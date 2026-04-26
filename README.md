@@ -247,6 +247,8 @@ public/
 
 `data/` 可以保留空目录，也可以不上传真实生产数据。不要把你的 NovelAI token 或 `.env` 提交到 GitHub。
 
+Docker 镜像不会复制本地 `data/` 目录。Zeabur 构建阶段只需要代码，运行阶段再把 Volume 挂载到 `/data`。
+
 ### 2. 创建 Zeabur 服务
 
 1. 登录 Zeabur。
