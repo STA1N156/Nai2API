@@ -1,0 +1,257 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Nai2API 管理后台</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body class="admin-page">
+    <header class="topbar admin-topbar">
+      <div class="brand">
+        <span class="brand-mark">OPS</span>
+        <div>
+          <h1>Nai2API 管理后台</h1>
+          <p id="adminState">等待验证</p>
+        </div>
+      </div>
+      <nav class="top-actions">
+        <a class="nav-link" href="/">用户界面</a>
+        <button id="refreshBtn" class="secondary hidden">刷新监控</button>
+      </nav>
+    </header>
+
+    <main class="admin-shell">
+      <section id="loginPanel" class="panel login-panel">
+        <div class="panel-title">
+          <div>
+            <h2>管理员验证</h2>
+            <span>ADMIN_TOKEN</span>
+          </div>
+        </div>
+        <label>
+          Admin Token
+          <input id="adminToken" type="password" autocomplete="current-password" />
+        </label>
+        <button id="enterAdminBtn" class="primary wide">进入后台</button>
+      </section>
+
+      <section id="dashboard" class="hidden">
+        <div class="metric-grid">
+          <article class="metric-card">
+            <span>STA1N 密钥</span>
+            <strong id="metricUsers">0</strong>
+          </article>
+          <article class="metric-card">
+            <span>24 小时请求</span>
+            <strong id="metricCredits">0</strong>
+          </article>
+          <article class="metric-card">
+            <span>可用账号</span>
+            <strong id="metricAccounts">0</strong>
+          </article>
+          <article class="metric-card">
+            <span>缓存图片</span>
+            <strong id="metricImages">0</strong>
+          </article>
+        </div>
+
+        <div class="admin-grid">
+          <section class="panel">
+            <div class="panel-title">
+              <div>
+                <h2>发放 STA1N 密钥</h2>
+                <span>管理员直接生成，用户拿到即可使用</span>
+              </div>
+            </div>
+            <div class="grid-three">
+              <label>
+                数量
+                <input id="userCount" type="number" min="1" max="200" value="5" />
+              </label>
+              <label>
+                额度
+                <input id="userCredits" type="number" min="1" value="20" />
+              </label>
+              <label>
+                备注
+                <input id="userNote" value="issued" />
+              </label>
+            </div>
+            <button id="createUsersBtn" class="primary wide">生成密钥</button>
+            <textarea id="newUsersOutput" class="codebox" rows="6" readonly></textarea>
+          </section>
+
+          <section class="panel">
+            <div class="panel-title">
+              <div>
+                <h2>系统设置</h2>
+                <span>单次生图固定扣 1 点</span>
+              </div>
+            </div>
+            <div class="grid-two">
+              <label class="settings-wide">
+                最大缓存图片数
+                <input id="maxCacheImages" type="number" min="0" max="200000" value="500" />
+              </label>
+              <label class="settings-wide">
+                每账号最高并发
+                <input id="accountConcurrency" type="number" min="1" max="20" value="2" />
+              </label>
+            </div>
+            <button id="saveSettingsBtn" class="primary wide">保存设置</button>
+          </section>
+        </div>
+
+        <div class="admin-grid">
+          <section class="panel">
+            <div class="panel-title">
+              <div>
+                <h2>Nai2API 账号池</h2>
+                <span>负载均衡与 token 迁移</span>
+              </div>
+            </div>
+            <label>
+              账号备注
+              <input id="accountName" placeholder="nai-1" />
+            </label>
+            <label>
+              Persistent API Token
+              <textarea id="accountToken" class="codebox" rows="3" placeholder="pst-..."></textarea>
+            </label>
+            <div class="button-row">
+              <button id="addAccountBtn" class="primary">加入账号池</button>
+              <button id="exportAccountsBtn" class="secondary">导出账号</button>
+            </div>
+            <label>
+              批量导入 token
+              <textarea id="accountImportText" class="codebox" rows="4" placeholder="每行一个 token，也支持：备注,token,权重"></textarea>
+            </label>
+            <div class="button-row">
+              <button id="importAccountsBtn" class="secondary">追加导入</button>
+              <button id="replaceAccountsBtn" class="ghost">覆盖导入</button>
+            </div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-title">
+              <div>
+                <h2>数据包迁移</h2>
+                <span>包含密钥、额度、账号池和系统设置，不包含记录与图片缓存</span>
+              </div>
+              <div class="button-row compact-actions">
+                <button id="exportPackageBtn" class="secondary">一键打包导出</button>
+                <label class="file-button">
+                  选择数据包
+                  <input id="packageFile" type="file" accept="application/json,.json" />
+                </label>
+              </div>
+            </div>
+            <textarea id="packageImportText" class="codebox import-area" rows="4" placeholder="也可以把导出的 JSON 数据包粘贴到这里"></textarea>
+            <div class="button-row">
+              <button id="importPackageMergeBtn" class="secondary">合并导入</button>
+              <button id="importPackageReplaceBtn" class="danger">覆盖导入</button>
+            </div>
+          </section>
+        </div>
+
+        <div class="admin-grid wide-grid">
+          <section class="panel">
+            <div class="panel-title">
+              <div>
+                <h2>账号监控</h2>
+                <span id="accountCount">0 个账号</span>
+              </div>
+            </div>
+            <div class="toolbar">
+              <label class="checkline">
+                <input id="selectAllAccounts" type="checkbox" />
+                全选
+              </label>
+              <button id="enableAccountsBtn" class="secondary">启用</button>
+              <button id="disableAccountsBtn" class="secondary">禁用</button>
+              <button id="resetAccountStatsBtn" class="ghost">重置监控</button>
+              <button id="deleteAccountsBtn" class="ghost">批量删除</button>
+            </div>
+            <div id="accountList" class="data-list"></div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-title">
+              <div>
+                <h2>密钥监控</h2>
+                <span id="userCountText">0 个密钥</span>
+              </div>
+            </div>
+            <div class="toolbar">
+              <input id="userSearch" class="search-input" placeholder="搜索密钥、备注或卡密来源" />
+              <label class="checkline">
+                <input id="selectAllUsers" type="checkbox" />
+                全选
+              </label>
+              <input id="balanceAdjustValue" class="inline-input" type="number" value="10" />
+              <button id="setBalanceBtn" class="secondary">设置额度</button>
+              <button id="addBalanceBtn" class="secondary">增加额度</button>
+              <button id="deleteUsersBtn" class="danger">批量删除</button>
+            </div>
+            <div id="userList" class="data-list"></div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-title">
+              <div>
+                <h2>最近任务</h2>
+                <span id="jobCountText">0 条</span>
+              </div>
+            </div>
+            <div id="jobList" class="data-list"></div>
+            <div class="pager">
+              <button id="jobPrevBtn" class="ghost" type="button">上一页</button>
+              <span id="jobPageText">第 1 / 1 页</span>
+              <button id="jobNextBtn" class="ghost" type="button">下一页</button>
+            </div>
+          </section>
+        </div>
+
+        <section class="panel">
+          <div class="panel-title">
+            <div>
+              <h2>缓存图片</h2>
+              <span id="imageCountText">0 / 0</span>
+            </div>
+            <div class="button-row compact-actions">
+              <input id="imageSearch" class="search-input" placeholder="搜索提示词、模型或密钥" />
+              <select id="imageRows" class="inline-select" aria-label="缓存图片显示行数">
+                <option value="3" selected>3 行</option>
+                <option value="5">5 行</option>
+                <option value="8">8 行</option>
+              </select>
+              <button id="refreshImagesBtn" class="secondary">刷新列表</button>
+              <button id="clearImagesBtn" class="danger">清理缓存</button>
+            </div>
+          </div>
+          <div id="imageList" class="image-cache-grid"></div>
+          <div class="pager">
+            <button id="imagePrevBtn" class="ghost" type="button">上一页</button>
+            <span id="imagePageText">第 1 / 1 页</span>
+            <button id="imageNextBtn" class="ghost" type="button">下一页</button>
+          </div>
+        </section>
+      </section>
+    </main>
+
+    <div id="imagePreview" class="image-preview hidden" role="dialog" aria-modal="true">
+      <button id="closeImagePreviewBtn" class="preview-close" aria-label="关闭预览">×</button>
+      <div class="preview-stage">
+        <img id="previewImage" alt="缓存图片预览" />
+        <div class="preview-meta">
+          <strong id="previewTitle"></strong>
+          <span id="previewInfo"></span>
+        </div>
+      </div>
+    </div>
+
+    <div id="toast" class="toast" role="status"></div>
+    <script src="/admin.js" type="module"></script>
+  </body>
+</html>

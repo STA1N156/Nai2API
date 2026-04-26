@@ -1,0 +1,11 @@
+services:
+  nai2api:
+    build: .
+    container_name: nai2api
+    ports:
+      - "${PORT:-8080}:8080"
+    env_file:
+      - .env
+    volumes:
+      - ./data:/data
+    restart: unless-stopped

@@ -1,0 +1,16 @@
+{
+  "name": "nai2api",
+  "version": "1.0.0",
+  "description": "Docker-ready NovelAI to API gateway with STA1N keys, user credits, account pool load balancing, direct image URLs, and polling jobs.",
+  "main": "server/index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server/index.js",
+    "dev": "node --watch server/index.js",
+    "check": "node --check server/index.js && node --check server/providers.js && node --check server/store.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}

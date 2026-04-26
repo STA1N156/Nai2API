@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Nai2API</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="user-shell">
+      <section class="panel token-panel">
+        <div class="panel-title token-summary">
+          <span class="status-dot"></span>
+          <div>
+            <h2>访问密钥</h2>
+            <span id="balanceText">未连接</span>
+          </div>
+        </div>
+        <label>
+          STA1N Token
+          <input id="userToken" placeholder="STA1N-..." />
+        </label>
+        <button id="saveTokenBtn" class="secondary wide">加载密钥</button>
+      </section>
+
+      <section class="panel composer-panel">
+        <div class="panel-title">
+          <div>
+            <h2>生成参数</h2>
+          </div>
+        </div>
+
+        <label>
+          提示词
+          <textarea id="promptInput" rows="7">1girl, silver hair, blue eyes, standing in a rainy neon street, cinematic lighting, highly detailed</textarea>
+        </label>
+
+        <div class="grid-two">
+          <label>
+            采样器
+            <select id="samplerInput">
+              <option value="k_dpmpp_2m_sde">DPM++ 2M SDE</option>
+              <option value="k_dpmpp_2m">DPM++ 2M</option>
+              <option value="k_euler_ancestral">Euler Ancestral</option>
+              <option value="k_euler">Euler</option>
+            </select>
+          </label>
+          <label>
+            尺寸
+              <select id="sizeInput">
+                <option>竖图</option>
+                <option>横图</option>
+                <option>方图</option>
+              </select>
+          </label>
+        </div>
+
+        <div class="grid-four">
+          <label>
+            步数
+            <input id="stepsInput" type="number" min="1" max="50" value="28" />
+          </label>
+          <label>
+            Scale
+            <input id="scaleInput" type="number" min="1" max="20" step="0.5" value="6" />
+          </label>
+          <label>
+            CFG
+            <input id="cfgInput" type="number" min="0" max="1" step="0.05" value="0" />
+          </label>
+          <label>
+            缓存
+            <select id="nocacheInput">
+              <option value="0">命中缓存</option>
+              <option value="1">强制重画</option>
+            </select>
+          </label>
+        </div>
+
+        <label>
+          Artist / 质量前缀
+          <textarea id="artistInput" rows="4"></textarea>
+        </label>
+        <label>
+          负面提示词
+          <textarea id="negativeInput" rows="8"></textarea>
+        </label>
+
+      </section>
+
+      <section class="panel result-panel">
+        <div class="panel-title">
+          <div>
+            <h2>结果</h2>
+            <span id="jobText">等待请求</span>
+          </div>
+          <div class="panel-actions">
+            <button id="directGenerateBtn" class="primary">生成图片</button>
+            <button id="copySnippetTopBtn" class="secondary">复制嵌入代码</button>
+          </div>
+        </div>
+
+        <div id="imageFrame" class="image-frame">
+          <span>等待生成</span>
+        </div>
+      </section>
+    </main>
+
+    <div id="resultPreview" class="image-preview hidden" aria-hidden="true">
+      <button id="closeResultPreviewBtn" class="preview-close" type="button" aria-label="关闭预览">×</button>
+      <div class="preview-stage result-preview-stage">
+        <img id="resultPreviewImage" alt="生成图片预览" />
+      </div>
+    </div>
+
+    <div id="toast" class="toast" role="status"></div>
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>
