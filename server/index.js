@@ -667,8 +667,6 @@ async function streamOpenAiImageJob(req, res, job, model) {
   writeOpenAiChunk(res, { id: streamId, model, content: '<think>\n任务已提交，正在进入队列\n' });
   let lastLine = '';
   let reachedRunning = false;
-  let lastQueuedCount = Number(job.queuedCount || 0);
-  let lastQueuePosition = Number(job.queuePosition || 0);
   const deadline = Date.now() + openAiChatTimeoutMs;
 
   while (Date.now() < deadline) {
@@ -682,20 +680,12 @@ async function streamOpenAiImageJob(req, res, job, model) {
     const line = openAiProgressLine(snapshot);
     const isQueuedAfterRunning = reachedRunning && snapshot.status === 'queued';
     if (snapshot.status === 'running') reachedRunning = true;
-    if (snapshot.status === 'queued') {
-      lastQueuedCount = Math.max(lastQueuedCount, Number(snapshot.queuedCount || 0));
-      lastQueuePosition = Math.max(lastQueuePosition, Number(snapshot.queuePosition || 0));
-    }
     if (line && !isQueuedAfterRunning && line !== lastLine) {
       writeOpenAiChunk(res, { id: streamId, model, content: `${line}\n` });
       lastLine = line;
     }
 
     if (snapshot.status === 'done') {
-      const finalQueueLine = openAiFinalQueueLine(lastQueuePosition, lastQueuedCount);
-      if (finalQueueLine && finalQueueLine !== lastLine) {
-        writeOpenAiChunk(res, { id: streamId, model, content: `${finalQueueLine}\n` });
-      }
       writeOpenAiChunk(res, { id: streamId, model, content: `生成完成\n</think>\n${openAiImageMarkdown(req, snapshot)}\n` });
       finishOpenAiStream(res, streamId, model);
       return;
@@ -730,12 +720,6 @@ function openAiProgressLine(job) {
     return '已路由账号，正在生成';
   }
   return '';
-}
-
-function openAiFinalQueueLine(position, count) {
-  const total = Number(count || 0);
-  if (total <= 1) return '';
-  return `排队中：第 ${total} / ${total} 个`;
 }
 
 function openAiImageMarkdown(req, imageOrJob) {
