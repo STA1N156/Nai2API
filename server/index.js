@@ -70,6 +70,11 @@ async function route(req, res) {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const method = req.method || 'GET';
 
+  if (method === 'OPTIONS') {
+    sendCorsPreflight(res);
+    return;
+  }
+
   if (method === 'GET' && url.pathname === '/api/health') {
     const db = await store.read();
     sendJson(res, 200, {
@@ -124,6 +129,33 @@ async function route(req, res) {
     const db = await store.read();
     const user = getUserOrThrow(db, token);
     sendJson(res, 200, publicUser(user));
+    return;
+  }
+
+  if (url.pathname === '/api/api/getUser' && ['GET', 'POST'].includes(method)) {
+    const body = method === 'POST' ? await readJson(req) : {};
+    const token = String(body.toUserId || body.token || url.searchParams.get('toUserId') || url.searchParams.get('token') || '').trim();
+    const db = await store.read();
+    const user = db.users.find((item) => item.token === token && item.enabled !== false);
+    if (!user) {
+      sendJson(res, 200, {
+        status: 'error',
+        type: token.toUpperCase().startsWith('STA1N') ? 'sta1n' : 'std',
+        message: 'user not found',
+        data: { value: 0 }
+      });
+      return;
+    }
+    sendJson(res, 200, {
+      status: 'ok',
+      type: token.toUpperCase().startsWith('STA1N') ? 'sta1n' : 'std',
+      data: {
+        value: Math.max(0, Math.floor(Number(user.balance || 0))),
+        balance: Number(user.balance || 0),
+        token: user.token,
+        enabled: user.enabled !== false
+      }
+    });
     return;
   }
 
@@ -1597,7 +1629,8 @@ async function readJson(req) {
 function sendJson(res, statusCode, payload) {
   res.writeHead(statusCode, {
     'content-type': 'application/json; charset=utf-8',
-    'cache-control': 'no-store'
+    'cache-control': 'no-store',
+    ...corsHeaders()
   });
   res.end(JSON.stringify(payload));
 }
@@ -1620,6 +1653,22 @@ function sendBusyImage(res) {
     'x-busy': '1',
     'retry-after': '15'
   });
+}
+
+function sendCorsPreflight(res) {
+  res.writeHead(204, {
+    ...corsHeaders(),
+    'access-control-max-age': '86400'
+  });
+  res.end();
+}
+
+function corsHeaders() {
+  return {
+    'access-control-allow-origin': '*',
+    'access-control-allow-methods': 'GET,POST,PUT,PATCH,DELETE,OPTIONS',
+    'access-control-allow-headers': 'content-type,authorization,x-admin-token,x-user-token'
+  };
 }
 
 function contentType(filePath) {
