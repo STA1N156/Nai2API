@@ -129,13 +129,19 @@ async function route(req, res) {
 
   if (method === 'GET' && url.pathname === '/api/admin/summary') {
     assertAdmin(req, url);
-    const db = await store.read();
+    const db = await store.update((current) => {
+      resetStaleAccountLoads(current.accounts);
+      return current;
+    });
     const revealTokens = url.searchParams.get('revealTokens') === '1';
     sendJson(res, 200, {
       settings: db.settings,
       cards: db.cards.map(publicCard),
       users: db.users.map(publicUser),
-      accounts: db.accounts.map((account) => publicAccount(account, { revealToken: revealTokens })),
+      accounts: db.accounts.map((account) => publicAccount(account, {
+        revealToken: revealTokens,
+        stats24h: accountStatsSince(account.id, db.jobs, 24 * 60 * 60 * 1000)
+      })),
       images: db.images.slice(0, 12).map(publicImage),
       imageCount: db.images.length,
       jobStats24h: jobStatsSince(db.jobs, 24 * 60 * 60 * 1000),
@@ -387,7 +393,7 @@ async function handleDirectGenerate(url, res) {
     if (remainingMs <= 0) throw new Error('direct generate timeout');
     clearTimeout(timeout);
     generationTimeout = setTimeout(() => abortController.abort(), Math.max(1, remainingMs));
-    const image = await generateNovelAiImage(request, result.account, process.env, { signal: abortController.signal });
+    const image = await generateWithAccountRetry(result, request, { signal: abortController.signal, deadline });
     clearTimeout(generationTimeout);
     const saved = await completeGeneration(result, request, image, { direct: true, jobId: directJob.id });
     sendImage(res, 200, saved.mimeType, image.buffer, {
@@ -915,11 +921,72 @@ async function reserveQueuedJob(jobId) {
 async function runReservedJob(reservation) {
   if (!reservation || reservation.skip || reservation.queued) return;
   try {
-    const image = await generateNovelAiImage(reservation.job.request, reservation.account, process.env);
+    const image = await generateWithAccountRetry(reservation, reservation.job.request);
     await completeGeneration(reservation, reservation.job.request, image, { jobId: reservation.job.id });
   } catch (error) {
     await failGeneration(reservation, error);
   }
+}
+
+async function generateWithAccountRetry(reservation, request, options = {}) {
+  const tried = new Set();
+  let firstError = null;
+  let current = reservation;
+
+  while (true) {
+    if (current.account?.id) tried.add(current.account.id);
+    try {
+      const image = await generateNovelAiImage(request, current.account, process.env, { signal: options.signal });
+      reservation.account = current.account;
+      return image;
+    } catch (error) {
+      if (isAbortError(error)) throw error;
+      if (!firstError) firstError = error;
+      const next = await retryReservationWithNextAccount(current, error, tried, options);
+      if (!next) {
+        current.account = null;
+        reservation.account = null;
+        throw firstError || error;
+      }
+      current = next;
+      reservation.account = current.account;
+    }
+  }
+}
+
+async function retryReservationWithNextAccount(reservation, error, tried, options = {}) {
+  if (!reservation.account?.id) return null;
+  return store.update((db) => {
+    const failedAccount = db.accounts.find((item) => item.id === reservation.account.id);
+    if (failedAccount) {
+      failedAccount.inFlight = Math.max(0, Number(failedAccount.inFlight || 0) - 1);
+      failedAccount.failures = Number(failedAccount.failures || 0) + 1;
+      failedAccount.updatedAt = new Date().toISOString();
+    }
+
+    if (options.deadline && Date.now() >= options.deadline) return null;
+    const account = selectAccount(db.accounts, db.settings, { excludeIds: tried });
+    if (!account) return null;
+    account.inFlight = Number(account.inFlight || 0) + 1;
+    account.lastUsedAt = new Date().toISOString();
+    account.updatedAt = new Date().toISOString();
+
+    if (reservation.job?.id) {
+      const job = db.jobs.find((item) => item.id === reservation.job.id);
+      if (job) {
+        job.status = 'running';
+        job.accountId = account.id;
+        job.error = `Retrying after account #${failedAccount?.routeId || '?'} failed: ${error.message}`;
+        job.updatedAt = new Date().toISOString();
+      }
+    }
+
+    return {
+      ...reservation,
+      account: { ...account },
+      job: reservation.job ? { ...reservation.job, accountId: account.id } : reservation.job
+    };
+  });
 }
 
 async function reserveCreditAndAccount(token, request, cacheKey) {
@@ -1020,6 +1087,7 @@ async function completeGeneration(reservation, request, image, meta = {}) {
       if (job) {
         job.status = 'done';
         job.imageId = saved.id;
+        job.error = '';
         job.updatedAt = new Date().toISOString();
       }
     }
@@ -1063,12 +1131,13 @@ async function failGeneration(reservation, error) {
   scheduleQueueDrain();
 }
 
-function selectAccount(accounts, settings = {}) {
+function selectAccount(accounts, settings = {}, options = {}) {
   resetStaleAccountLoads(accounts);
+  const excludeIds = options.excludeIds || new Set();
   const enabled = accounts.filter((account) => account.enabled !== false);
   if (!enabled.length) return null;
   const maxConcurrency = maxAccountConcurrency(settings);
-  const available = enabled.filter((account) => Number(account.inFlight || 0) < maxConcurrency);
+  const available = enabled.filter((account) => !excludeIds.has(account.id) && Number(account.inFlight || 0) < maxConcurrency);
   if (!available.length) return null;
   return available.sort((a, b) => {
     const loadA = Number(a.inFlight || 0) / maxConcurrency;
@@ -1217,6 +1286,7 @@ function publicAccount(account, options = {}) {
     inFlight: account.inFlight || 0,
     total: account.total || 0,
     failures: account.failures || 0,
+    stats24h: options.stats24h || { done: 0, failed: 0 },
     lastUsedAt: account.lastUsedAt || ''
   };
 }
@@ -1353,6 +1423,18 @@ function jobStatsSince(jobs, rangeMs) {
   }, { done: 0, failed: 0 });
 }
 
+function accountStatsSince(accountId, jobs, rangeMs) {
+  const since = Date.now() - rangeMs;
+  return jobs.reduce((stats, job) => {
+    if (job.accountId !== accountId) return stats;
+    const createdAt = Date.parse(job.createdAt || '');
+    if (!createdAt || createdAt < since) return stats;
+    if (job.status === 'done') stats.done += 1;
+    if (job.status === 'failed') stats.failed += 1;
+    return stats;
+  }, { done: 0, failed: 0 });
+}
+
 function publicImage(image) {
   return {
     id: image.id,
@@ -1394,6 +1476,10 @@ function cacheableRequest(request) {
 
 function isNoCache(value) {
   return value === true || value === 1 || value === '1' || value === 'true';
+}
+
+function isAbortError(error) {
+  return error?.name === 'AbortError' || /aborted|abort/i.test(String(error?.message || ''));
 }
 
 function selectUsers(db, body) {

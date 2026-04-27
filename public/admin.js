@@ -594,6 +594,7 @@ function renderAccount(account) {
   const status = account.enabled ? '已启用' : '已禁用';
   const statusClass = account.enabled ? 'ok' : 'muted';
   const lastUsed = account.lastUsedAt ? `最近使用 ${formatDate(account.lastUsedAt)}` : '尚未使用';
+  const stats24h = account.stats24h || { done: 0, failed: 0 };
   return `<article class="data-row selectable account-row">
     <input class="row-check account-select" type="checkbox" value="${escapeHtml(account.id)}" ${checked} />
     <div class="row-main">
@@ -606,8 +607,9 @@ function renderAccount(account) {
     </div>
     <div class="row-stats">
       <span><b>${account.inFlight}</b> 运行中</span>
-      <span><b>${account.total}</b> 成功</span>
-      <span><b>${account.failures}</b> 失败</span>
+      <span><b>${stats24h.done || 0}</b> 24h成功</span>
+      <span><b>${stats24h.failed || 0}</b> 24h失败</span>
+      <small>累计 ${account.total || 0}/${account.failures || 0}</small>
     </div>
   </article>`;
 }
