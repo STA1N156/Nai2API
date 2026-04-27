@@ -19,6 +19,16 @@ let queueDraining = false;
 let queueDrainRequested = false;
 const jobWaiters = new Map();
 const directGenerateTimeoutMs = Number(process.env.DIRECT_GENERATE_TIMEOUT_MS || 60_000);
+const openAiChatTimeoutMs = Number(process.env.OPENAI_CHAT_TIMEOUT_MS || 10 * 60_000);
+const openAiFixedSteps = 28;
+const openAiSamplers = [
+  'k_euler_ancestral',
+  'k_euler',
+  'k_dpmpp_2s_ancestral',
+  'k_dpmpp_2m_sde',
+  'k_dpmpp_2m',
+  'k_dpmpp_sde'
+];
 const insufficientBalanceMessage = '密钥额度不足，无法生成图片。';
 
 await store.init();
@@ -34,6 +44,10 @@ const server = http.createServer(async (req, res) => {
     if (req.url?.startsWith('/generate')) {
       const image = buildErrorImage(publicErrorMessage(error.message || 'Generation failed'));
       sendImage(res, 200, image.mimeType, image.buffer, { 'x-error': '1' });
+      return;
+    }
+    if (req.url?.startsWith('/v1/')) {
+      sendOpenAiError(res, error.statusCode || 500, publicErrorMessage(error.message || 'Internal server error'), openAiErrorType(error));
       return;
     }
     sendJson(res, error.statusCode || 500, { error: publicErrorMessage(error.message || 'Internal server error') });
@@ -75,6 +89,16 @@ async function route(req, res) {
 
   if (method === 'OPTIONS') {
     sendCorsPreflight(res);
+    return;
+  }
+
+  if (method === 'GET' && url.pathname === '/v1/models') {
+    sendJson(res, 200, openAiModelsResponse());
+    return;
+  }
+
+  if (method === 'POST' && url.pathname === '/v1/chat/completions') {
+    await handleOpenAiChatCompletion(req, res);
     return;
   }
 
@@ -437,6 +461,277 @@ async function handleDirectGenerate(url, res) {
     }
     throw error;
   }
+}
+
+async function handleOpenAiChatCompletion(req, res) {
+  const token = bearerToken(req);
+  if (!token) throw httpError(401, 'missing API key.');
+  const body = await readJson(req);
+  const settings = await store.readSettings();
+  const parsed = parseOpenAiImageRequest(body, settings);
+  const job = await createJob(token, parsed.request);
+  scheduleQueueDrain();
+
+  if (body.stream === true) {
+    await streamOpenAiImageJob(req, res, job, parsed.model);
+    return;
+  }
+
+  const deadline = Date.now() + openAiChatTimeoutMs;
+  const result = await waitForJobResult(job.id, deadline);
+  if (!result) throw httpError(504, '连接超时');
+  if (result.error) throw httpError(500, result.error);
+
+  sendJson(res, 200, openAiChatCompletionResponse({
+    model: parsed.model,
+    content: openAiImageMarkdown(req, result.saved),
+    id: `chatcmpl-${job.id}`
+  }));
+}
+
+function openAiModelsResponse() {
+  const created = Math.floor(Date.now() / 1000);
+  return {
+    object: 'list',
+    data: openAiSamplers.map((sampler) => ({
+      id: `nai-diffusion-4-5-full:${sampler}`,
+      object: 'model',
+      created,
+      owned_by: 'nai2api'
+    }))
+  };
+}
+
+function parseOpenAiImageRequest(body = {}, settings = {}) {
+  const modelParts = parseOpenAiModel(body.model || settings.defaultModel || 'nai-diffusion-4-5-full');
+  const messageText = lastUserMessageText(body.messages || []);
+  const fields = parseChinesePromptFields(messageText);
+  validateOpenAiPromptFormat(fields, messageText);
+  const nai = body.nai && typeof body.nai === 'object' ? body.nai : {};
+  const prompt = String(nai.tag || nai.prompt || fields.tag || '').trim();
+  const negative = String(nai.negative ?? fields.negative ?? '').trim() || settings.defaultNegative || '';
+
+  const request = {
+    tag: prompt,
+    model: modelParts.model,
+    artist: nai.artist ?? fields.artist ?? settings.defaultArtist ?? '',
+    size: nai.size ?? fields.size ?? settings.defaults?.size,
+    steps: openAiFixedSteps,
+    scale: nai.scale ?? fields.scale ?? settings.defaults?.scale,
+    cfg: nai.cfg ?? fields.cfg ?? settings.defaults?.cfg,
+    sampler: nai.sampler ?? fields.sampler ?? modelParts.sampler ?? settings.defaults?.sampler,
+    negative,
+    nocache: nai.nocache ?? body.nocache ?? '1',
+    noise_schedule: nai.noise_schedule ?? nai.noiseSchedule ?? settings.defaults?.noiseSchedule ?? 'karras'
+  };
+
+  return {
+    model: modelParts.original,
+    request
+  };
+}
+
+function validateOpenAiPromptFormat(fields, messageText) {
+  const requiredFields = ['tag', 'size', 'scale', 'cfg'];
+  const missing = requiredFields.some((key) => !String(fields[key] ?? '').trim());
+  const optionalFieldsPresent = Object.hasOwn(fields, 'artist') && Object.hasOwn(fields, 'negative');
+  if (missing || !optionalFieldsPresent) throw httpError(400, openAiPromptFormatError());
+}
+
+function openAiPromptFormatError() {
+  return '请求格式错误，请参考群内使用指南';
+}
+
+function parseOpenAiModel(modelValue) {
+  const original = String(modelValue || 'nai-diffusion-4-5-full');
+  const [model, sampler] = original.split(':');
+  return {
+    original,
+    model: model || 'nai-diffusion-4-5-full',
+    sampler: sampler || ''
+  };
+}
+
+function lastUserMessageText(messages) {
+  const list = Array.isArray(messages) ? messages : [];
+  const message = [...list].reverse().find((item) => item?.role === 'user') || list.at(-1);
+  return messageContentText(message?.content || '');
+}
+
+function messageContentText(content) {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return String(content || '');
+  return content.map((part) => {
+    if (typeof part === 'string') return part;
+    if (part?.type === 'text') return part.text || '';
+    return part?.text || '';
+  }).filter(Boolean).join('\n');
+}
+
+function parseChinesePromptFields(text) {
+  const fieldNames = {
+    '提示词': 'tag',
+    '畫師串': 'artist',
+    '画师串': 'artist',
+    '尺寸': 'size',
+    '提示词引导值': 'scale',
+    '提示詞引導值': 'scale',
+    '缩放引导值': 'cfg',
+    '縮放引導值': 'cfg',
+    '负面提示词': 'negative',
+    '負面提示詞': 'negative',
+    '采样器': 'sampler',
+    '採樣器': 'sampler'
+  };
+  const fields = {};
+  let currentKey = '';
+  for (const rawLine of String(text || '').split(/\r?\n/)) {
+    const line = rawLine.trimEnd();
+    const match = line.match(/^([^:：]{1,16})\s*[:：]\s*(.*)$/);
+    const key = match ? fieldNames[match[1].trim()] : '';
+    if (key) {
+      currentKey = key;
+      fields[currentKey] = appendFieldValue(fields[currentKey], match[2]);
+      continue;
+    }
+    if (currentKey && line.trim()) {
+      fields[currentKey] = appendFieldValue(fields[currentKey], line);
+    }
+  }
+  return fields;
+}
+
+function appendFieldValue(current, value) {
+  const text = String(value || '').trim();
+  if (!current) return text;
+  if (!text) return current;
+  return `${current}\n${text}`;
+}
+
+async function streamOpenAiImageJob(req, res, job, model) {
+  sendOpenAiStreamHeaders(res);
+  const streamId = `chatcmpl-${job.id}`;
+  writeOpenAiChunk(res, { id: streamId, model, content: '<think>\n任务已提交，正在进入队列\n' });
+  let lastLine = '';
+  let reachedRunning = false;
+  const deadline = Date.now() + openAiChatTimeoutMs;
+
+  while (Date.now() < deadline) {
+    const snapshot = await publicJobSnapshot(job.id);
+    if (!snapshot) {
+      writeOpenAiChunk(res, { id: streamId, model, content: '任务不存在\n</think>\n任务不存在\n' });
+      finishOpenAiStream(res, streamId, model);
+      return;
+    }
+
+    const line = openAiProgressLine(snapshot);
+    const isQueuedAfterRunning = reachedRunning && snapshot.status === 'queued';
+    if (snapshot.status === 'running') reachedRunning = true;
+    if (line && !isQueuedAfterRunning && line !== lastLine) {
+      writeOpenAiChunk(res, { id: streamId, model, content: `${line}\n` });
+      lastLine = line;
+    }
+
+    if (snapshot.status === 'done') {
+      writeOpenAiChunk(res, { id: streamId, model, content: `生成完成\n</think>\n${openAiImageMarkdown(req, snapshot)}\n` });
+      finishOpenAiStream(res, streamId, model);
+      return;
+    }
+
+    if (snapshot.status === 'failed') {
+      const message = snapshot.error || '生成失败';
+      writeOpenAiChunk(res, { id: streamId, model, content: `${message}\n</think>\n${message}\n` });
+      finishOpenAiStream(res, streamId, model);
+      return;
+    }
+
+    await sleep(1100);
+  }
+
+  writeOpenAiChunk(res, { id: streamId, model, content: '连接超时\n</think>\n连接超时\n' });
+  finishOpenAiStream(res, streamId, model);
+}
+
+async function publicJobSnapshot(jobId) {
+  const db = await store.readCollections(['accounts', 'jobs']);
+  const job = db.jobs.find((item) => item.id === jobId);
+  return job ? publicJob(job, db) : null;
+}
+
+function openAiProgressLine(job) {
+  if (job.status === 'queued') {
+    if (job.queuePosition && job.queuedCount) return `排队中：第 ${job.queuePosition} / ${job.queuedCount} 个`;
+    return '排队中，正在等待可用账号';
+  }
+  if (job.status === 'running') {
+    return '已路由账号，正在生成';
+  }
+  return '';
+}
+
+function openAiImageMarkdown(req, imageOrJob) {
+  const imageId = imageOrJob.imageId || imageOrJob.id;
+  return `![image](${absoluteUrl(req, `/api/images/${imageId}/content`)})`;
+}
+
+function openAiChatCompletionResponse({ model, content, id }) {
+  return {
+    id,
+    object: 'chat.completion',
+    created: Math.floor(Date.now() / 1000),
+    model,
+    choices: [{
+      index: 0,
+      message: { role: 'assistant', content },
+      finish_reason: 'stop'
+    }],
+    usage: {
+      prompt_tokens: 1,
+      completion_tokens: 1,
+      total_tokens: 2
+    }
+  };
+}
+
+function writeOpenAiChunk(res, { id, model, content }) {
+  res.write(`data: ${JSON.stringify({
+    id,
+    object: 'chat.completion.chunk',
+    created: Math.floor(Date.now() / 1000),
+    model,
+    choices: [{
+      index: 0,
+      delta: { content },
+      finish_reason: null
+    }]
+  })}\n\n`);
+}
+
+function finishOpenAiStream(res, id, model) {
+  res.write(`data: ${JSON.stringify({
+    id,
+    object: 'chat.completion.chunk',
+    created: Math.floor(Date.now() / 1000),
+    model,
+    choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
+  })}\n\n`);
+  res.write('data: [DONE]\n\n');
+  res.end();
+}
+
+function sendOpenAiStreamHeaders(res) {
+  res.writeHead(200, {
+    'content-type': 'text/event-stream; charset=utf-8',
+    'cache-control': 'no-cache, no-transform',
+    connection: 'keep-alive',
+    ...corsHeaders()
+  });
+}
+
+function absoluteUrl(req, urlPath) {
+  const proto = req.headers['x-forwarded-proto'] || (req.socket.encrypted ? 'https' : 'http');
+  const hostHeader = req.headers['x-forwarded-host'] || req.headers.host || `localhost:${port}`;
+  return `${proto}://${hostHeader}${urlPath}`;
 }
 
 async function redeemCard(cardCode) {
@@ -1839,6 +2134,17 @@ function sendJson(res, statusCode, payload) {
   res.end(JSON.stringify(payload));
 }
 
+function sendOpenAiError(res, statusCode, message, type = 'invalid_request_error') {
+  sendJson(res, statusCode, {
+    error: {
+      message: publicErrorMessage(message),
+      type,
+      param: null,
+      code: type
+    }
+  });
+}
+
 function sendImage(res, statusCode, mimeType, buffer, extraHeaders = {}) {
   res.writeHead(statusCode, {
     'content-type': mimeType,
@@ -1896,6 +2202,20 @@ function tokenFrom(req, url) {
   const header = req.headers.authorization || '';
   if (header.startsWith('Bearer ')) return header.slice(7).trim();
   return String(url.searchParams.get('token') || req.headers['x-user-token'] || '').trim();
+}
+
+function bearerToken(req) {
+  const header = String(req.headers.authorization || '');
+  const match = header.match(/^Bearer\s+(.+)$/i);
+  return match ? match[1].trim() : '';
+}
+
+function openAiErrorType(error) {
+  const statusCode = Number(error?.statusCode || 500);
+  if (statusCode === 401 || statusCode === 403) return 'authentication_error';
+  if (statusCode === 429) return 'rate_limit_error';
+  if (statusCode >= 500) return 'server_error';
+  return 'invalid_request_error';
 }
 
 function isAdmin(req, url) {
