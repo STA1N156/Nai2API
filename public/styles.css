@@ -623,6 +623,10 @@ textarea:focus {
   gap: 13px;
 }
 
+.param-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
 .grid-four {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));

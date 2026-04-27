@@ -27,7 +27,6 @@ const ids = [
   'stepsInput',
   'scaleInput',
   'cfgInput',
-  'nocacheInput',
   'negativeInput',
   'directGenerateBtn',
   'copySnippetTopBtn',
@@ -115,7 +114,6 @@ function bindEvents() {
     el.stepsInput,
     el.scaleInput,
     el.cfgInput,
-    el.nocacheInput,
     el.negativeInput
   ].forEach((input) => input.addEventListener('input', updateUrlOutputs));
 }
@@ -163,7 +161,7 @@ function collectParams() {
     cfg: el.cfgInput.value,
     sampler: el.samplerInput.value,
     negative: el.negativeInput.value.trim(),
-    nocache: el.nocacheInput.value,
+    nocache: '1',
     noise_schedule: 'karras'
   };
 }
@@ -196,7 +194,7 @@ function readableQueryValue(value) {
 }
 
 function buildReadableGenerateUrl(overrides = {}) {
-  const values = clampUrlParams({ ...collectParams(), ...overrides });
+  const values = clampUrlParams({ ...collectParams(), nocache: '0', ...overrides });
   const query = snippetParamOrder
     .filter((key) => values[key] !== undefined && values[key] !== '')
     .map((key) => `${key}=${readableQueryValue(values[key])}`)
@@ -261,6 +259,7 @@ async function startJob() {
         cfg: Number(params.cfg),
         sampler: params.sampler,
         negative: params.negative,
+        nocache: '1',
         noise_schedule: params.noise_schedule
       }
     });

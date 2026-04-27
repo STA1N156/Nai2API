@@ -598,7 +598,7 @@ function renderAccount(account) {
     <input class="row-check account-select" type="checkbox" value="${escapeHtml(account.id)}" ${checked} />
     <div class="row-main">
       <div class="row-heading">
-        <strong>${escapeHtml(account.name || 'NovelAI 账号')}</strong>
+        <strong>#${account.routeId || '-'} ${escapeHtml(account.name || 'NovelAI 账号')}</strong>
         <span class="status-badge ${statusClass}">${status}</span>
       </div>
       <span class="token-text">${escapeHtml(account.token)}</span>
@@ -633,6 +633,9 @@ function renderJob(job) {
   const stepText = requestedSteps && routedSteps
     ? `请求步数 ${requestedSteps} · 路由步数 ${routedSteps}`
     : '';
+  const sourceText = job.source === 'direct' ? 'URL' : '网页';
+  const accountText = job.accountRouteId ? `路由账号 #${job.accountRouteId}` : '路由账号 -';
+  const durationText = job.durationMs ? `耗时 ${formatDuration(job.durationMs)}` : '';
   const queueText = job.status === 'queued' && job.queuePosition
     ? `排队中：第 ${job.queuePosition} / ${job.queuedCount} 个`
     : '';
@@ -643,6 +646,7 @@ function renderJob(job) {
         <span class="job-time">${escapeHtml(formatDate(job.createdAt))}</span>
       </div>
       <strong title="${escapeHtml(prompt)}">${escapeHtml(prompt)}</strong>
+      <span class="step-route">${escapeHtml([sourceText, accountText, durationText].filter(Boolean).join(' · '))}</span>
       ${stepText ? `<span class="step-route">${escapeHtml(stepText)}</span>` : ''}
       ${queueText ? `<span>${escapeHtml(queueText)}</span>` : ''}
       ${job.error ? `<span class="error-line">${escapeHtml(job.error)}</span>` : ''}
@@ -849,6 +853,16 @@ function dateStamp() {
 function formatDate(value) {
   if (!value) return '';
   return new Date(value).toLocaleString('zh-CN', { hour12: false });
+}
+
+function formatDuration(value) {
+  const ms = Math.max(0, Number(value || 0));
+  if (ms < 1000) return `${ms}ms`;
+  const seconds = ms / 1000;
+  if (seconds < 60) return `${seconds.toFixed(seconds < 10 ? 1 : 0)}s`;
+  const minutes = Math.floor(seconds / 60);
+  const rest = Math.round(seconds % 60);
+  return `${minutes}m ${rest}s`;
 }
 
 function showToast(message, isError = false) {

@@ -21,6 +21,7 @@ const directGenerateTimeoutMs = Number(process.env.DIRECT_GENERATE_TIMEOUT_MS ||
 await store.init();
 await mkdir(imageDir, { recursive: true });
 await migrateInlineImages();
+await ensureAccountRouteIds();
 await applyRuntimeSettings();
 
 const server = http.createServer(async (req, res) => {
@@ -341,14 +342,21 @@ async function handleDirectGenerate(url, res) {
   const rawParams = Object.fromEntries(url.searchParams.entries());
   const db = await store.read();
   const request = normalizeNovelAiRequest(rawParams, db.settings, { maxSteps: DIRECT_URL_MAX_STEPS });
-  const cacheKey = hashObject({ token, request: cacheableRequest({ ...request, seed: rawParams.seed || '' }) });
+  const cacheKey = requestCacheKey(token, request, rawParams.seed);
   const nocache = rawParams.nocache === '1' || rawParams.nocache === 'true';
 
   if (!nocache) {
     const cached = db.images.find((image) => image.cacheKey === cacheKey && !image.mock && image.mimeType !== 'image/svg+xml');
     if (cached) {
       try {
-        sendImage(res, 200, cached.mimeType, await readStoredImage(cached), {
+        const cachedBuffer = await readStoredImage(cached);
+        await createDirectJob(token, request, cacheKey, {
+          status: 'done',
+          accountId: cached.accountId || '',
+          imageId: cached.id,
+          cost: 0
+        });
+        sendImage(res, 200, cached.mimeType, cachedBuffer, {
           'x-cache': 'hit',
           'x-balance': String(getUserOrThrow(db, token).balance)
         });
@@ -364,25 +372,31 @@ async function handleDirectGenerate(url, res) {
   const timeout = setTimeout(() => abortController.abort(), Math.max(1, directGenerateTimeoutMs));
   let generationTimeout = null;
   let result = null;
+  let directJob = null;
   try {
+    directJob = await createDirectJob(token, request, cacheKey);
     result = await reserveCreditAndAccountWhenAvailable(token, request, cacheKey, deadline);
     if (!result) {
+      await markDirectJobFailed(directJob.id, 'server busy, please retry later.');
       sendBusyImage(res);
       return;
     }
+    result.job = { id: directJob.id };
+    await markDirectJobRunning(directJob.id, result);
     const remainingMs = deadline - Date.now();
     if (remainingMs <= 0) throw new Error('direct generate timeout');
     clearTimeout(timeout);
     generationTimeout = setTimeout(() => abortController.abort(), Math.max(1, remainingMs));
     const image = await generateNovelAiImage(request, result.account, process.env, { signal: abortController.signal });
     clearTimeout(generationTimeout);
-    const saved = await completeGeneration(result, request, image, { direct: true });
+    const saved = await completeGeneration(result, request, image, { direct: true, jobId: directJob.id });
     sendImage(res, 200, saved.mimeType, image.buffer, {
       'x-cache': 'miss',
       'x-balance': String(saved.balance)
     });
   } catch (error) {
     if (result) await failGeneration(result, error);
+    if (!result && directJob) await markDirectJobFailed(directJob.id, error.message || 'direct generate failed.');
     if (abortController.signal.aborted || error.message === 'direct generate timeout') {
       sendBusyImage(res);
       return;
@@ -530,6 +544,7 @@ async function addAccount(body) {
   return store.update((db) => {
     const account = {
       id: createId('acct'),
+      routeId: nextAccountRouteId(db.accounts),
       name: String(body.name || `NovelAI ${db.accounts.length + 1}`).slice(0, 80),
       token,
       enabled: body.enabled !== false,
@@ -555,6 +570,7 @@ async function importAccounts(body) {
     const now = new Date().toISOString();
     const imported = accounts.map((account, index) => ({
       id: account.id || createId('acct'),
+      routeId: Number(account.routeId || 0),
       name: String(account.name || `NovelAI imported ${index + 1}`).slice(0, 80),
       token: String(account.token || '').trim(),
       enabled: account.enabled !== false,
@@ -578,6 +594,7 @@ async function importAccounts(body) {
         }
       });
     }
+    assignAccountRouteIds(db.accounts);
 
     db.ledger.unshift({
       id: createId('log'),
@@ -714,6 +731,7 @@ async function importPackage(body) {
       ledger: []
     });
     safeDb.accounts = safeDb.accounts.map((account) => ({ ...account, inFlight: 0 }));
+    assignAccountRouteIds(safeDb.accounts);
     await store.write(safeDb);
     return {
       mode,
@@ -761,6 +779,30 @@ async function createJob(token, body) {
   return store.update((db) => {
     const user = getUserOrThrow(db, token);
     const request = normalizeNovelAiRequest(body, db.settings);
+    const cacheKey = requestCacheKey(token, request, body.seed);
+    const nocache = isNoCache(body.nocache);
+    if (!nocache) {
+      const cached = db.images.find((image) => image.cacheKey === cacheKey && !image.mock && image.mimeType !== 'image/svg+xml');
+      if (cached) {
+        const now = new Date().toISOString();
+        const job = {
+          id: createId('job'),
+          userToken: token,
+          status: 'done',
+          request,
+          cacheKey,
+          cost: 0,
+          accountId: cached.accountId || '',
+          createdAt: now,
+          updatedAt: now,
+          imageId: cached.id,
+          error: ''
+        };
+        db.jobs.unshift(job);
+        return job;
+      }
+    }
+
     const cost = generationCost();
     if (user.balance < cost) throw httpError(402, 'insufficient balance.');
     user.balance -= cost;
@@ -770,6 +812,7 @@ async function createJob(token, body) {
       userToken: token,
       status: 'queued',
       request,
+      cacheKey,
       cost,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
@@ -786,6 +829,56 @@ async function createJob(token, body) {
       at: new Date().toISOString()
     });
     return job;
+  });
+}
+
+async function ensureAccountRouteIds() {
+  await store.update((db) => {
+    assignAccountRouteIds(db.accounts);
+  });
+}
+
+async function createDirectJob(token, request, cacheKey, options = {}) {
+  return store.update((db) => {
+    getUserOrThrow(db, token);
+    const now = new Date().toISOString();
+    const job = {
+      id: createId('job'),
+      source: 'direct',
+      userToken: token,
+      status: options.status || 'queued',
+      request,
+      cacheKey,
+      cost: Number(options.cost || 0),
+      accountId: options.accountId || '',
+      createdAt: now,
+      updatedAt: now,
+      imageId: options.imageId || '',
+      error: ''
+    };
+    db.jobs.unshift(job);
+    return job;
+  });
+}
+
+async function markDirectJobRunning(jobId, reservation) {
+  await store.update((db) => {
+    const job = db.jobs.find((item) => item.id === jobId);
+    if (!job) return;
+    job.status = 'running';
+    job.accountId = reservation.account?.id || '';
+    job.cost = Number(reservation.cost || 0);
+    job.updatedAt = new Date().toISOString();
+  });
+}
+
+async function markDirectJobFailed(jobId, message) {
+  await store.update((db) => {
+    const job = db.jobs.find((item) => item.id === jobId);
+    if (!job) return;
+    job.status = 'failed';
+    job.error = message;
+    job.updatedAt = new Date().toISOString();
   });
 }
 
@@ -815,7 +908,7 @@ async function reserveQueuedJob(jobId) {
     job.status = 'running';
     job.accountId = account?.id || '';
     job.updatedAt = new Date().toISOString();
-    return { job, account: account ? { ...account } : null, token: job.userToken, cost: job.cost };
+    return { job, account: account ? { ...account } : null, token: job.userToken, cost: job.cost, cacheKey: job.cacheKey || '' };
   });
 }
 
@@ -1045,6 +1138,28 @@ function resetStaleAccountLoads(accounts) {
   });
 }
 
+function assignAccountRouteIds(accounts) {
+  const used = new Set();
+  let next = 1;
+  accounts.forEach((account) => {
+    const current = Number(account.routeId || 0);
+    if (Number.isInteger(current) && current > 0 && !used.has(current)) {
+      account.routeId = current;
+      used.add(current);
+      next = Math.max(next, current + 1);
+      return;
+    }
+    while (used.has(next)) next += 1;
+    account.routeId = next;
+    used.add(next);
+    next += 1;
+  });
+}
+
+function nextAccountRouteId(accounts) {
+  return accounts.reduce((max, account) => Math.max(max, Number(account.routeId || 0)), 0) + 1;
+}
+
 function normalizePublicBaseUrl(value = '') {
   const text = String(value || '').trim().replace(/\/+$/, '');
   if (!text) return '';
@@ -1094,6 +1209,7 @@ function publicCard(card) {
 function publicAccount(account, options = {}) {
   return {
     id: account.id,
+    routeId: account.routeId || 0,
     name: account.name,
     token: options.revealToken ? account.token : maskToken(account.token),
     enabled: account.enabled !== false,
@@ -1108,6 +1224,7 @@ function publicAccount(account, options = {}) {
 function exportAccount(account) {
   return {
     id: account.id,
+    routeId: account.routeId || 0,
     name: account.name,
     token: account.token,
     enabled: account.enabled !== false,
@@ -1193,23 +1310,36 @@ function publicJob(job, db = null) {
   const queuedJobs = db ? db.jobs.filter((item) => item.status === 'queued').reverse() : [];
   const queuePosition = job.status === 'queued' ? queuedJobs.findIndex((item) => item.id === job.id) + 1 : 0;
   const request = job.request || {};
+  const account = db && job.accountId ? db.accounts.find((item) => item.id === job.accountId) : null;
   return {
     id: job.id,
+    source: job.source || 'web',
     status: job.status,
     prompt: request.tag || '',
     model: request.model || '',
     requestedSteps: request.requestedSteps ?? request.steps ?? 0,
     routedSteps: request.steps ?? 0,
     accountId: job.accountId || '',
+    accountRouteId: account?.routeId || 0,
     cost: job.cost,
     imageId: job.imageId || '',
     imageUrl: job.imageId ? `/api/images/${job.imageId}/content` : '',
     error: job.error || '',
     queuePosition,
     queuedCount: queuedJobs.length,
+    durationMs: jobDurationMs(job),
     createdAt: job.createdAt,
     updatedAt: job.updatedAt
   };
+}
+
+function jobDurationMs(job) {
+  const started = Date.parse(job.createdAt || '');
+  if (!started) return 0;
+  const terminal = ['done', 'failed'].includes(job.status);
+  const ended = terminal ? Date.parse(job.updatedAt || '') : Date.now();
+  if (!ended || ended < started) return 0;
+  return ended - started;
 }
 
 function jobStatsSince(jobs, rangeMs) {
@@ -1247,9 +1377,23 @@ function generationCost() {
   return 1;
 }
 
+function requestCacheKey(token, request, explicitSeed = '') {
+  return hashObject({
+    token,
+    request: cacheableRequest({
+      ...request,
+      seed: explicitSeed === undefined || explicitSeed === '' ? '' : Number(explicitSeed)
+    })
+  });
+}
+
 function cacheableRequest(request) {
   const { requestedSteps, ...cacheRequest } = request;
   return cacheRequest;
+}
+
+function isNoCache(value) {
+  return value === true || value === 1 || value === '1' || value === 'true';
 }
 
 function selectUsers(db, body) {
