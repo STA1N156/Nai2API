@@ -1,5 +1,5 @@
 import http from 'node:http';
-import { readFile } from 'node:fs/promises';
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { JsonStore, MAX_CACHE_IMAGES_LIMIT, createId, createPublicToken, hashObject, maskToken, normalizeDb } from './store.js';
@@ -9,7 +9,9 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, '..');
 const publicDir = path.join(rootDir, 'public');
 const dataDir = process.env.DATA_DIR || path.join(rootDir, 'data');
+const imageDir = path.join(dataDir, 'images');
 const port = Number(process.env.PORT || 8080);
+const host = process.env.HOST || '0.0.0.0';
 const adminToken = process.env.ADMIN_TOKEN || '123456';
 const store = new JsonStore(dataDir);
 let queueDrainTimer = null;
@@ -17,6 +19,8 @@ let queueDraining = false;
 const directGenerateTimeoutMs = Number(process.env.DIRECT_GENERATE_TIMEOUT_MS || 60_000);
 
 await store.init();
+await mkdir(imageDir, { recursive: true });
+await migrateInlineImages();
 await applyRuntimeSettings();
 
 const server = http.createServer(async (req, res) => {
@@ -32,8 +36,8 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(port, () => {
-  console.log(`Nai2API listening on http://localhost:${port}`);
+server.listen(port, host, () => {
+  console.log(`Nai2API listening on http://${host}:${port}`);
   scheduleQueueDrain();
 });
 
@@ -42,6 +46,22 @@ async function applyRuntimeSettings() {
   if (!publicBaseUrl) return;
   await store.update((db) => {
     if (!db.settings.publicBaseUrl) db.settings.publicBaseUrl = publicBaseUrl;
+  });
+}
+
+async function migrateInlineImages() {
+  await store.update(async (db) => {
+    for (const image of db.images) {
+      if (!image.base64 || image.file) continue;
+      const imageFile = imageStorageName(image.id, image.mimeType);
+      try {
+        await writeFile(path.join(dataDir, imageFile), Buffer.from(image.base64, 'base64'));
+        image.file = imageFile;
+        delete image.base64;
+      } catch (error) {
+        console.error(`Failed to migrate cached image ${image.id}:`, error);
+      }
+    }
   });
 }
 
@@ -299,7 +319,7 @@ async function route(req, res) {
     const db = await store.read();
     const image = db.images.find((item) => item.id === id);
     if (!image) throw httpError(404, 'image not found.');
-    sendImage(res, 200, image.mimeType, Buffer.from(image.base64, 'base64'));
+    sendImage(res, 200, image.mimeType, await readStoredImage(image));
     return;
   }
 
@@ -327,11 +347,15 @@ async function handleDirectGenerate(url, res) {
   if (!nocache) {
     const cached = db.images.find((image) => image.cacheKey === cacheKey && !image.mock && image.mimeType !== 'image/svg+xml');
     if (cached) {
-      sendImage(res, 200, cached.mimeType, Buffer.from(cached.base64, 'base64'), {
-        'x-cache': 'hit',
-        'x-balance': String(getUserOrThrow(db, token).balance)
-      });
-      return;
+      try {
+        sendImage(res, 200, cached.mimeType, await readStoredImage(cached), {
+          'x-cache': 'hit',
+          'x-balance': String(getUserOrThrow(db, token).balance)
+        });
+        return;
+      } catch (error) {
+        console.error(`Cached image ${cached.id} is missing, regenerating:`, error);
+      }
     }
   }
 
@@ -353,7 +377,7 @@ async function handleDirectGenerate(url, res) {
     const image = await generateNovelAiImage(request, result.account, process.env, { signal: abortController.signal });
     clearTimeout(generationTimeout);
     const saved = await completeGeneration(result, request, image, { direct: true });
-    sendImage(res, 200, saved.mimeType, Buffer.from(saved.base64, 'base64'), {
+    sendImage(res, 200, saved.mimeType, image.buffer, {
       'x-cache': 'miss',
       'x-balance': String(saved.balance)
     });
@@ -633,7 +657,8 @@ async function resetAccountStats(body) {
 }
 
 async function clearImageCache(body) {
-  return store.update((db) => {
+  const deletedImages = [];
+  const result = await store.update((db) => {
     const ids = new Set(collectValues(body.ids || body.images));
     const query = String(body.q || body.query || '').trim().toLowerCase();
     const clearAll = body.all === true || body.mode === 'all';
@@ -651,6 +676,7 @@ async function clearImageCache(body) {
     db.images = db.images.filter((image) => {
       if (!shouldDelete(image)) return true;
       deletedIds.add(image.id);
+      deletedImages.push(image);
       return false;
     });
 
@@ -670,6 +696,8 @@ async function clearImageCache(body) {
 
     return { deleted: deletedIds.size, remaining: db.images.length };
   });
+  await removeStoredImages(deletedImages);
+  return result;
 }
 
 async function importPackage(body) {
@@ -863,6 +891,8 @@ async function tryReserveCreditAndAccount(token, request, cacheKey) {
 }
 
 async function completeGeneration(reservation, request, image, meta = {}) {
+  const imageId = createId('img');
+  const imageFile = await writeStoredImage(imageId, image);
   const savedImage = await store.update((db) => {
     const user = getUserOrThrow(db, reservation.token);
     const account = reservation.account ? db.accounts.find((item) => item.id === reservation.account.id) : null;
@@ -873,7 +903,7 @@ async function completeGeneration(reservation, request, image, meta = {}) {
     }
 
     const saved = {
-      id: createId('img'),
+      id: imageId,
       token: reservation.token,
       accountId: reservation.account?.id || '',
       cacheKey: image.mock ? '' : reservation.cacheKey || '',
@@ -887,7 +917,7 @@ async function completeGeneration(reservation, request, image, meta = {}) {
       routedSteps: request.steps,
       cost: reservation.cost,
       mimeType: image.mimeType,
-      base64: image.buffer.toString('base64'),
+      file: imageFile,
       createdAt: new Date().toISOString()
     };
     db.images.unshift(saved);
@@ -1100,6 +1130,51 @@ function exportMigrationData(db) {
     images: [],
     ledger: []
   };
+}
+
+async function writeStoredImage(id, image) {
+  const imageFile = imageStorageName(id, image.mimeType);
+  await writeFile(path.join(dataDir, imageFile), image.buffer);
+  return imageFile;
+}
+
+async function readStoredImage(image) {
+  if (image.file) {
+    return readFile(imageFilePath(image.file));
+  }
+  if (image.base64) {
+    return Buffer.from(image.base64, 'base64');
+  }
+  throw httpError(404, 'image content not found.');
+}
+
+async function removeStoredImages(images) {
+  await Promise.all(images.map(async (image) => {
+    if (!image.file) return;
+    try {
+      await rm(imageFilePath(image.file), { force: true });
+    } catch (error) {
+      console.error(`Failed to delete cached image ${image.id}:`, error);
+    }
+  }));
+}
+
+function imageStorageName(id, mimeType = '') {
+  return path.join('images', `${id}.${imageExtension(mimeType)}`);
+}
+
+function imageFilePath(file) {
+  const resolved = path.resolve(dataDir, file);
+  const root = path.resolve(imageDir);
+  if (resolved !== root && !resolved.startsWith(`${root}${path.sep}`)) throw httpError(403, 'invalid image path.');
+  return resolved;
+}
+
+function imageExtension(mimeType = '') {
+  if (mimeType.includes('jpeg') || mimeType.includes('jpg')) return 'jpg';
+  if (mimeType.includes('webp')) return 'webp';
+  if (mimeType.includes('svg')) return 'svg';
+  return 'png';
 }
 
 function sanitizeMigrationData(payload) {
