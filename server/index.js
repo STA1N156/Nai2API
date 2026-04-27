@@ -229,22 +229,17 @@ async function route(req, res) {
 
   if (method === 'GET' && url.pathname === '/api/admin/images') {
     assertAdmin(req, url);
-    const db = await store.readCollections(['settings', 'images']);
     const limit = clamp(Number(url.searchParams.get('limit') || 60), 1, 200);
     const offset = clamp(Number(url.searchParams.get('offset') || 0), 0, Number.MAX_SAFE_INTEGER);
     const q = String(url.searchParams.get('q') || '').trim().toLowerCase();
-    const images = db.images.filter((image) => {
-      if (!q) return true;
-      return [image.id, image.token, image.prompt, image.fullPrompt, image.model]
-        .some((value) => String(value || '').toLowerCase().includes(q));
-    });
+    const page = await store.readImagePage({ limit, offset, q });
     sendJson(res, 200, {
-      images: images.slice(offset, offset + limit).map(publicImage),
-      total: db.images.length,
-      matched: images.length,
-      offset,
-      limit,
-      maxCacheImages: db.settings.maxCacheImages
+      images: page.images.map(publicImage),
+      total: page.total,
+      matched: page.matched,
+      offset: page.offset,
+      limit: page.limit,
+      maxCacheImages: page.maxCacheImages
     });
     return;
   }
@@ -358,8 +353,7 @@ async function route(req, res) {
 
   if (method === 'GET' && url.pathname.startsWith('/api/images/')) {
     const id = decodeURIComponent(url.pathname.split('/').at(-2) || '');
-    const db = await store.readCollections(['images']);
-    const image = db.images.find((item) => item.id === id);
+    const image = await store.findImage(id);
     if (!image) throw httpError(404, 'image not found.');
     sendImage(res, 200, image.mimeType, await readStoredImage(image));
     return;
@@ -381,13 +375,13 @@ async function route(req, res) {
 async function handleDirectGenerate(url, res) {
   const token = String(url.searchParams.get('token') || '').trim();
   const rawParams = Object.fromEntries(url.searchParams.entries());
-  const db = await store.readCollections(['settings', 'users', 'images']);
+  const db = await store.readCollections(['settings', 'users']);
   const request = normalizeNovelAiRequest(rawParams, db.settings, { maxSteps: DIRECT_URL_MAX_STEPS });
   const cacheKey = requestCacheKey(token, request, rawParams.seed);
   const nocache = rawParams.nocache === '1' || rawParams.nocache === 'true';
 
   if (!nocache) {
-    const cached = db.images.find((image) => image.cacheKey === cacheKey && !image.mock && image.mimeType !== 'image/svg+xml');
+    const cached = await store.findImageByCacheKey(cacheKey);
     if (cached) {
       try {
         const cachedBuffer = await readStoredImage(cached);

@@ -85,6 +85,57 @@ export class JsonStore {
     return structuredClone(this.db.settings);
   }
 
+  async findImage(id) {
+    await this.ensureLoaded();
+    const image = this.db.images.find((item) => item.id === id);
+    return image ? structuredClone(image) : null;
+  }
+
+  async findImageByCacheKey(cacheKey) {
+    await this.ensureLoaded();
+    const image = this.db.images.find((item) => item.cacheKey === cacheKey && !item.mock && item.mimeType !== 'image/svg+xml');
+    return image ? structuredClone(image) : null;
+  }
+
+  async readImagePage(options = {}) {
+    await this.ensureLoaded();
+    const limit = Math.max(1, Math.min(200, Math.floor(Number(options.limit || 60))));
+    const offset = Math.max(0, Math.floor(Number(options.offset || 0)));
+    const q = String(options.q || '').trim().toLowerCase();
+    const total = this.db.images.length;
+
+    if (!q) {
+      const page = this.db.images.slice(offset, offset + limit);
+      return {
+        images: structuredClone(page),
+        total,
+        matched: total,
+        offset,
+        limit,
+        maxCacheImages: this.db.settings.maxCacheImages
+      };
+    }
+
+    const page = [];
+    let matched = 0;
+    for (const image of this.db.images) {
+      const isMatch = [image.id, image.token, image.prompt, image.fullPrompt, image.model]
+        .some((value) => String(value || '').toLowerCase().includes(q));
+      if (!isMatch) continue;
+      if (matched >= offset && page.length < limit) page.push(image);
+      matched += 1;
+    }
+
+    return {
+      images: structuredClone(page),
+      total,
+      matched,
+      offset,
+      limit,
+      maxCacheImages: this.db.settings.maxCacheImages
+    };
+  }
+
   async readCounts() {
     await this.ensureLoaded();
     return {
