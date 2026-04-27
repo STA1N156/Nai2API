@@ -44,6 +44,8 @@ export class JsonStore {
     this.dataDir = dataDir;
     this.dbPath = path.join(dataDir, 'library.json');
     this.queue = Promise.resolve();
+    this.flushQueue = Promise.resolve();
+    this.flushTimer = null;
     this.db = null;
   }
 
@@ -61,11 +63,55 @@ export class JsonStore {
   }
 
   async read() {
-    if (!this.db) {
-      await this.queue.catch(() => {});
-      this.db = await this.readRaw();
-    }
+    await this.ensureLoaded();
     return cloneDb(this.db);
+  }
+
+  async readCollections(collections = []) {
+    await this.ensureLoaded();
+    const snapshot = {};
+    for (const key of collections) {
+      if (key === 'settings') {
+        snapshot.settings = structuredClone(this.db.settings);
+      } else if (Array.isArray(this.db[key])) {
+        snapshot[key] = structuredClone(this.db[key]);
+      }
+    }
+    return snapshot;
+  }
+
+  async readSettings() {
+    await this.ensureLoaded();
+    return structuredClone(this.db.settings);
+  }
+
+  async readCounts() {
+    await this.ensureLoaded();
+    return {
+      users: this.db.users.length,
+      enabledAccounts: this.db.accounts.filter((account) => account.enabled !== false).length,
+      cards: this.db.cards.length
+    };
+  }
+
+  async readAdminSummary() {
+    await this.ensureLoaded();
+    return {
+      settings: structuredClone(this.db.settings),
+      cards: structuredClone(this.db.cards),
+      users: structuredClone(this.db.users),
+      accounts: structuredClone(this.db.accounts),
+      jobs: structuredClone(this.db.jobs),
+      images: structuredClone(this.db.images.slice(0, 12)),
+      imageCount: this.db.images.length,
+      ledger: structuredClone(this.db.ledger.slice(0, 80))
+    };
+  }
+
+  async ensureLoaded() {
+    if (this.db) return;
+    await this.queue.catch(() => {});
+    this.db = await this.readRaw();
   }
 
   async readRaw() {
@@ -75,31 +121,74 @@ export class JsonStore {
   }
 
   async write(db) {
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
     const safeDb = normalizeDb(db);
-    const maxCacheImages = clampNumber(safeDb.settings.maxCacheImages, 0, MAX_CACHE_IMAGES_LIMIT);
-    safeDb.settings.costPerImage = 1;
-    safeDb.settings.maxCacheImages = maxCacheImages;
-    safeDb.settings.accountConcurrency = clampNumber(safeDb.settings.accountConcurrency, 1, 20);
-    safeDb.jobs = safeDb.jobs.slice(0, 500);
-    safeDb.images = safeDb.images.slice(0, maxCacheImages);
-    safeDb.ledger = safeDb.ledger.slice(0, 1000);
+    trimDb(safeDb);
     this.db = safeDb;
-    await writeFile(this.dbPath, `${JSON.stringify(safeDb, null, 2)}\n`, 'utf8');
+    await this.enqueueWrite(safeDb);
   }
 
-  async update(mutator) {
+  async update(mutator, options = {}) {
     this.queue = this.queue.catch(() => {}).then(async () => {
-      const db = cloneDb(this.db || await this.readRaw());
+      if (!this.db) this.db = await this.readRaw();
+      const db = this.db;
       const result = await mutator(db);
-      await this.write(db);
-      return result;
+      trimDb(db);
+      if (options.flush === true) {
+        await this.writeSnapshot(db);
+      } else {
+        this.scheduleFlush();
+      }
+      return cloneValue(result);
     });
     return this.queue;
+  }
+
+  scheduleFlush(delay = 350) {
+    if (this.flushTimer) return;
+    this.flushTimer = setTimeout(() => {
+      this.flushTimer = null;
+      this.flush().catch((error) => console.error('Failed to flush data store:', error));
+    }, delay);
+  }
+
+  async flush() {
+    await this.ensureLoaded();
+    const snapshot = cloneDb(this.db);
+    return this.enqueueWrite(snapshot);
+  }
+
+  async enqueueWrite(db) {
+    this.flushQueue = this.flushQueue.catch(() => {}).then(() => this.writeSnapshot(db));
+    return this.flushQueue;
+  }
+
+  async writeSnapshot(db) {
+    await writeFile(this.dbPath, `${JSON.stringify(db, null, 2)}\n`, 'utf8');
   }
 }
 
 function cloneDb(db) {
   return normalizeDb(structuredClone(db));
+}
+
+function cloneValue(value) {
+  if (value === undefined || value === null) return value;
+  return structuredClone(value);
+}
+
+function trimDb(db) {
+  const maxCacheImages = clampNumber(db.settings.maxCacheImages, 0, MAX_CACHE_IMAGES_LIMIT);
+  db.settings.costPerImage = 1;
+  db.settings.maxCacheImages = maxCacheImages;
+  db.settings.accountConcurrency = clampNumber(db.settings.accountConcurrency, 1, 20);
+  db.jobs = db.jobs.slice(0, 500);
+  db.images = db.images.slice(0, maxCacheImages);
+  db.ledger = db.ledger.slice(0, 1000);
+  return db;
 }
 
 export function normalizeDb(db = {}) {

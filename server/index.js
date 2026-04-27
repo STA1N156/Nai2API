@@ -16,7 +16,9 @@ const adminToken = process.env.ADMIN_TOKEN || '123456';
 const store = new JsonStore(dataDir);
 let queueDrainTimer = null;
 let queueDraining = false;
+let queueDrainRequested = false;
 const directGenerateTimeoutMs = Number(process.env.DIRECT_GENERATE_TIMEOUT_MS || 60_000);
+const insufficientBalanceMessage = '密钥额度不足，无法生成图片。';
 
 await store.init();
 await mkdir(imageDir, { recursive: true });
@@ -29,11 +31,11 @@ const server = http.createServer(async (req, res) => {
     await route(req, res);
   } catch (error) {
     if (req.url?.startsWith('/generate')) {
-      const image = buildErrorImage(error.message || 'Generation failed');
+      const image = buildErrorImage(publicErrorMessage(error.message || 'Generation failed'));
       sendImage(res, 200, image.mimeType, image.buffer, { 'x-error': '1' });
       return;
     }
-    sendJson(res, error.statusCode || 500, { error: error.message || 'Internal server error' });
+    sendJson(res, error.statusCode || 500, { error: publicErrorMessage(error.message || 'Internal server error') });
   }
 });
 
@@ -76,21 +78,21 @@ async function route(req, res) {
   }
 
   if (method === 'GET' && url.pathname === '/api/health') {
-    const db = await store.read();
+    const counts = await store.readCounts();
     sendJson(res, 200, {
       ok: true,
       service: 'Nai2API',
-      users: db.users.length,
-      enabledAccounts: db.accounts.filter((account) => account.enabled !== false).length,
-      cards: db.cards.length,
+      users: counts.users,
+      enabledAccounts: counts.enabledAccounts,
+      cards: counts.cards,
       adminConfigured: adminToken !== '123456'
     });
     return;
   }
 
   if (method === 'GET' && url.pathname === '/api/settings') {
-    const db = await store.read();
-    sendJson(res, 200, db.settings);
+    const settings = await store.readSettings();
+    sendJson(res, 200, settings);
     return;
   }
 
@@ -126,7 +128,7 @@ async function route(req, res) {
 
   if (method === 'GET' && url.pathname === '/api/me') {
     const token = tokenFrom(req, url);
-    const db = await store.read();
+    const db = await store.readCollections(['users']);
     const user = getUserOrThrow(db, token);
     sendJson(res, 200, publicUser(user));
     return;
@@ -135,7 +137,7 @@ async function route(req, res) {
   if (url.pathname === '/api/api/getUser' && ['GET', 'POST'].includes(method)) {
     const body = method === 'POST' ? await readJson(req) : {};
     const token = String(body.toUserId || body.token || url.searchParams.get('toUserId') || url.searchParams.get('token') || '').trim();
-    const db = await store.read();
+    const db = await store.readCollections(['users']);
     const user = db.users.find((item) => item.token === token && item.enabled !== false);
     if (!user) {
       sendJson(res, 200, {
@@ -161,7 +163,7 @@ async function route(req, res) {
 
   if (method === 'GET' && url.pathname === '/api/admin/summary') {
     assertAdmin(req, url);
-    const db = await store.read();
+    const db = await store.readAdminSummary();
     resetStaleAccountLoads(db.accounts);
     const revealTokens = url.searchParams.get('revealTokens') === '1';
     sendJson(res, 200, {
@@ -224,7 +226,7 @@ async function route(req, res) {
 
   if (method === 'GET' && url.pathname === '/api/admin/images') {
     assertAdmin(req, url);
-    const db = await store.read();
+    const db = await store.readCollections(['settings', 'images']);
     const limit = clamp(Number(url.searchParams.get('limit') || 60), 1, 200);
     const offset = clamp(Number(url.searchParams.get('offset') || 0), 0, Number.MAX_SAFE_INTEGER);
     const q = String(url.searchParams.get('q') || '').trim().toLowerCase();
@@ -254,7 +256,7 @@ async function route(req, res) {
 
   if (method === 'GET' && url.pathname === '/api/admin/accounts/export') {
     assertAdmin(req, url);
-    const db = await store.read();
+    const db = await store.readCollections(['accounts']);
     sendJson(res, 200, {
       exportedAt: new Date().toISOString(),
       accounts: db.accounts.map(exportAccount)
@@ -309,7 +311,7 @@ async function route(req, res) {
 
   if (method === 'GET' && url.pathname === '/api/admin/export') {
     assertAdmin(req, url);
-    const db = await store.read();
+    const db = await store.readCollections(['settings', 'cards', 'users', 'accounts']);
     sendJson(res, 200, {
       exportedAt: new Date().toISOString(),
       app: 'Nai2API',
@@ -333,8 +335,8 @@ async function route(req, res) {
     const body = await readJson(req);
     const token = String(body.token || tokenFrom(req, url) || '');
     const job = await createJob(token, body);
-    await drainQueuedJobs();
-    const db = await store.read();
+    scheduleQueueDrain();
+    const db = await store.readCollections(['accounts', 'jobs']);
     const savedJob = db.jobs.find((item) => item.id === job.id) || job;
     sendJson(res, 202, publicJob(savedJob, db));
     return;
@@ -343,7 +345,7 @@ async function route(req, res) {
   if (method === 'GET' && url.pathname.startsWith('/api/jobs/')) {
     const id = decodeURIComponent(url.pathname.split('/').pop() || '');
     const token = tokenFrom(req, url);
-    const db = await store.read();
+    const db = await store.readCollections(['accounts', 'jobs']);
     const job = db.jobs.find((item) => item.id === id);
     if (!job) throw httpError(404, 'job not found.');
     if (job.userToken !== token && !isAdmin(req, url)) throw httpError(403, 'forbidden.');
@@ -353,7 +355,7 @@ async function route(req, res) {
 
   if (method === 'GET' && url.pathname.startsWith('/api/images/')) {
     const id = decodeURIComponent(url.pathname.split('/').at(-2) || '');
-    const db = await store.read();
+    const db = await store.readCollections(['images']);
     const image = db.images.find((item) => item.id === id);
     if (!image) throw httpError(404, 'image not found.');
     sendImage(res, 200, image.mimeType, await readStoredImage(image));
@@ -376,7 +378,7 @@ async function route(req, res) {
 async function handleDirectGenerate(url, res) {
   const token = String(url.searchParams.get('token') || '').trim();
   const rawParams = Object.fromEntries(url.searchParams.entries());
-  const db = await store.read();
+  const db = await store.readCollections(['settings', 'users', 'images']);
   const request = normalizeNovelAiRequest(rawParams, db.settings, { maxSteps: DIRECT_URL_MAX_STEPS });
   const cacheKey = requestCacheKey(token, request, rawParams.seed);
   const nocache = rawParams.nocache === '1' || rawParams.nocache === 'true';
@@ -432,7 +434,13 @@ async function handleDirectGenerate(url, res) {
     });
   } catch (error) {
     if (result) await failGeneration(result, error);
-    if (!result && directJob) await markDirectJobFailed(directJob.id, error.message || 'direct generate failed.');
+    if (!result && directJob) {
+      if (isInsufficientBalanceError(error)) {
+        await removeJob(directJob.id);
+      } else {
+        await markDirectJobFailed(directJob.id, publicErrorMessage(error.message || 'direct generate failed.'));
+      }
+    }
     if (abortController.signal.aborted || error.message === 'direct generate timeout') {
       sendBusyImage(res);
       return;
@@ -814,7 +822,7 @@ async function updateAccount(id, body) {
 async function createJob(token, body) {
   return store.update((db) => {
     const user = getUserOrThrow(db, token);
-    const request = normalizeNovelAiRequest(body, db.settings);
+    const request = normalizeNovelAiRequest(body, db.settings, { maxSteps: DIRECT_URL_MAX_STEPS });
     const cacheKey = requestCacheKey(token, request, body.seed);
     const nocache = isNoCache(body.nocache);
     if (!nocache) {
@@ -840,7 +848,7 @@ async function createJob(token, body) {
     }
 
     const cost = generationCost();
-    if (user.balance < cost) throw httpError(402, 'insufficient balance.');
+    if (user.balance < cost) throw httpError(402, insufficientBalanceMessage);
     const queueTotal = activeJobCount(db.jobs) + 1;
     user.balance -= cost;
     user.updatedAt = new Date().toISOString();
@@ -916,8 +924,14 @@ async function markDirectJobFailed(jobId, message) {
     const job = db.jobs.find((item) => item.id === jobId);
     if (!job) return;
     job.status = 'failed';
-    job.error = message;
+    job.error = publicErrorMessage(message);
     job.updatedAt = new Date().toISOString();
+  });
+}
+
+async function removeJob(jobId) {
+  await store.update((db) => {
+    db.jobs = db.jobs.filter((job) => job.id !== jobId);
   });
 }
 
@@ -1025,7 +1039,7 @@ async function reserveCreditAndAccount(token, request, cacheKey) {
   return store.update((db) => {
     const user = getUserOrThrow(db, token);
     const cost = generationCost();
-    if (user.balance < cost) throw httpError(402, 'insufficient balance.');
+    if (user.balance < cost) throw httpError(402, insufficientBalanceMessage);
     const account = selectAccount(db.accounts, db.settings);
     if (!account && hasEnabledAccounts(db.accounts)) {
       throw httpError(429, 'all NovelAI accounts are busy, retry shortly.');
@@ -1061,7 +1075,7 @@ async function tryReserveCreditAndAccount(token, request, cacheKey) {
   return store.update((db) => {
     const user = getUserOrThrow(db, token);
     const cost = generationCost();
-    if (user.balance < cost) throw httpError(402, 'insufficient balance.');
+    if (user.balance < cost) throw httpError(402, insufficientBalanceMessage);
     const account = selectAccount(db.accounts, db.settings);
     if (!account && hasEnabledAccounts(db.accounts)) return { busy: true };
     if (account) {
@@ -1148,7 +1162,7 @@ async function failGeneration(reservation, error) {
       const job = db.jobs.find((item) => item.id === reservation.job.id);
       if (job) {
         job.status = 'failed';
-        job.error = error.message;
+        job.error = publicErrorMessage(error.message);
         job.updatedAt = new Date().toISOString();
       }
     }
@@ -1158,7 +1172,7 @@ async function failGeneration(reservation, error) {
       token: reservation.token,
       amount: Number(reservation.cost || 0),
       at: new Date().toISOString(),
-      note: error.message
+      note: publicErrorMessage(error.message)
     });
   });
   scheduleQueueDrain();
@@ -1193,7 +1207,10 @@ function availableAccountSlots(accounts, settings = {}) {
 }
 
 function scheduleQueueDrain(delay = 0) {
-  if (queueDrainTimer) return;
+  if (queueDrainTimer || queueDraining) {
+    queueDrainRequested = true;
+    return;
+  }
   queueDrainTimer = setTimeout(() => {
     queueDrainTimer = null;
     drainQueuedJobs();
@@ -1201,8 +1218,12 @@ function scheduleQueueDrain(delay = 0) {
 }
 
 async function drainQueuedJobs() {
-  if (queueDraining) return;
+  if (queueDraining) {
+    queueDrainRequested = true;
+    return;
+  }
   queueDraining = true;
+  queueDrainRequested = false;
   try {
     const jobIds = await store.update((db) => {
       const slots = availableAccountSlots(db.accounts, db.settings);
@@ -1223,6 +1244,7 @@ async function drainQueuedJobs() {
     });
   } finally {
     queueDraining = false;
+    if (queueDrainRequested) scheduleQueueDrain(25);
   }
 }
 
@@ -1426,7 +1448,7 @@ function publicJob(job, db = null) {
     cost: job.cost,
     imageId: job.imageId || '',
     imageUrl: job.imageId ? `/api/images/${job.imageId}/content` : '',
-    error: job.error || '',
+    error: publicErrorMessage(job.error || ''),
     queuePosition: queue.progress,
     queuedCount: queue.total,
     durationMs: jobDurationMs(job),
@@ -1466,6 +1488,7 @@ function activeJobCount(jobs) {
 function jobStatsSince(jobs, rangeMs) {
   const since = Date.now() - rangeMs;
   return finalizeStats(jobs.reduce((stats, job) => {
+    if (isQuotaFailureJob(job)) return stats;
     const createdAt = Date.parse(job.createdAt || '');
     if (!createdAt || createdAt < since) return stats;
     if (job.status === 'done') stats.done += 1;
@@ -1477,6 +1500,7 @@ function jobStatsSince(jobs, rangeMs) {
 function accountStatsSince(accountId, jobs, rangeMs) {
   const since = Date.now() - rangeMs;
   return finalizeStats(jobs.reduce((stats, job) => {
+    if (isQuotaFailureJob(job)) return stats;
     if (job.accountId !== accountId) return stats;
     const createdAt = Date.parse(job.createdAt || '');
     if (!createdAt || createdAt < since) return stats;
@@ -1539,6 +1563,22 @@ function cacheableRequest(request) {
 
 function isNoCache(value) {
   return value === true || value === 1 || value === '1' || value === 'true';
+}
+
+function isInsufficientBalanceError(error) {
+  return Number(error?.statusCode || error?.status) === 402 || /insufficient balance|额度不足|余额不足/i.test(String(error?.message || error || ''));
+}
+
+function isQuotaFailureJob(job) {
+  return job?.status === 'failed' && isInsufficientBalanceError({ message: job.error });
+}
+
+function publicErrorMessage(message) {
+  const text = String(message || '');
+  if (isInsufficientBalanceError({ message: text })) return insufficientBalanceMessage;
+  if (/invalid token/i.test(text)) return '密钥无效或已被禁用。';
+  if (/all NovelAI accounts are busy|server busy/i.test(text)) return '服务器繁忙，请稍后再试。';
+  return text;
 }
 
 function isAbortError(error) {

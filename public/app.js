@@ -41,7 +41,7 @@ const ids = [
 ];
 const el = Object.fromEntries(ids.map((id) => [id, document.querySelector(`#${id}`)]));
 
-const maxSteps = 50;
+const maxSteps = 28;
 const maxUrlSteps = 28;
 const defaultSteps = 28;
 

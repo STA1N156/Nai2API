@@ -223,7 +223,7 @@ export function generateMockImage(request, message = 'Mock NovelAI preview') {
 }
 
 export function buildErrorImage(message) {
-  return generateMockImage({ tag: message, width: 900, height: 480, seed: 0 }, 'Generation failed');
+  return generateMockImage({ tag: message, width: 900, height: 480, seed: 0 }, '生成失败');
 }
 
 function extractFirstImageFromZip(buffer) {
