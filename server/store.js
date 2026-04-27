@@ -210,8 +210,7 @@ export class JsonStore {
 
   async flush() {
     await this.ensureLoaded();
-    const snapshot = cloneDb(this.db);
-    return this.enqueueWrite(snapshot);
+    return this.enqueueWrite(this.db);
   }
 
   async enqueueWrite(db) {

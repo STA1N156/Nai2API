@@ -341,15 +341,14 @@ function updateLoadingStatus(job) {
     const position = Number(view.position || 0);
     target.textContent = position > 1 ? `正在排队，当前第 ${position} / ${count} 个` : '准备生成，正在等待可用账号';
     el.jobText.textContent = queueStatusText(position, count);
+    setLoadingStep(1);
     return;
   }
   if (job.status === 'running') {
     if (finishQueueView(job)) return;
     clearQueueView();
     target.textContent = '账号已分配，NovelAI 正在生成';
-    document.querySelectorAll('.loading-steps span').forEach((item, index) => {
-      item.classList.toggle('active', index <= 2);
-    });
+    setLoadingStep(2);
     return;
   }
   if (job.status === 'done') target.textContent = '生成完成，正在载入图片';
@@ -421,9 +420,7 @@ function ensureQueueViewTimer() {
       clearQueueView();
       if (target) target.textContent = '账号已分配，NovelAI 正在生成';
       el.jobText.textContent = '生成中';
-      document.querySelectorAll('.loading-steps span').forEach((item, index) => {
-        item.classList.toggle('active', index <= 2);
-      });
+      setLoadingStep(2);
     }
   }, state.queueView?.completing ? 120 : 420);
 }
@@ -436,6 +433,12 @@ function renderQueueText() {
   target.textContent = position > 1
     ? `正在排队，当前第 ${position} / ${count} 个`
     : '准备生成，正在等待可用账号';
+}
+
+function setLoadingStep(activeIndex) {
+  document.querySelectorAll('.loading-steps span').forEach((item, index) => {
+    item.classList.toggle('active', index <= activeIndex);
+  });
 }
 
 function clearQueueView() {

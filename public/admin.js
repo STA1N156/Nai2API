@@ -15,6 +15,7 @@ const state = {
 };
 
 const jobPageSize = 10;
+const userRenderLimit = 300;
 
 const ids = [
   'adminState',
@@ -158,7 +159,7 @@ async function enterAdmin(options = {}) {
     const summary = await loadSummary();
     localStorage.setItem('nai.adminToken', state.adminToken);
     setAuthenticated(true);
-    renderSummary(summary);
+    renderSummary(summary, { renderImages: false });
     await refreshImages(false);
     if (!options.silent) showToast('已进入后台');
   } catch (error) {
@@ -188,9 +189,8 @@ function setAuthenticated(isAuthenticated) {
 }
 
 async function reloadDashboard() {
-    const summary = await loadSummary();
-    renderSummary(summary);
-    await refreshImages(false);
+  const summary = await loadSummary();
+  renderSummary(summary, { renderImages: false });
 }
 
 async function loadSummary() {
@@ -489,7 +489,7 @@ async function clearImages() {
   }
 }
 
-function renderSummary(summary) {
+function renderSummary(summary, options = {}) {
   const enabledAccounts = summary.accounts.filter((account) => account.enabled).length;
   const requestStats = requestStats1h(summary);
   const jobPageCount = Math.max(1, Math.ceil(summary.jobs.length / jobPageSize));
@@ -515,7 +515,7 @@ function renderSummary(summary) {
   renderUsers(summary.users);
 
   renderJobs(summary.jobs);
-  renderSummaryImages(summary);
+  if (options.renderImages === true) renderSummaryImages(summary);
 
   syncSelectionControls();
 }
@@ -576,11 +576,12 @@ function renderJobs(jobs) {
 
 function renderUsers(users) {
   const filtered = filteredUsers(users);
+  const visible = visibleUsers(users);
   el.userCountText.textContent = el.userSearch.value.trim()
     ? `${filtered.length} / ${users.length} 个密钥`
     : `${users.length} 个密钥`;
-  el.userList.innerHTML = filtered.length
-    ? filtered.map(renderUser).join('')
+  el.userList.innerHTML = visible.length
+    ? visible.map(renderUser).join('')
     : '<div class="empty small">没有匹配的密钥</div>';
   syncSelectionControls();
 }
@@ -771,6 +772,10 @@ function filteredUsers(users) {
     .some((value) => String(value || '').toLowerCase().includes(q)));
 }
 
+function visibleUsers(users) {
+  return filteredUsers(users).slice(0, userRenderLimit);
+}
+
 function handleUserSelection(event) {
   if (!event.target.classList.contains('user-select')) return;
   toggleSelection(state.selectedUsers, event.target.value, event.target.checked);
@@ -784,7 +789,7 @@ function handleAccountSelection(event) {
 }
 
 function toggleAllUsers() {
-  const users = filteredUsers(state.summary?.users || []);
+  const users = visibleUsers(state.summary?.users || []);
   if (el.selectAllUsers.checked) users.forEach((user) => state.selectedUsers.add(user.id));
   else users.forEach((user) => state.selectedUsers.delete(user.id));
   renderUsers(state.summary?.users || []);
@@ -813,9 +818,9 @@ function pruneSelections() {
 }
 
 function syncSelectionControls() {
-  const visibleUsers = filteredUsers(state.summary?.users || []);
+  const shownUsers = visibleUsers(state.summary?.users || []);
   const visibleAccounts = state.summary?.accounts || [];
-  el.selectAllUsers.checked = Boolean(visibleUsers.length) && visibleUsers.every((user) => state.selectedUsers.has(user.id));
+  el.selectAllUsers.checked = Boolean(shownUsers.length) && shownUsers.every((user) => state.selectedUsers.has(user.id));
   el.selectAllAccounts.checked = Boolean(visibleAccounts.length) && visibleAccounts.every((account) => state.selectedAccounts.has(account.id));
 }
 
