@@ -17,6 +17,7 @@ const store = new JsonStore(dataDir);
 let queueDrainTimer = null;
 let queueDraining = false;
 let queueDrainRequested = false;
+const jobWaiters = new Map();
 const directGenerateTimeoutMs = Number(process.env.DIRECT_GENERATE_TIMEOUT_MS || 60_000);
 const insufficientBalanceMessage = '密钥额度不足，无法生成图片。';
 
@@ -175,7 +176,9 @@ async function route(req, res) {
         stats1h: accountStatsSince(account.id, db.jobs, 60 * 60 * 1000)
       })),
       images: db.images.slice(0, 12).map(publicImage),
-      imageCount: db.images.length,
+      imageCount: db.imageCount ?? db.images.length,
+      imageTotal: db.imageCount ?? db.images.length,
+      cacheImageCount: db.imageCount ?? db.images.length,
       jobStats1h: jobStatsSince(db.jobs, 60 * 60 * 1000),
       jobs: db.jobs.slice(0, 50).map((job) => publicJob(job, db)),
       ledger: db.ledger.slice(0, 80)
@@ -406,43 +409,32 @@ async function handleDirectGenerate(url, res) {
   }
 
   const deadline = Date.now() + directGenerateTimeoutMs;
-  const abortController = new AbortController();
-  const timeout = setTimeout(() => abortController.abort(), Math.max(1, directGenerateTimeoutMs));
-  let generationTimeout = null;
-  let result = null;
   let directJob = null;
   try {
-    directJob = await createDirectJob(token, request, cacheKey);
-    result = await reserveCreditAndAccountWhenAvailable(token, request, cacheKey, deadline);
+    directJob = await createDirectJob(token, request, cacheKey, { deadlineAt: new Date(deadline).toISOString() });
+    scheduleQueueDrain();
+    const result = await waitForJobResult(directJob.id, deadline);
     if (!result) {
-      await markDirectJobFailed(directJob.id, 'server busy, please retry later.');
-      sendBusyImage(res);
+      await timeoutDirectJob(directJob.id);
+      sendTimeoutImage(res);
       return;
     }
-    result.job = { id: directJob.id };
-    await markDirectJobRunning(directJob.id, result);
-    const remainingMs = deadline - Date.now();
-    if (remainingMs <= 0) throw new Error('direct generate timeout');
-    clearTimeout(timeout);
-    generationTimeout = setTimeout(() => abortController.abort(), Math.max(1, remainingMs));
-    const image = await generateWithAccountRetry(result, request, { signal: abortController.signal, deadline });
-    clearTimeout(generationTimeout);
-    const saved = await completeGeneration(result, request, image, { direct: true, jobId: directJob.id });
-    sendImage(res, 200, saved.mimeType, image.buffer, {
+    if (result.error) throw new Error(result.error);
+    const image = result.image || await readStoredImage(result.saved);
+    sendImage(res, 200, result.saved.mimeType, image.buffer || image, {
       'x-cache': 'miss',
-      'x-balance': String(saved.balance)
+      'x-balance': String(result.balance ?? '')
     });
   } catch (error) {
-    if (result) await failGeneration(result, error);
-    if (!result && directJob) {
+    if (directJob) {
       if (isInsufficientBalanceError(error)) {
         await removeJob(directJob.id);
       } else {
         await markDirectJobFailed(directJob.id, publicErrorMessage(error.message || 'direct generate failed.'));
       }
     }
-    if (abortController.signal.aborted || error.message === 'direct generate timeout') {
-      sendBusyImage(res);
+    if (error.message === 'direct generate timeout') {
+      sendTimeoutImage(res);
       return;
     }
     if (isNovelAiCapacityError(error)) {
@@ -450,9 +442,6 @@ async function handleDirectGenerate(url, res) {
       return;
     }
     throw error;
-  } finally {
-    clearTimeout(timeout);
-    clearTimeout(generationTimeout);
   }
 }
 
@@ -893,8 +882,15 @@ async function ensureAccountRouteIds() {
 
 async function createDirectJob(token, request, cacheKey, options = {}) {
   return store.update((db) => {
-    getUserOrThrow(db, token);
+    const user = getUserOrThrow(db, token);
+    const cost = Number(options.cost ?? generationCost());
+    const shouldCharge = !options.status && cost > 0;
+    if (shouldCharge && user.balance < cost) throw httpError(402, insufficientBalanceMessage);
     const now = new Date().toISOString();
+    if (shouldCharge) {
+      user.balance -= cost;
+      user.updatedAt = now;
+    }
     const job = {
       id: createId('job'),
       source: 'direct',
@@ -903,14 +899,25 @@ async function createDirectJob(token, request, cacheKey, options = {}) {
       request,
       cacheKey,
       queueTotal: options.status === 'done' ? 1 : activeJobCount(db.jobs) + 1,
-      cost: Number(options.cost || 0),
+      cost: shouldCharge ? cost : Number(options.cost || 0),
       accountId: options.accountId || '',
+      deadlineAt: options.deadlineAt || '',
       createdAt: now,
       updatedAt: now,
       imageId: options.imageId || '',
       error: ''
     };
     db.jobs.unshift(job);
+    if (shouldCharge) {
+      db.ledger.unshift({
+        id: createId('log'),
+        type: 'reserve',
+        token,
+        jobId: job.id,
+        amount: -cost,
+        at: now
+      });
+    }
     return job;
   });
 }
@@ -934,12 +941,55 @@ async function markDirectJobFailed(jobId, message) {
     job.error = publicErrorMessage(message);
     job.updatedAt = new Date().toISOString();
   });
+  notifyJobWaiters(jobId, { error: publicErrorMessage(message) });
 }
 
 async function removeJob(jobId) {
   await store.update((db) => {
     db.jobs = db.jobs.filter((job) => job.id !== jobId);
   });
+}
+
+async function timeoutDirectJob(jobId) {
+  await store.update((db) => {
+    const job = db.jobs.find((item) => item.id === jobId);
+    if (!job || ['done', 'failed'].includes(job.status)) return;
+    if (job.status !== 'queued') return;
+    refundJob(db, job, '连接超时');
+    job.status = 'failed';
+    job.error = '连接超时';
+    job.updatedAt = new Date().toISOString();
+  });
+}
+
+function waitForJobResult(jobId, deadline) {
+  const remainingMs = Math.max(1, deadline - Date.now());
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      removeJobWaiter(jobId, waiter);
+      resolve(null);
+    }, remainingMs);
+    const waiter = { resolve, timer };
+    if (!jobWaiters.has(jobId)) jobWaiters.set(jobId, new Set());
+    jobWaiters.get(jobId).add(waiter);
+  });
+}
+
+function notifyJobWaiters(jobId, payload) {
+  const waiters = jobWaiters.get(jobId);
+  if (!waiters) return;
+  jobWaiters.delete(jobId);
+  waiters.forEach((waiter) => {
+    clearTimeout(waiter.timer);
+    waiter.resolve(payload);
+  });
+}
+
+function removeJobWaiter(jobId, waiter) {
+  const waiters = jobWaiters.get(jobId);
+  if (!waiters) return;
+  waiters.delete(waiter);
+  if (!waiters.size) jobWaiters.delete(jobId);
 }
 
 async function runJob(jobId) {
@@ -956,6 +1006,13 @@ async function reserveQueuedJob(jobId) {
     const job = db.jobs.find((item) => item.id === jobId);
     if (!job) throw new Error('job not found.');
     if (job.status !== 'queued') return { skip: true };
+    if (isExpiredJob(job)) {
+      refundJob(db, job, '连接超时');
+      job.status = 'failed';
+      job.error = '连接超时';
+      job.updatedAt = new Date().toISOString();
+      return { skip: true };
+    }
     const account = selectAccount(db.accounts, db.settings);
     if (!account && hasEnabledAccounts(db.accounts)) {
       job.updatedAt = new Date().toISOString();
@@ -1178,6 +1235,7 @@ async function completeGeneration(reservation, request, image, meta = {}) {
     return { ...saved, balance: user.balance };
   });
   scheduleQueueDrain();
+  if (meta.jobId) notifyJobWaiters(meta.jobId, { saved: savedImage, image, balance: savedImage.balance });
   return savedImage;
 }
 
@@ -1212,6 +1270,7 @@ async function failGeneration(reservation, error) {
     });
   });
   scheduleQueueDrain();
+  if (reservation.job?.id) notifyJobWaiters(reservation.job.id, { error: publicErrorMessage(error.message) });
 }
 
 function selectAccount(accounts, settings = {}, options = {}) {
@@ -1566,6 +1625,30 @@ function activeJobCount(jobs) {
   return jobs.filter((job) => ['queued', 'running'].includes(job.status)).length;
 }
 
+function isExpiredJob(job) {
+  const deadline = Date.parse(job.deadlineAt || '');
+  return Number.isFinite(deadline) && deadline > 0 && Date.now() >= deadline;
+}
+
+function refundJob(db, job, note) {
+  if (job.refundedAt) return;
+  const cost = Number(job.cost || 0);
+  if (cost <= 0) return;
+  const user = db.users.find((item) => item.token === job.userToken);
+  if (!user) return;
+  user.balance += cost;
+  user.updatedAt = new Date().toISOString();
+  job.refundedAt = new Date().toISOString();
+  db.ledger.unshift({
+    id: createId('log'),
+    type: 'refund',
+    token: job.userToken,
+    amount: cost,
+    at: job.refundedAt,
+    note
+  });
+}
+
 function jobStatsSince(jobs, rangeMs) {
   const since = Date.now() - rangeMs;
   return finalizeStats(jobs.reduce((stats, job) => {
@@ -1662,6 +1745,7 @@ function isQuotaFailureJob(job) {
 function publicErrorMessage(message) {
   const text = String(message || '');
   if (isInsufficientBalanceError({ message: text })) return insufficientBalanceMessage;
+  if (/This operation was aborted|operation was aborted|direct generate timeout|AbortError/i.test(text)) return '连接超时';
   if (/invalid token/i.test(text)) return '密钥无效或已被禁用。';
   if (/all NovelAI accounts are busy|server busy/i.test(text)) return '服务器繁忙，请稍后再试。';
   return text;
@@ -1778,6 +1862,15 @@ function sendBusyImage(res) {
     'x-error': '1',
     'x-busy': '1',
     'retry-after': '15'
+  });
+}
+
+function sendTimeoutImage(res) {
+  const image = buildErrorImage('连接超时');
+  sendImage(res, 200, image.mimeType, image.buffer, {
+    'cache-control': 'no-store',
+    'x-error': '1',
+    'x-timeout': '1'
   });
 }
 

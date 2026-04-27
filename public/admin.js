@@ -497,8 +497,13 @@ function renderSummary(summary) {
   el.metricUsers.textContent = summary.users.length;
   el.metricCredits.textContent = `${formatPercent(requestStats.successRate)}%`;
   el.metricAccounts.textContent = enabledAccounts;
-  el.metricImages.textContent = summary.imageCount || 0;
-  state.imageTotal = Number(summary.imageCount || 0);
+  const imageTotal = summaryImageTotal(summary);
+  if (imageTotal !== null) {
+    el.metricImages.textContent = imageTotal;
+    state.imageTotal = imageTotal;
+  } else if (!state.imageTotal) {
+    el.metricImages.textContent = '统计中';
+  }
   el.accountCount.textContent = `${summary.accounts.length} 个账号`;
   el.maxCacheImages.value = summary.settings?.maxCacheImages ?? 500;
   el.accountConcurrency.value = summary.settings?.accountConcurrency ?? 2;
@@ -518,12 +523,18 @@ function renderSummary(summary) {
 function renderSummaryImages(summary) {
   if (state.imagePage !== 1 || el.imageSearch.value.trim()) return;
   const images = Array.isArray(summary.images) ? summary.images : [];
-  const total = Number(summary.imageCount || images.length);
+  const total = summaryImageTotal(summary) ?? state.imageTotal ?? 0;
   state.images = images;
   state.imagePageSize = imagePageLimit();
   state.imageMatched = total;
   state.imageTotal = total;
   renderImages({ images, total, matched: total, offset: 0 });
+}
+
+function summaryImageTotal(summary = {}) {
+  const value = summary.imageCount ?? summary.imageTotal ?? summary.cacheImageCount;
+  const total = Number(value);
+  return Number.isFinite(total) ? total : null;
 }
 
 function requestStats1h(summary) {
@@ -575,7 +586,7 @@ function renderUsers(users) {
 }
 
 function renderImages(data) {
-  const total = Number(data?.total ?? state.imageTotal ?? state.images.length);
+  const total = Number(data?.total ?? state.imageTotal ?? 0);
   const matched = Number(data?.matched ?? state.imageMatched ?? total);
   const rows = selectedImageRows();
   const pageCount = Math.max(1, Math.ceil(matched / state.imagePageSize));
@@ -585,7 +596,7 @@ function renderImages(data) {
   el.imageCountText.textContent = el.imageSearch.value.trim()
     ? `${start}-${end} / ${matched} · ${rows} 行`
     : `${start}-${end} / ${total} · ${rows} 行`;
-  el.metricImages.textContent = total;
+  el.metricImages.textContent = Number.isFinite(total) ? total : '统计中';
   el.imageList.innerHTML = state.images.length
     ? state.images.map(renderImage).join('')
     : '<div class="empty small">暂无缓存图片</div>';

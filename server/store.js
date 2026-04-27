@@ -104,6 +104,8 @@ export class JsonStore {
       jobs: structuredClone(this.db.jobs),
       images: structuredClone(this.db.images.slice(0, 12)),
       imageCount: this.db.images.length,
+      imageTotal: this.db.images.length,
+      cacheImageCount: this.db.images.length,
       ledger: structuredClone(this.db.ledger.slice(0, 80))
     };
   }
