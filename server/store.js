@@ -44,12 +44,13 @@ export class JsonStore {
     this.dataDir = dataDir;
     this.dbPath = path.join(dataDir, 'library.json');
     this.queue = Promise.resolve();
+    this.db = null;
   }
 
   async init() {
     await mkdir(this.dataDir, { recursive: true });
     try {
-      const db = await this.read();
+      const db = await this.readRaw();
       db.accounts.forEach((account) => {
         account.inFlight = 0;
       });
@@ -60,8 +61,11 @@ export class JsonStore {
   }
 
   async read() {
-    await this.queue.catch(() => {});
-    return this.readRaw();
+    if (!this.db) {
+      await this.queue.catch(() => {});
+      this.db = await this.readRaw();
+    }
+    return cloneDb(this.db);
   }
 
   async readRaw() {
@@ -79,18 +83,23 @@ export class JsonStore {
     safeDb.jobs = safeDb.jobs.slice(0, 500);
     safeDb.images = safeDb.images.slice(0, maxCacheImages);
     safeDb.ledger = safeDb.ledger.slice(0, 1000);
+    this.db = safeDb;
     await writeFile(this.dbPath, `${JSON.stringify(safeDb, null, 2)}\n`, 'utf8');
   }
 
   async update(mutator) {
     this.queue = this.queue.catch(() => {}).then(async () => {
-      const db = await this.readRaw();
+      const db = cloneDb(this.db || await this.readRaw());
       const result = await mutator(db);
       await this.write(db);
       return result;
     });
     return this.queue;
   }
+}
+
+function cloneDb(db) {
+  return normalizeDb(structuredClone(db));
 }
 
 export function normalizeDb(db = {}) {

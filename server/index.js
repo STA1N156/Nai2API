@@ -129,10 +129,8 @@ async function route(req, res) {
 
   if (method === 'GET' && url.pathname === '/api/admin/summary') {
     assertAdmin(req, url);
-    const db = await store.update((current) => {
-      resetStaleAccountLoads(current.accounts);
-      return current;
-    });
+    const db = await store.read();
+    resetStaleAccountLoads(db.accounts);
     const revealTokens = url.searchParams.get('revealTokens') === '1';
     sendJson(res, 200, {
       settings: db.settings,
@@ -811,6 +809,7 @@ async function createJob(token, body) {
 
     const cost = generationCost();
     if (user.balance < cost) throw httpError(402, 'insufficient balance.');
+    const queueTotal = activeJobCount(db.jobs) + 1;
     user.balance -= cost;
     user.updatedAt = new Date().toISOString();
     const job = {
@@ -819,6 +818,7 @@ async function createJob(token, body) {
       status: 'queued',
       request,
       cacheKey,
+      queueTotal,
       cost,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
@@ -855,6 +855,7 @@ async function createDirectJob(token, request, cacheKey, options = {}) {
       status: options.status || 'queued',
       request,
       cacheKey,
+      queueTotal: options.status === 'done' ? 1 : activeJobCount(db.jobs) + 1,
       cost: Number(options.cost || 0),
       accountId: options.accountId || '',
       createdAt: now,
@@ -1377,8 +1378,7 @@ function sanitizeMigrationData(payload) {
 }
 
 function publicJob(job, db = null) {
-  const queuedJobs = db ? db.jobs.filter((item) => item.status === 'queued').reverse() : [];
-  const queuePosition = job.status === 'queued' ? queuedJobs.findIndex((item) => item.id === job.id) + 1 : 0;
+  const queue = db && job.status === 'queued' ? stableQueueProgress(job, db.jobs) : { progress: 0, total: 0 };
   const request = job.request || {};
   const account = db && job.accountId ? db.accounts.find((item) => item.id === job.accountId) : null;
   return {
@@ -1395,11 +1395,26 @@ function publicJob(job, db = null) {
     imageId: job.imageId || '',
     imageUrl: job.imageId ? `/api/images/${job.imageId}/content` : '',
     error: job.error || '',
-    queuePosition,
-    queuedCount: queuedJobs.length,
+    queuePosition: queue.progress,
+    queuedCount: queue.total,
     durationMs: jobDurationMs(job),
     createdAt: job.createdAt,
     updatedAt: job.updatedAt
+  };
+}
+
+function stableQueueProgress(job, jobs) {
+  const total = Math.max(1, Number(job.queueTotal || 0));
+  const createdAt = Date.parse(job.createdAt || '') || 0;
+  const activeAhead = jobs.filter((item) => {
+    if (item.id === job.id) return false;
+    if (!['queued', 'running'].includes(item.status)) return false;
+    const itemTime = Date.parse(item.createdAt || '') || 0;
+    return itemTime <= createdAt;
+  }).length;
+  return {
+    progress: Math.max(1, Math.min(total, total - activeAhead)),
+    total
   };
 }
 
@@ -1410,6 +1425,10 @@ function jobDurationMs(job) {
   const ended = terminal ? Date.parse(job.updatedAt || '') : Date.now();
   if (!ended || ended < started) return 0;
   return ended - started;
+}
+
+function activeJobCount(jobs) {
+  return jobs.filter((job) => ['queued', 'running'].includes(job.status)).length;
 }
 
 function jobStatsSince(jobs, rangeMs) {

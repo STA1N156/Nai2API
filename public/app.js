@@ -5,6 +5,8 @@ const state = {
   token: localStorage.getItem('nai.userToken') || '',
   toastTimer: null,
   pollTimer: null,
+  queueViewTimer: null,
+  queueView: null,
   generating: false,
   previewScale: 1,
   previewPanX: 0,
@@ -263,10 +265,11 @@ async function startJob() {
         noise_schedule: params.noise_schedule
       }
     });
+    resetQueueView(job);
     el.jobText.textContent = jobStatusText(job);
     updateLoadingStatus(job);
     await loadMe().catch(() => {});
-    state.pollTimer = setInterval(() => pollJob(job.id), 1600);
+    state.pollTimer = setInterval(() => pollJob(job.id), 1100);
     await pollJob(job.id);
   } catch (error) {
     renderFrameNotice('生成失败', true);
@@ -295,6 +298,7 @@ async function pollJob(id) {
   updateLoadingStatus(job);
   if (job.status === 'done') {
     clearInterval(state.pollTimer);
+    clearQueueView();
     renderResultImage(job.imageUrl);
     await loadMe().catch(() => {});
     showToast('图片已生成');
@@ -302,6 +306,7 @@ async function pollJob(id) {
   }
   if (job.status === 'failed') {
     clearInterval(state.pollTimer);
+    clearQueueView();
     renderFrameNotice('生成失败', true);
     showToast(job.error || '任务失败', true);
     setGenerateBusy(false);
@@ -309,6 +314,7 @@ async function pollJob(id) {
 }
 
 function renderLoadingFrame() {
+  clearQueueView();
   closeResultPreview();
   el.jobText.textContent = '生成中';
   el.imageFrame.classList.remove('result-ready');
@@ -329,12 +335,15 @@ function updateLoadingStatus(job) {
   const target = document.querySelector('#loadingStatusText');
   if (!target) return;
   if (job.status === 'queued') {
-    const count = Number(job.queuedCount || 0);
-    const position = Number(job.queuePosition || 0);
+    const view = updateQueueView(job);
+    const count = Number(view.count || 0);
+    const position = Number(view.position || 0);
     target.textContent = position > 1 ? `正在排队，当前第 ${position} / ${count} 个` : '准备生成，正在等待可用账号';
+    el.jobText.textContent = queueStatusText(position, count);
     return;
   }
   if (job.status === 'running') {
+    clearQueueView();
     target.textContent = '账号已分配，NovelAI 正在生成';
     document.querySelectorAll('.loading-steps span').forEach((item, index) => {
       item.classList.toggle('active', index <= 2);
@@ -342,6 +351,61 @@ function updateLoadingStatus(job) {
     return;
   }
   if (job.status === 'done') target.textContent = '生成完成，正在载入图片';
+}
+
+function resetQueueView(job = {}) {
+  clearQueueView();
+  const total = Number(job.queuedCount || 0);
+  const position = Number(job.queuePosition || 0);
+  if (job.status !== 'queued' || !total || !position) return;
+  state.queueView = {
+    position: Math.max(1, position),
+    target: Math.max(1, position),
+    count: Math.max(1, total)
+  };
+}
+
+function updateQueueView(job = {}) {
+  const total = Math.max(1, Number(job.queuedCount || 1));
+  const target = Math.max(1, Number(job.queuePosition || 1));
+  if (!state.queueView) {
+    state.queueView = { position: target, target, count: total };
+  } else {
+    state.queueView.count = Math.max(state.queueView.count, total);
+    state.queueView.target = Math.max(state.queueView.target, target);
+  }
+  ensureQueueViewTimer();
+  return state.queueView;
+}
+
+function ensureQueueViewTimer() {
+  if (state.queueViewTimer) return;
+  state.queueViewTimer = setInterval(() => {
+    if (!state.queueView) {
+      clearQueueView();
+      return;
+    }
+    if (state.queueView.position < state.queueView.target) {
+      state.queueView.position += 1;
+      renderQueueText();
+    }
+  }, 420);
+}
+
+function renderQueueText() {
+  const target = document.querySelector('#loadingStatusText');
+  if (!target || !state.queueView) return;
+  const { position, count } = state.queueView;
+  el.jobText.textContent = queueStatusText(position, count);
+  target.textContent = position > 1
+    ? `正在排队，当前第 ${position} / ${count} 个`
+    : '准备生成，正在等待可用账号';
+}
+
+function clearQueueView() {
+  if (state.queueViewTimer) clearInterval(state.queueViewTimer);
+  state.queueViewTimer = null;
+  state.queueView = null;
 }
 
 function renderFrameNotice(message, isError = false) {
@@ -453,15 +517,23 @@ function closeResultPreview() {
 
 function jobStatusText(job) {
   if (job.status === 'queued') {
-    const count = Number(job.queuedCount || 0);
-    const position = Number(job.queuePosition || 0);
-    if (position <= 1 && count <= 1) return '准备生成中';
-    return position ? `排队中（第 ${position} / ${count} 个）` : `排队中（${count} 个）`;
+    const view = state.queueView || {
+      count: Number(job.queuedCount || 0),
+      position: Number(job.queuePosition || 0)
+    };
+    return queueStatusText(view.position, view.count);
   }
   if (job.status === 'running') return '生成中';
   if (job.status === 'done') return '生成完成';
   if (job.status === 'failed') return '生成失败';
   return job.status || '等待请求';
+}
+
+function queueStatusText(position, count) {
+  const total = Number(count || 0);
+  const current = Number(position || 0);
+  if (current <= 1 && total <= 1) return '准备生成中';
+  return current ? `排队中（第 ${current} / ${total} 个）` : `排队中（${total} 个）`;
 }
 
 function setGenerateBusy(isBusy) {
