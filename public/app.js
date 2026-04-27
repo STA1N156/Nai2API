@@ -7,6 +7,7 @@ const state = {
   pollTimer: null,
   queueViewTimer: null,
   queueView: null,
+  queueViewCompleteTimer: null,
   generating: false,
   previewScale: 1,
   previewPanX: 0,
@@ -343,6 +344,7 @@ function updateLoadingStatus(job) {
     return;
   }
   if (job.status === 'running') {
+    if (finishQueueView(job)) return;
     clearQueueView();
     target.textContent = '账号已分配，NovelAI 正在生成';
     document.querySelectorAll('.loading-steps span').forEach((item, index) => {
@@ -369,13 +371,36 @@ function updateQueueView(job = {}) {
   const total = Math.max(1, Number(job.queuedCount || 1));
   const target = Math.max(1, Number(job.queuePosition || 1));
   if (!state.queueView) {
-    state.queueView = { position: target, target, count: total };
+    state.queueView = { position: target, target, count: total, completing: false };
   } else {
     state.queueView.count = Math.max(state.queueView.count, total);
     state.queueView.target = Math.max(state.queueView.target, target);
   }
   ensureQueueViewTimer();
   return state.queueView;
+}
+
+function finishQueueView(job = {}) {
+  if (!state.queueView) return false;
+  const total = Math.max(
+    Number(state.queueView.count || 0),
+    Number(job.queuedCount || 0),
+    Number(job.queuePosition || 0)
+  );
+  if (total <= 1 || state.queueView.position >= total) {
+    clearQueueView();
+    return false;
+  }
+  state.queueView.count = total;
+  state.queueView.target = total;
+  state.queueView.completing = true;
+  if (state.queueViewTimer) {
+    clearInterval(state.queueViewTimer);
+    state.queueViewTimer = null;
+  }
+  ensureQueueViewTimer();
+  renderQueueText();
+  return true;
 }
 
 function ensureQueueViewTimer() {
@@ -388,8 +413,19 @@ function ensureQueueViewTimer() {
     if (state.queueView.position < state.queueView.target) {
       state.queueView.position += 1;
       renderQueueText();
+      return;
     }
-  }, 420);
+    if (state.queueView.completing) {
+      const target = document.querySelector('#loadingStatusText');
+      state.queueView.completing = false;
+      clearQueueView();
+      if (target) target.textContent = '账号已分配，NovelAI 正在生成';
+      el.jobText.textContent = '生成中';
+      document.querySelectorAll('.loading-steps span').forEach((item, index) => {
+        item.classList.toggle('active', index <= 2);
+      });
+    }
+  }, state.queueView?.completing ? 120 : 420);
 }
 
 function renderQueueText() {
@@ -404,7 +440,9 @@ function renderQueueText() {
 
 function clearQueueView() {
   if (state.queueViewTimer) clearInterval(state.queueViewTimer);
+  if (state.queueViewCompleteTimer) clearTimeout(state.queueViewCompleteTimer);
   state.queueViewTimer = null;
+  state.queueViewCompleteTimer = null;
   state.queueView = null;
 }
 

@@ -445,6 +445,10 @@ async function handleDirectGenerate(url, res) {
       sendBusyImage(res);
       return;
     }
+    if (isNovelAiCapacityError(error)) {
+      sendBusyImage(res);
+      return;
+    }
     throw error;
   } finally {
     clearTimeout(timeout);
@@ -596,6 +600,7 @@ async function addAccount(body) {
       inFlight: 0,
       total: 0,
       failures: 0,
+      cooldownUntil: '',
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
       lastUsedAt: ''
@@ -622,6 +627,7 @@ async function importAccounts(body) {
       inFlight: 0,
       total: Number(account.total || 0),
       failures: Number(account.failures || 0),
+      cooldownUntil: '',
       createdAt: account.createdAt || now,
       updatedAt: now,
       lastUsedAt: account.lastUsedAt || ''
@@ -703,6 +709,7 @@ async function resetAccountStats(body) {
       account.inFlight = 0;
       account.total = 0;
       account.failures = 0;
+      account.cooldownUntil = '';
       account.lastUsedAt = '';
       account.updatedAt = now;
     });
@@ -971,6 +978,10 @@ async function runReservedJob(reservation) {
     const image = await generateWithAccountRetry(reservation, reservation.job.request);
     await completeGeneration(reservation, reservation.job.request, image, { jobId: reservation.job.id });
   } catch (error) {
+    if (isNovelAiCapacityError(error)) {
+      await requeueReservedJob(reservation, error);
+      return;
+    }
     await failGeneration(reservation, error);
   }
 }
@@ -1008,6 +1019,7 @@ async function retryReservationWithNextAccount(reservation, error, tried, option
     if (failedAccount) {
       failedAccount.inFlight = Math.max(0, Number(failedAccount.inFlight || 0) - 1);
       failedAccount.failures = Number(failedAccount.failures || 0) + 1;
+      if (isNovelAiCapacityError(error)) failedAccount.cooldownUntil = new Date(Date.now() + accountBusyCooldownMs()).toISOString();
       failedAccount.updatedAt = new Date().toISOString();
     }
 
@@ -1033,6 +1045,30 @@ async function retryReservationWithNextAccount(reservation, error, tried, option
       job: reservation.job ? { ...reservation.job, accountId: account.id } : reservation.job
     };
   });
+}
+
+async function requeueReservedJob(reservation, error) {
+  let delay = accountBusyCooldownMs();
+  await store.update((db) => {
+    if (reservation.account?.id) {
+      const account = db.accounts.find((item) => item.id === reservation.account.id);
+      if (account) {
+        account.inFlight = Math.max(0, Number(account.inFlight || 0) - 1);
+        account.cooldownUntil = new Date(Date.now() + delay).toISOString();
+        account.updatedAt = new Date().toISOString();
+      }
+    }
+    const job = reservation.job?.id ? db.jobs.find((item) => item.id === reservation.job.id) : null;
+    if (job) {
+      job.status = 'queued';
+      job.accountId = '';
+      job.error = '';
+      job.retryCount = Number(job.retryCount || 0) + 1;
+      job.updatedAt = new Date().toISOString();
+    }
+    delay = Math.max(250, nextAccountReadyDelay(db.accounts, db.settings) || delay);
+  });
+  scheduleQueueDrain(delay);
 }
 
 async function reserveCreditAndAccount(token, request, cacheKey) {
@@ -1181,7 +1217,8 @@ async function failGeneration(reservation, error) {
 function selectAccount(accounts, settings = {}, options = {}) {
   resetStaleAccountLoads(accounts);
   const excludeIds = options.excludeIds || new Set();
-  const enabled = accounts.filter((account) => account.enabled !== false);
+  const now = Date.now();
+  const enabled = accounts.filter((account) => account.enabled !== false && !isAccountCoolingDown(account, now));
   if (!enabled.length) return null;
   const maxConcurrency = maxAccountConcurrency(settings);
   const available = enabled.filter((account) => !excludeIds.has(account.id) && Number(account.inFlight || 0) < maxConcurrency);
@@ -1200,10 +1237,26 @@ function maxAccountConcurrency(settings = {}) {
 
 function availableAccountSlots(accounts, settings = {}) {
   resetStaleAccountLoads(accounts);
-  const enabled = accounts.filter((account) => account.enabled !== false);
-  if (!enabled.length) return 1;
+  const now = Date.now();
+  const allEnabled = accounts.filter((account) => account.enabled !== false);
+  if (!allEnabled.length) return 1;
+  const enabled = allEnabled.filter((account) => !isAccountCoolingDown(account, now));
+  if (!enabled.length) return 0;
   const maxConcurrency = maxAccountConcurrency(settings);
   return enabled.reduce((sum, account) => sum + Math.max(0, maxConcurrency - Number(account.inFlight || 0)), 0);
+}
+
+function nextAccountReadyDelay(accounts, settings = {}) {
+  resetStaleAccountLoads(accounts);
+  const now = Date.now();
+  const maxConcurrency = maxAccountConcurrency(settings);
+  const enabled = accounts.filter((account) => account.enabled !== false);
+  if (!enabled.length) return 0;
+  if (enabled.some((account) => !isAccountCoolingDown(account, now) && Number(account.inFlight || 0) < maxConcurrency)) return 0;
+  const waits = enabled
+    .map((account) => Date.parse(account.cooldownUntil || '') - now)
+    .filter((wait) => Number.isFinite(wait) && wait > 0);
+  return waits.length ? Math.min(...waits) + 50 : 1000;
 }
 
 function scheduleQueueDrain(delay = 0) {
@@ -1225,15 +1278,20 @@ async function drainQueuedJobs() {
   queueDraining = true;
   queueDrainRequested = false;
   try {
-    const jobIds = await store.update((db) => {
+    const drainPlan = await store.update((db) => {
       const slots = availableAccountSlots(db.accounts, db.settings);
-      if (slots <= 0) return [];
-      return db.jobs
-        .filter((job) => job.status === 'queued')
-        .reverse()
-        .slice(0, slots)
-        .map((job) => job.id);
+      if (slots <= 0) return { jobIds: [], delay: nextAccountReadyDelay(db.accounts, db.settings) };
+      return {
+        jobIds: db.jobs
+          .filter((job) => job.status === 'queued')
+          .reverse()
+          .slice(0, slots)
+          .map((job) => job.id),
+        delay: 0
+      };
     });
+    const jobIds = drainPlan.jobIds || [];
+    if (!jobIds.length && drainPlan.delay > 0) queueDrainRequested = true;
     const reservations = await Promise.all(jobIds.map((id) => reserveQueuedJob(id).catch((error) => ({ error }))));
     reservations.forEach((reservation) => {
       if (reservation?.error) {
@@ -1244,8 +1302,16 @@ async function drainQueuedJobs() {
     });
   } finally {
     queueDraining = false;
-    if (queueDrainRequested) scheduleQueueDrain(25);
+    if (queueDrainRequested) {
+      const delay = await queueRetryDelay();
+      scheduleQueueDrain(delay);
+    }
   }
+}
+
+async function queueRetryDelay() {
+  const db = await store.readCollections(['settings', 'accounts']);
+  return Math.max(25, nextAccountReadyDelay(db.accounts, db.settings) || 25);
 }
 
 function hasEnabledAccounts(accounts) {
@@ -1256,10 +1322,20 @@ function resetStaleAccountLoads(accounts) {
   const staleAfterMs = Number(process.env.ACCOUNT_INFLIGHT_TIMEOUT_MS || 10 * 60 * 1000);
   const now = Date.now();
   accounts.forEach((account) => {
+    if (account.cooldownUntil && Date.parse(account.cooldownUntil) <= now) account.cooldownUntil = '';
     if (Number(account.inFlight || 0) <= 0) return;
     const lastUsed = Date.parse(account.lastUsedAt || 0);
     if (!lastUsed || now - lastUsed > staleAfterMs) account.inFlight = 0;
   });
+}
+
+function isAccountCoolingDown(account, now = Date.now()) {
+  const until = Date.parse(account.cooldownUntil || '');
+  return Number.isFinite(until) && until > now;
+}
+
+function accountBusyCooldownMs() {
+  return clamp(Number(process.env.ACCOUNT_429_COOLDOWN_MS || 800), 200, 120_000);
 }
 
 function assignAccountRouteIds(accounts) {
@@ -1341,6 +1417,7 @@ function publicAccount(account, options = {}) {
     inFlight: account.inFlight || 0,
     total: account.total || 0,
     failures: account.failures || 0,
+    cooldownUntil: account.cooldownUntil || '',
     stats1h: options.stats1h || { done: 0, failed: 0, total: 0, successRate: 0 },
     lastUsedAt: account.lastUsedAt || ''
   };
@@ -1432,7 +1509,11 @@ function sanitizeMigrationData(payload) {
 }
 
 function publicJob(job, db = null) {
-  const queue = db && job.status === 'queued' ? stableQueueProgress(job, db.jobs) : { progress: 0, total: 0 };
+  const queue = db && job.status === 'queued'
+    ? stableQueueProgress(job, db.jobs)
+    : job.status === 'running' && Number(job.queueTotal || 0) > 1
+      ? { progress: Number(job.queueTotal || 0), total: Number(job.queueTotal || 0) }
+      : { progress: 0, total: 0 };
   const request = job.request || {};
   const account = db && job.accountId ? db.accounts.find((item) => item.id === job.accountId) : null;
   return {
@@ -1567,6 +1648,11 @@ function isNoCache(value) {
 
 function isInsufficientBalanceError(error) {
   return Number(error?.statusCode || error?.status) === 402 || /insufficient balance|额度不足|余额不足/i.test(String(error?.message || error || ''));
+}
+
+function isNovelAiCapacityError(error) {
+  const text = String(error?.message || error || '');
+  return /NovelAI returned 429|statusCode["']?\s*:\s*429|Concurrent generation is locked|并发生成被锁定|concurrent generation/i.test(text);
 }
 
 function isQuotaFailureJob(job) {

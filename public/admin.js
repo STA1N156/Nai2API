@@ -6,6 +6,7 @@ const state = {
   selectedAccounts: new Set(),
   summary: null,
   images: [],
+  imageTotal: 0,
   imagePage: 1,
   imagePageSize: 1,
   imageMatched: 0,
@@ -458,6 +459,7 @@ async function refreshImages(withToast = true) {
     }
     state.images = data.images || [];
     state.imagePageSize = limit;
+    state.imageTotal = Number(data.total ?? state.imageTotal ?? state.images.length);
     state.imageMatched = matched;
     renderImages(data);
     if (withToast) showToast('缓存图片已刷新');
@@ -496,6 +498,7 @@ function renderSummary(summary) {
   el.metricCredits.textContent = `${formatPercent(requestStats.successRate)}%`;
   el.metricAccounts.textContent = enabledAccounts;
   el.metricImages.textContent = summary.imageCount || 0;
+  state.imageTotal = Number(summary.imageCount || 0);
   el.accountCount.textContent = `${summary.accounts.length} 个账号`;
   el.maxCacheImages.value = summary.settings?.maxCacheImages ?? 500;
   el.accountConcurrency.value = summary.settings?.accountConcurrency ?? 2;
@@ -507,8 +510,20 @@ function renderSummary(summary) {
   renderUsers(summary.users);
 
   renderJobs(summary.jobs);
+  renderSummaryImages(summary);
 
   syncSelectionControls();
+}
+
+function renderSummaryImages(summary) {
+  if (state.imagePage !== 1 || el.imageSearch.value.trim()) return;
+  const images = Array.isArray(summary.images) ? summary.images : [];
+  const total = Number(summary.imageCount || images.length);
+  state.images = images;
+  state.imagePageSize = imagePageLimit();
+  state.imageMatched = total;
+  state.imageTotal = total;
+  renderImages({ images, total, matched: total, offset: 0 });
 }
 
 function requestStats1h(summary) {
@@ -560,8 +575,8 @@ function renderUsers(users) {
 }
 
 function renderImages(data) {
-  const total = data?.total ?? state.images.length;
-  const matched = data?.matched ?? state.images.length;
+  const total = Number(data?.total ?? state.imageTotal ?? state.images.length);
+  const matched = Number(data?.matched ?? state.imageMatched ?? total);
   const rows = selectedImageRows();
   const pageCount = Math.max(1, Math.ceil(matched / state.imagePageSize));
   const offset = data?.offset ?? (state.imagePage - 1) * state.imagePageSize;
@@ -633,7 +648,6 @@ function renderUser(user) {
 function renderJob(job) {
   const status = jobStatusText(job.status);
   const statusClass = jobStatusClass(job.status);
-  const prompt = job.prompt || job.id;
   const requestedSteps = Number(job.requestedSteps || 0);
   const routedSteps = Number(job.routedSteps || 0);
   const stepText = requestedSteps && routedSteps
@@ -651,7 +665,6 @@ function renderJob(job) {
         <span class="status-badge ${statusClass}">${status}</span>
         <span class="job-time">${escapeHtml(formatDate(job.createdAt))}</span>
       </div>
-      <strong title="${escapeHtml(prompt)}">${escapeHtml(prompt)}</strong>
       <span class="step-route">${escapeHtml([sourceText, accountText, durationText].filter(Boolean).join(' · '))}</span>
       ${stepText ? `<span class="step-route">${escapeHtml(stepText)}</span>` : ''}
       ${queueText ? `<span>${escapeHtml(queueText)}</span>` : ''}
