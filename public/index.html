@@ -41,6 +41,8 @@
             <select id="samplerInput">
               <option value="k_dpmpp_2m_sde">DPM++ 2M SDE</option>
               <option value="k_dpmpp_2m">DPM++ 2M</option>
+              <option value="k_dpmpp_sde">DPM++ SDE</option>
+              <option value="k_dpmpp_2s_ancestral">DPM++ 2S Ancestral</option>
               <option value="k_euler_ancestral">Euler Ancestral</option>
               <option value="k_euler">Euler</option>
             </select>
@@ -72,7 +74,14 @@
 
         <label>
           Artist / 质量前缀
-          <textarea id="artistInput" rows="4"></textarea>
+          <select id="artistPresetInput">
+            <option value="2.5d">2.5D唯美风</option>
+            <option value="fresh">韩漫小清新风</option>
+            <option value="doujin">本子动漫风</option>
+            <option value="galgame">GalGame风</option>
+            <option value="custom">自定义</option>
+          </select>
+          <textarea id="artistInput" rows="8"></textarea>
         </label>
         <label>
           负面提示词
@@ -83,13 +92,15 @@
 
       <section class="panel result-panel">
         <div class="panel-title">
-          <div>
+          <div class="result-title-main">
             <h2>结果</h2>
-            <span id="jobText">等待请求</span>
-          </div>
-          <div class="panel-actions">
-            <button id="directGenerateBtn" class="primary">生成图片</button>
-            <button id="copySnippetTopBtn" class="secondary">复制嵌入代码</button>
+            <div class="result-title-row">
+              <span id="jobText">等待请求</span>
+              <div class="panel-actions result-actions">
+                <button id="directGenerateBtn" class="primary">生成图片</button>
+                <button id="copySnippetTopBtn" class="secondary">复制嵌入代码</button>
+              </div>
+            </div>
           </div>
         </div>
 
@@ -101,6 +112,8 @@
 
     <div id="resultPreview" class="image-preview hidden" aria-hidden="true">
       <button id="closeResultPreviewBtn" class="preview-close" type="button" aria-label="关闭预览">×</button>
+      <button id="prevResultBtn" class="preview-nav preview-prev" type="button" aria-label="上一张">‹</button>
+      <button id="nextResultBtn" class="preview-nav preview-next" type="button" aria-label="下一张">›</button>
       <div class="preview-stage result-preview-stage">
         <img id="resultPreviewImage" alt="生成图片预览" />
       </div>

@@ -1,9 +1,14 @@
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { createWriteStream } from 'node:fs';
+import { copyFile, mkdir, readFile, rename, unlink } from 'node:fs/promises';
 import crypto from 'node:crypto';
 import path from 'node:path';
 
 export const MAX_CACHE_IMAGES_LIMIT = 200000;
 export const MAX_FREE_STEPS = 28;
+export const defaultArtist2_5D =
+  `0.9::misaka_12003-gou ::, dino_(dinoartforame), wanke, liduke, year 2025, realistic, 4k, -2::green ::, textless version, The image is highly intricate finished drawn. Only the character's face is in anime style, but their body is in realistic style. 1.35::A highly finished photo-style artwork that has lively color, graphic texture, realistic skin surface, and lifelike flesh with little obliques::. 1.63::photorealistic::, 1.63::photo(medium)::, \\n20::best quality, absurdres, very aesthetic, detailed, masterpiece::,, very aesthetic, masterpiece, no text,`;
+export const legacyDefaultArtist =
+  'artist:ningen_mame,, noyu_(noyu23386566),, toosaka asagi,, location,\n20::best quality, absurdres, very aesthetic, detailed, masterpiece::,:,, very aesthetic, masterpiece, no text,';
 
 const defaultSettings = {
   serviceName: 'Nai2API',
@@ -13,8 +18,7 @@ const defaultSettings = {
   publicBaseUrl: '',
   mockWhenNoAccount: true,
   defaultModel: 'nai-diffusion-4-5-full',
-  defaultArtist:
-    'artist:ningen_mame,, noyu_(noyu23386566),, toosaka asagi,, location,\n20::best quality, absurdres, very aesthetic, detailed, masterpiece::,:,, very aesthetic, masterpiece, no text,',
+  defaultArtist: defaultArtist2_5D,
   defaultNegative:
     '{{{{bad anatomy}}}},{bad feet},bad hands,{{{bad proportions}}},{blurry},cloned face,cropped,{{{deformed}}},{{{disfigured}}},error,{{{extra arms}}},{extra digit},{{{extra legs}}},extra limbs,{{extra limbs}},{fewer digits},{{{fused fingers}}},gross proportions,jpeg artifacts,{{{{long neck}}}},low quality,{malformed limbs},{{missing arms}},{missing fingers},{{missing legs}},mutated hands,{{{mutation}}},normal quality,poorly drawn face,poorly drawn hands,signature,text,{{too many fingers}},{{{ugly}}},username,watermark,worst quality',
   defaults: {
@@ -57,8 +61,20 @@ export class JsonStore {
         account.inFlight = 0;
       });
       await this.write(db);
-    } catch {
-      await this.write(defaultDb);
+    } catch (error) {
+      const backupDb = await this.readBackup().catch(() => null);
+      if (backupDb) {
+        backupDb.accounts.forEach((account) => {
+          account.inFlight = 0;
+        });
+        await this.write(backupDb);
+        return;
+      }
+      if (error?.code === 'ENOENT') {
+        await this.write(defaultDb);
+        return;
+      }
+      throw error;
     }
   }
 
@@ -102,14 +118,16 @@ export class JsonStore {
     const limit = Math.max(1, Math.min(200, Math.floor(Number(options.limit || 60))));
     const offset = Math.max(0, Math.floor(Number(options.offset || 0)));
     const q = String(options.q || '').trim().toLowerCase();
-    const total = this.db.images.length;
+    const tier = String(options.tier || '').trim().toLowerCase();
+    const source = tier ? this.db.images.filter((image) => imageResolutionTier(image).toLowerCase() === tier) : this.db.images;
+    const total = tier ? this.db.images.length : source.length;
 
     if (!q) {
-      const page = this.db.images.slice(offset, offset + limit);
+      const page = source.slice(offset, offset + limit);
       return {
         images: structuredClone(page),
         total,
-        matched: total,
+        matched: source.length,
         offset,
         limit,
         maxCacheImages: this.db.settings.maxCacheImages
@@ -118,7 +136,7 @@ export class JsonStore {
 
     const page = [];
     let matched = 0;
-    for (const image of this.db.images) {
+    for (const image of source) {
       const isMatch = [image.id, image.token, image.prompt, image.fullPrompt, image.model]
         .some((value) => String(value || '').toLowerCase().includes(q));
       if (!isMatch) continue;
@@ -173,6 +191,12 @@ export class JsonStore {
     return normalizeDb(db);
   }
 
+  async readBackup() {
+    const raw = await readFile(`${this.dbPath}.bak`, 'utf8');
+    const db = JSON.parse(raw);
+    return normalizeDb(db);
+  }
+
   async write(db) {
     if (this.flushTimer) {
       clearTimeout(this.flushTimer);
@@ -219,8 +243,19 @@ export class JsonStore {
   }
 
   async writeSnapshot(db) {
-    await writeFile(this.dbPath, `${JSON.stringify(db, null, 2)}\n`, 'utf8');
+    const tempPath = `${this.dbPath}.${process.pid}.${Date.now()}.tmp`;
+    await writeJsonSnapshot(tempPath, db);
+    await renameWithRetry(tempPath, this.dbPath);
+    await copyFile(this.dbPath, `${this.dbPath}.bak`).catch(() => {});
   }
+}
+
+function imageResolutionTier(image) {
+  const width = Number(image?.width || 0);
+  const height = Number(image?.height || 0);
+  if (width >= 1700 || height >= 1900) return '4K';
+  if (width >= 1300 || height >= 1500) return '2K';
+  return 'standard';
 }
 
 function cloneDb(db) {
@@ -230,6 +265,112 @@ function cloneDb(db) {
 function cloneValue(value) {
   if (value === undefined || value === null) return value;
   return structuredClone(value);
+}
+
+async function writeJsonSnapshot(filePath, db) {
+  const snapshot = snapshotDb(db);
+  const stream = createWriteStream(filePath, { encoding: 'utf8' });
+  try {
+    await writeChunk(stream, '{');
+    await writeObjectProperty(stream, 'settings', snapshot.settings, true);
+    await writeArrayProperty(stream, 'cards', snapshot.cards);
+    await writeArrayProperty(stream, 'users', snapshot.users);
+    await writeArrayProperty(stream, 'accounts', snapshot.accounts);
+    await writeArrayProperty(stream, 'jobs', snapshot.jobs);
+    await writeArrayProperty(stream, 'images', snapshot.images);
+    await writeArrayProperty(stream, 'ledger', snapshot.ledger);
+    await writeChunk(stream, '\n}\n');
+    await closeStream(stream);
+  } catch (error) {
+    stream.destroy();
+    await unlink(filePath).catch(() => {});
+    throw error;
+  }
+}
+
+function snapshotDb(db) {
+  return {
+    settings: db.settings,
+    cards: db.cards.slice(),
+    users: db.users.slice(),
+    accounts: db.accounts.slice(),
+    jobs: db.jobs.slice(),
+    images: db.images.slice(),
+    ledger: db.ledger.slice()
+  };
+}
+
+async function writeObjectProperty(stream, key, value, first = false) {
+  await writeChunk(stream, `${first ? '\n' : ',\n'}${JSON.stringify(key)}:`);
+  await writeChunk(stream, JSON.stringify(value));
+}
+
+async function writeArrayProperty(stream, key, values) {
+  await writeChunk(stream, `,\n${JSON.stringify(key)}:[`);
+  for (let index = 0; index < values.length; index += 1) {
+    if (index > 0) await writeChunk(stream, ',');
+    await writeChunk(stream, JSON.stringify(values[index]));
+    if (index > 0 && index % 200 === 0) await yieldToEventLoop();
+  }
+  await writeChunk(stream, ']');
+}
+
+function writeChunk(stream, chunk) {
+  return new Promise((resolve, reject) => {
+    const onError = (error) => {
+      stream.off('drain', onDrain);
+      reject(error);
+    };
+    const onDrain = () => {
+      stream.off('error', onError);
+      resolve();
+    };
+    stream.once('error', onError);
+    if (stream.write(chunk)) {
+      stream.off('error', onError);
+      resolve();
+    } else {
+      stream.once('drain', onDrain);
+    }
+  });
+}
+
+function closeStream(stream) {
+  return new Promise((resolve, reject) => {
+    const onError = (error) => {
+      stream.off('finish', onFinish);
+      reject(error);
+    };
+    const onFinish = () => {
+      stream.off('error', onError);
+      resolve();
+    };
+    stream.once('error', onError);
+    stream.once('finish', onFinish);
+    stream.end();
+  });
+}
+
+async function renameWithRetry(source, target) {
+  let lastError = null;
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    try {
+      await rename(source, target);
+      return;
+    } catch (error) {
+      lastError = error;
+      await sleep(50 * (attempt + 1));
+    }
+  }
+  throw lastError;
+}
+
+function yieldToEventLoop() {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function trimDb(db) {

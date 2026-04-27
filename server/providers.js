@@ -6,13 +6,31 @@ export const DIRECT_URL_MAX_STEPS = 28;
 export const sizeMap = {
   '竖图': { width: 832, height: 1216 },
   '横图': { width: 1216, height: 832 },
-  '方图': { width: 1024, height: 1024 }
+  '方图': { width: 1024, height: 1024 },
+  '2K竖图': { width: 1088, height: 1600 },
+  '2K横图': { width: 1600, height: 1088 },
+  '2K方图': { width: 1344, height: 1344 },
+  '4K竖图': { width: 1344, height: 1984 },
+  '4K横图': { width: 1984, height: 1344 },
+  '4K方图': { width: 1728, height: 1728 }
+};
+
+export const sizeCostMap = {
+  '竖图': 1,
+  '横图': 1,
+  '方图': 1,
+  '2K竖图': 20,
+  '2K横图': 20,
+  '2K方图': 20,
+  '4K竖图': 35,
+  '4K横图': 35,
+  '4K方图': 35
 };
 
 export function normalizeNovelAiRequest(input, settings, options = {}) {
   const defaults = settings.defaults || {};
   const maxSteps = Number.isFinite(Number(options.maxSteps)) ? Number(options.maxSteps) : MAX_STEPS;
-  const sizeName = String(input.size || defaults.size || '竖图');
+  const sizeName = normalizeSizeName(input.size || defaults.size || '竖图');
   const mappedSize = sizeMap[sizeName] || {};
   const tag = normalizePromptText(input.tag || input.prompt || '').trim();
   const artist = normalizePromptText(input.artist ?? settings.defaultArtist ?? '').trim();
@@ -34,12 +52,17 @@ export function normalizeNovelAiRequest(input, settings, options = {}) {
     cfg: clampNumber(input.cfg ?? defaults.cfg, 0, 1),
     sampler: String(input.sampler || defaults.sampler || 'k_dpmpp_2m_sde'),
     noiseSchedule: String(input.noise_schedule || input.noiseSchedule || defaults.noiseSchedule || 'karras'),
-    seed: input.seed === undefined || input.seed === '' ? Math.floor(Math.random() * 2 ** 31) : Number(input.seed)
+    seed: input.seed === undefined || input.seed === '' ? Math.floor(Math.random() * 2 ** 31) : Number(input.seed),
+    cost: input.cost === undefined || input.cost === '' ? undefined : Number(input.cost)
   };
 }
 
 function normalizePromptText(value) {
   return String(value).replace(/\\n/g, '\n');
+}
+
+function normalizeSizeName(value) {
+  return String(value || '').replace(/\s*\(-\d+\)\s*$/, '').trim();
 }
 
 export async function generateNovelAiImage(request, account, env, options = {}) {
@@ -92,6 +115,52 @@ export async function generateNovelAiImage(request, account, env, options = {}) 
   return {
     mimeType: contentType.includes('jpeg') ? 'image/jpeg' : 'image/png',
     buffer
+  };
+}
+
+export async function fetchNovelAiAccountQuota(token, env = {}, options = {}) {
+  if (!token) throw new Error('NovelAI account token is required.');
+  const baseUrl = (env.NOVELAI_ACCOUNT_API_URL || 'https://api.novelai.net').replace(/\/$/, '');
+  const response = await fetch(`${baseUrl}/user/data`, {
+    method: 'GET',
+    signal: options.signal,
+    headers: {
+      authorization: `Bearer ${token}`,
+      accept: 'application/json',
+      origin: 'https://novelai.net',
+      referer: 'https://novelai.net/',
+      'user-agent': 'Mozilla/5.0 Nai2API/1.0'
+    }
+  });
+
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(`NovelAI account returned ${response.status}: ${text.slice(0, 500)}`);
+  }
+
+  const payload = text ? JSON.parse(text) : {};
+  const subscription = payload.subscription || payload.account?.subscription || {};
+  const stepsLeft = subscription.trainingStepsLeft || subscription.training_steps_left || {};
+  const fixed = numberOrNull(
+    stepsLeft.fixedTrainingStepsLeft
+    ?? stepsLeft.fixed_training_steps_left
+    ?? subscription.fixedTrainingStepsLeft
+    ?? subscription.fixed_training_steps_left
+  );
+  const purchased = numberOrNull(
+    stepsLeft.purchasedTrainingSteps
+    ?? stepsLeft.purchased_training_steps
+    ?? subscription.purchasedTrainingSteps
+    ?? subscription.purchased_training_steps
+  );
+  const values = [fixed, purchased].filter((value) => value !== null);
+
+  return {
+    points: values.length ? values.reduce((sum, value) => sum + value, 0) : null,
+    fixed,
+    purchased,
+    tier: subscription.tier ?? subscription.subscriptionTier ?? payload.tier ?? null,
+    raw: payload
   };
 }
 
@@ -189,8 +258,7 @@ function normalizeV4Sampler(sampler) {
     'k_euler_ancestral',
     'k_dpmpp_2m',
     'k_dpmpp_sde',
-    'k_dpmpp_2s_ancestral',
-    'ddim_v3'
+    'k_dpmpp_2s_ancestral'
   ]);
   return supported.has(sampler) ? sampler : 'k_euler_ancestral';
 }
@@ -303,6 +371,11 @@ function clampNumber(value, min, max) {
   const number = Number(value);
   if (!Number.isFinite(number)) return min;
   return Math.max(min, Math.min(max, number));
+}
+
+function numberOrNull(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
 }
 
 function escapeXml(value) {

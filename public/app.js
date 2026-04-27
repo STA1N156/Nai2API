@@ -8,6 +8,8 @@ const state = {
   queueViewTimer: null,
   queueView: null,
   queueViewCompleteTimer: null,
+  resultHistory: [],
+  resultHistoryIndex: -1,
   generating: false,
   previewScale: 1,
   previewPanX: 0,
@@ -24,6 +26,7 @@ const ids = [
   'userToken',
   'saveTokenBtn',
   'promptInput',
+  'artistPresetInput',
   'artistInput',
   'samplerInput',
   'sizeInput',
@@ -37,6 +40,8 @@ const ids = [
   'jobText',
   'resultPreview',
   'closeResultPreviewBtn',
+  'prevResultBtn',
+  'nextResultBtn',
   'resultPreviewImage',
   'toast'
 ];
@@ -45,6 +50,40 @@ const el = Object.fromEntries(ids.map((id) => [id, document.querySelector(`#${id
 const maxSteps = 28;
 const maxUrlSteps = 28;
 const defaultSteps = 28;
+const artistPresets = {
+  '2.5d': {
+    label: '2.5D唯美风',
+    value: `0.9::misaka_12003-gou ::, dino_(dinoartforame), wanke, liduke, year 2025, realistic, 4k, -2::green ::, textless version, The image is highly intricate finished drawn. Only the character's face is in anime style, but their body is in realistic style. 1.35::A highly finished photo-style artwork that has lively color, graphic texture, realistic skin surface, and lifelike flesh with little obliques::. 1.63::photorealistic::, 1.63::photo(medium)::, \\n20::best quality, absurdres, very aesthetic, detailed, masterpiece::,, very aesthetic, masterpiece, no text,`
+  },
+  fresh: {
+    label: '韩漫小清新风',
+    value: '[[[artist:dishwasher1910]]], {{yd_(orange_maru)}}, [artist:ciloranko], [artist:sho_(sho_lwlw)], [ningen mame], year 2024,'
+  },
+  doujin: {
+    label: '本子动漫风',
+    value: '1.4::asanagi::,{{{{{artist:asanagi}}}}},1.2::xiaoluo_xl::,1.3::Artist: misaka_12003-gou::,1.2::Artist:shexyo::,0.7::Artist:b.sa_(bbbs)::,1::Artist:qiandaiyiyu::,1.05::artist:natedecock::,1.05::artist:kunaboto::,0.75::artist:kandata_nijou::,1.05::artist:zer0.zer0 ::,1.05::artist:jasony::,0.75::misaka_12003-gou ::, dino_(dinoartforame), wanke, liduke, year 2025, realistic, 4k, -2::green ::, {textless version, The image is highly intricate finished drawn,write realistically,true to life}, 1.35::A highly finished photo-style artwork that has lively color, graphic texture, realistic skin surface, and lifelike flesh with little obliques::, 1.63::photorealistic::,3::age slider::,1.63::photo(medium)::, 2::best quality, absurdres, very aesthetic, detailed, masterpiece::,-4::Muscle definition, abs::'
+  },
+  galgame: {
+    label: 'GalGame风',
+    value: 'artist:ningen_mame,, noyu_(noyu23386566),, toosaka asagi,, location,\\n20::best quality, absurdres, very aesthetic, detailed, masterpiece::,:,, very aesthetic, masterpiece, no text,'
+  },
+  animeOld: {
+    label: '动漫风（旧）',
+    value: 'artist collaboration, 0.70::artist:necomi ::, 0.80::artist:tan (tangent) ::, 1.38::artist:kanda done ::, 1.22::artist:quasarcake ::, 1.22::artist:atdan ::, 0.94::artist:fuumi (radial engine) ::, 1.70::artist:john kafka ::, 0.60::artist:meisansan ::, 0.98::artist:ogipote ::, 0.44::artist:nixeu ::, 0.74::artist:mignon ::, 0.94::artist:rangu ::, 1.18::artist:hiten (hitenkei) ::, 1.24::artist:freng ::, 0.56::artist:miwabe sakura ::, year 2024, perspective'
+  }
+};
+
+const sizeOptions = [
+  { value: '竖图', label: '竖图(-1)', cost: 1 },
+  { value: '横图', label: '横图(-1)', cost: 1 },
+  { value: '方图', label: '方图(-1)', cost: 1 },
+  { value: '2K竖图', label: '2K竖图(-20)', cost: 20 },
+  { value: '2K横图', label: '2K横图(-20)', cost: 20 },
+  { value: '2K方图', label: '2K方图(-20)', cost: 20 },
+  { value: '4K竖图', label: '4K竖图(-35)', cost: 35 },
+  { value: '4K横图', label: '4K横图(-35)', cost: 35 },
+  { value: '4K方图', label: '4K方图(-35)', cost: 35 }
+];
 
 const paramOrder = [
   'tag',
@@ -79,10 +118,13 @@ const snippetParamOrder = [
 await boot();
 
 async function boot() {
+  populateArtistPresetOptions();
+  populateSizeOptions();
   bindEvents();
   el.userToken.value = state.token;
   await loadSettings();
   applyDefaults();
+  updateGenerateCostLabel();
   enhanceSelects();
   updateUrlOutputs();
   if (state.token) await loadMe().catch(() => {});
@@ -101,6 +143,14 @@ function bindEvents() {
   el.resultPreview.addEventListener('pointerleave', stopPreviewDrag);
   el.resultPreview.addEventListener('wheel', handlePreviewWheel, { passive: false });
   el.closeResultPreviewBtn.addEventListener('click', closeResultPreview);
+  el.prevResultBtn.addEventListener('click', (event) => {
+    event.stopPropagation();
+    showResultHistory(state.resultHistoryIndex - 1);
+  });
+  el.nextResultBtn.addEventListener('click', (event) => {
+    event.stopPropagation();
+    showResultHistory(state.resultHistoryIndex + 1);
+  });
   el.resultPreview.addEventListener('click', (event) => {
     if (event.target === el.resultPreview) closeResultPreview();
   });
@@ -111,7 +161,6 @@ function bindEvents() {
   [
     el.userToken,
     el.promptInput,
-    el.artistInput,
     el.samplerInput,
     el.sizeInput,
     el.stepsInput,
@@ -119,6 +168,25 @@ function bindEvents() {
     el.cfgInput,
     el.negativeInput
   ].forEach((input) => input.addEventListener('input', updateUrlOutputs));
+  el.artistPresetInput.addEventListener('change', applyArtistPreset);
+  el.sizeInput.addEventListener('change', updateGenerateCostLabel);
+  el.artistInput.addEventListener('input', () => {
+    syncArtistPresetSelection();
+    updateUrlOutputs();
+  });
+}
+
+function populateArtistPresetOptions() {
+  const options = Object.entries(artistPresets)
+    .map(([value, preset]) => `<option value="${value}">${preset.label}</option>`)
+    .join('');
+  el.artistPresetInput.innerHTML = `${options}<option value="custom">自定义</option>`;
+}
+
+function populateSizeOptions() {
+  el.sizeInput.innerHTML = sizeOptions
+    .map((option) => `<option value="${option.value}">${option.label}</option>`)
+    .join('');
 }
 
 async function loadSettings() {
@@ -126,7 +194,8 @@ async function loadSettings() {
 }
 
 function applyDefaults() {
-  el.artistInput.value = state.settings.defaultArtist || '';
+  el.artistInput.value = state.settings.defaultArtist || artistPresets['2.5d'].value;
+  syncArtistPresetSelection();
   el.negativeInput.value = state.settings.defaultNegative || '';
   el.samplerInput.value = state.settings.defaults?.sampler || 'k_dpmpp_2m_sde';
   el.sizeInput.value = state.settings.defaults?.size || '竖图';
@@ -165,7 +234,8 @@ function collectParams() {
     sampler: el.samplerInput.value,
     negative: el.negativeInput.value.trim(),
     nocache: '1',
-    noise_schedule: 'karras'
+    noise_schedule: 'karras',
+    cost: generationCost()
   };
 }
 
@@ -219,6 +289,7 @@ function buildSnippet() {
 
 function updateUrlOutputs() {
   // The embed code is generated on demand for the copy button.
+  if (!state.generating) updateGenerateCostLabel();
 }
 
 async function directGenerate() {
@@ -257,6 +328,7 @@ async function startJob() {
         model: params.model,
         artist: params.artist,
         size: params.size,
+        cost: params.cost,
         steps: Number(params.steps),
         scale: Number(params.scale),
         cfg: Number(params.cfg),
@@ -339,7 +411,7 @@ function updateLoadingStatus(job) {
     const view = updateQueueView(job);
     const count = Number(view.count || 0);
     const position = Number(view.position || 0);
-    target.textContent = position > 1 ? `正在排队，当前第 ${position} / ${count} 个` : '准备生成，正在等待可用账号';
+    target.textContent = queueLoadingText(position, count);
     el.jobText.textContent = queueStatusText(position, count);
     setLoadingStep(1);
     return;
@@ -377,6 +449,30 @@ function updateQueueView(job = {}) {
   }
   ensureQueueViewTimer();
   return state.queueView;
+}
+
+function applyArtistPreset() {
+  const preset = artistPresets[el.artistPresetInput.value];
+  if (preset) {
+    el.artistInput.value = preset.value;
+    setArtistInputLocked(true);
+  } else {
+    el.artistInput.value = '';
+    setArtistInputLocked(false);
+  }
+  updateUrlOutputs();
+}
+
+function syncArtistPresetSelection() {
+  const current = el.artistInput.value;
+  const found = Object.entries(artistPresets).find(([, preset]) => preset.value === current);
+  el.artistPresetInput.value = found ? found[0] : 'custom';
+  setArtistInputLocked(Boolean(found));
+}
+
+function setArtistInputLocked(isLocked) {
+  el.artistInput.readOnly = isLocked;
+  el.artistInput.classList.toggle('locked', isLocked);
 }
 
 function finishQueueView(job = {}) {
@@ -430,9 +526,7 @@ function renderQueueText() {
   if (!target || !state.queueView) return;
   const { position, count } = state.queueView;
   el.jobText.textContent = queueStatusText(position, count);
-  target.textContent = position > 1
-    ? `正在排队，当前第 ${position} / ${count} 个`
-    : '准备生成，正在等待可用账号';
+  target.textContent = queueLoadingText(position, count);
 }
 
 function setLoadingStep(activeIndex) {
@@ -455,6 +549,7 @@ function renderFrameNotice(message, isError = false) {
 }
 
 function renderResultImage(src) {
+  pushResultHistory(src);
   el.imageFrame.classList.remove('loading');
   el.imageFrame.classList.add('result-ready');
   el.imageFrame.innerHTML = `<button class="result-image-button" type="button" aria-label="放大预览生成图片"><img src="${src}" alt="生成图片"></button>`;
@@ -463,12 +558,45 @@ function renderResultImage(src) {
 function handleResultPreview(event) {
   const image = event.target.closest('.result-image-button img');
   if (!image) return;
-  el.resultPreviewImage.src = image.currentSrc || image.src;
-  setPreviewScale(1);
+  const src = image.currentSrc || image.src;
+  const index = state.resultHistory.indexOf(src);
+  openResultPreview(index >= 0 ? index : state.resultHistoryIndex);
+}
+
+function pushResultHistory(src) {
+  if (!src) return;
+  const existingIndex = state.resultHistory.indexOf(src);
+  if (existingIndex >= 0) {
+    state.resultHistoryIndex = existingIndex;
+    return;
+  }
+  state.resultHistory.push(src);
+  state.resultHistoryIndex = state.resultHistory.length - 1;
+}
+
+function openResultPreview(index = state.resultHistoryIndex) {
+  if (!state.resultHistory.length) return;
+  showResultHistory(index);
   el.resultPreview.classList.remove('hidden');
   el.resultPreview.setAttribute('aria-hidden', 'false');
   document.documentElement.classList.add('modal-open');
   document.body.classList.add('modal-open');
+}
+
+function showResultHistory(index) {
+  if (!state.resultHistory.length) return;
+  state.resultHistoryIndex = Math.max(0, Math.min(state.resultHistory.length - 1, Number(index || 0)));
+  el.resultPreviewImage.src = state.resultHistory[state.resultHistoryIndex];
+  setPreviewScale(1);
+  updateResultHistoryNav();
+}
+
+function updateResultHistoryNav() {
+  const hasMultiple = state.resultHistory.length > 1;
+  el.prevResultBtn.hidden = !hasMultiple;
+  el.nextResultBtn.hidden = !hasMultiple;
+  el.prevResultBtn.disabled = state.resultHistoryIndex <= 0;
+  el.nextResultBtn.disabled = state.resultHistoryIndex >= state.resultHistory.length - 1;
 }
 
 function toggleResultZoom(event) {
@@ -552,6 +680,7 @@ function closeResultPreview() {
   state.previewDragging = false;
   state.previewDragged = false;
   el.resultPreviewImage.removeAttribute('src');
+  updateResultHistoryNav();
   document.documentElement.classList.remove('modal-open');
   document.body.classList.remove('modal-open');
 }
@@ -577,9 +706,26 @@ function queueStatusText(position, count) {
   return current ? `排队中（第 ${current} / ${total} 个）` : `排队中（${total} 个）`;
 }
 
+function queueLoadingText(position, count) {
+  const total = Number(count || 0);
+  const current = Number(position || 0);
+  if (total > 1 && current > 0) return `正在排队，当前第 ${current} / ${total} 个`;
+  return '准备生成，正在等待可用账号';
+}
+
 function setGenerateBusy(isBusy) {
   state.generating = isBusy;
   el.directGenerateBtn.disabled = isBusy;
+  el.directGenerateBtn.textContent = isBusy ? '生成中...' : `生成图片（${generationCost()}点）`;
+}
+
+function updateGenerateCostLabel() {
+  el.directGenerateBtn.textContent = `生成图片（${generationCost()}点）`;
+}
+
+function generationCost() {
+  const selected = sizeOptions.find((option) => option.value === el.sizeInput.value);
+  return selected?.cost || 1;
 }
 
 async function api(path, options = {}) {

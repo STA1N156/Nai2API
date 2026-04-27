@@ -2,8 +2,8 @@ import http from 'node:http';
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { JsonStore, MAX_CACHE_IMAGES_LIMIT, createId, createPublicToken, hashObject, maskToken, normalizeDb } from './store.js';
-import { DIRECT_URL_MAX_STEPS, buildErrorImage, generateNovelAiImage, normalizeNovelAiRequest } from './providers.js';
+import { JsonStore, MAX_CACHE_IMAGES_LIMIT, createId, createPublicToken, defaultArtist2_5D, hashObject, legacyDefaultArtist, maskToken, normalizeDb } from './store.js';
+import { DIRECT_URL_MAX_STEPS, buildErrorImage, fetchNovelAiAccountQuota, generateNovelAiImage, normalizeNovelAiRequest, sizeCostMap } from './providers.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, '..');
@@ -29,6 +29,26 @@ const openAiSamplers = [
   'k_dpmpp_2m',
   'k_dpmpp_sde'
 ];
+const openAiSizeTiers = {
+  '2K': {
+    label: '[2K]',
+    cost: 20,
+    sizes: {
+      '竖图': { width: 1088, height: 1600 },
+      '横图': { width: 1600, height: 1088 },
+      '方图': { width: 1344, height: 1344 }
+    }
+  },
+  '4K': {
+    label: '[4K]',
+    cost: 35,
+    sizes: {
+      '竖图': { width: 1344, height: 1984 },
+      '横图': { width: 1984, height: 1344 },
+      '方图': { width: 1728, height: 1728 }
+    }
+  }
+};
 const insufficientBalanceMessage = '密钥额度不足，无法生成图片。';
 
 await store.init();
@@ -61,9 +81,11 @@ server.listen(port, host, () => {
 
 async function applyRuntimeSettings() {
   const publicBaseUrl = normalizePublicBaseUrl(process.env.PUBLIC_BASE_URL || '');
-  if (!publicBaseUrl) return;
   await store.update((db) => {
-    if (!db.settings.publicBaseUrl) db.settings.publicBaseUrl = publicBaseUrl;
+    if (publicBaseUrl && !db.settings.publicBaseUrl) db.settings.publicBaseUrl = publicBaseUrl;
+    if (!db.settings.defaultArtist || db.settings.defaultArtist === legacyDefaultArtist) {
+      db.settings.defaultArtist = defaultArtist2_5D;
+    }
   });
 }
 
@@ -256,7 +278,8 @@ async function route(req, res) {
     const limit = clamp(Number(url.searchParams.get('limit') || 60), 1, 200);
     const offset = clamp(Number(url.searchParams.get('offset') || 0), 0, Number.MAX_SAFE_INTEGER);
     const q = String(url.searchParams.get('q') || '').trim().toLowerCase();
-    const page = await store.readImagePage({ limit, offset, q });
+    const tier = String(url.searchParams.get('tier') || '').trim();
+    const page = await store.readImagePage({ limit, offset, q, tier });
     sendJson(res, 200, {
       images: page.images.map(publicImage),
       total: page.total,
@@ -317,6 +340,14 @@ async function route(req, res) {
     const body = await readJson(req);
     const result = await resetAccountStats(body);
     scheduleQueueDrain();
+    sendJson(res, 200, result);
+    return;
+  }
+
+  if (method === 'POST' && url.pathname === '/api/admin/accounts/quota') {
+    assertAdmin(req, url);
+    const body = await readJson(req);
+    const result = await refreshAccountQuotas(body);
     sendJson(res, 200, result);
     return;
   }
@@ -493,12 +524,24 @@ function openAiModelsResponse() {
   const created = Math.floor(Date.now() / 1000);
   return {
     object: 'list',
-    data: openAiSamplers.map((sampler) => ({
-      id: `nai-diffusion-4-5-full:${sampler}`,
-      object: 'model',
-      created,
-      owned_by: 'nai2api'
-    }))
+    data: [
+      ...openAiSamplers.map((sampler) => ({
+        id: `nai-diffusion-4-5-full:${sampler}`,
+        object: 'model',
+        created,
+        owned_by: 'nai2api',
+        cost: 1,
+        resolution_tier: 'standard'
+      })),
+      ...Object.entries(openAiSizeTiers).flatMap(([tierName, tier]) => openAiSamplers.map((sampler) => ({
+        id: `${tier.label}nai-diffusion-4-5-full:${sampler}`,
+        object: 'model',
+        created,
+        owned_by: 'nai2api',
+        cost: tier.cost,
+        resolution_tier: tierName
+      })))
+    ]
   };
 }
 
@@ -510,19 +553,24 @@ function parseOpenAiImageRequest(body = {}, settings = {}) {
   const nai = body.nai && typeof body.nai === 'object' ? body.nai : {};
   const prompt = String(nai.tag || nai.prompt || fields.tag || '').trim();
   const negative = String(nai.negative ?? fields.negative ?? '').trim() || settings.defaultNegative || '';
+  const sizeName = String(nai.size ?? fields.size ?? settings.defaults?.size ?? '竖图').trim();
+  const tierSize = modelParts.tier?.sizes?.[sizeName];
 
   const request = {
     tag: prompt,
     model: modelParts.model,
     artist: nai.artist ?? fields.artist ?? settings.defaultArtist ?? '',
-    size: nai.size ?? fields.size ?? settings.defaults?.size,
+    size: sizeName,
+    width: tierSize?.width ?? nai.width,
+    height: tierSize?.height ?? nai.height,
     steps: openAiFixedSteps,
     scale: nai.scale ?? fields.scale ?? settings.defaults?.scale,
     cfg: nai.cfg ?? fields.cfg ?? settings.defaults?.cfg,
     sampler: nai.sampler ?? fields.sampler ?? modelParts.sampler ?? settings.defaults?.sampler,
     negative,
     nocache: nai.nocache ?? body.nocache ?? '1',
-    noise_schedule: nai.noise_schedule ?? nai.noiseSchedule ?? settings.defaults?.noiseSchedule ?? 'karras'
+    noise_schedule: nai.noise_schedule ?? nai.noiseSchedule ?? settings.defaults?.noiseSchedule ?? 'karras',
+    cost: modelParts.tier?.cost ?? generationCost()
   };
 
   return {
@@ -544,9 +592,14 @@ function openAiPromptFormatError() {
 
 function parseOpenAiModel(modelValue) {
   const original = String(modelValue || 'nai-diffusion-4-5-full');
-  const [model, sampler] = original.split(':');
+  const tierMatch = original.match(/^\[(2K|4K)\]\s*(.+)$/i);
+  const tierName = tierMatch ? tierMatch[1].toUpperCase() : '';
+  const modelWithSampler = tierMatch ? tierMatch[2] : original;
+  const [model, sampler] = modelWithSampler.split(':');
   return {
     original,
+    tierName,
+    tier: openAiSizeTiers[tierName] || null,
     model: model || 'nai-diffusion-4-5-full',
     sampler: sampler || ''
   };
@@ -614,6 +667,8 @@ async function streamOpenAiImageJob(req, res, job, model) {
   writeOpenAiChunk(res, { id: streamId, model, content: '<think>\n任务已提交，正在进入队列\n' });
   let lastLine = '';
   let reachedRunning = false;
+  let lastQueuedCount = Number(job.queuedCount || 0);
+  let lastQueuePosition = Number(job.queuePosition || 0);
   const deadline = Date.now() + openAiChatTimeoutMs;
 
   while (Date.now() < deadline) {
@@ -627,12 +682,20 @@ async function streamOpenAiImageJob(req, res, job, model) {
     const line = openAiProgressLine(snapshot);
     const isQueuedAfterRunning = reachedRunning && snapshot.status === 'queued';
     if (snapshot.status === 'running') reachedRunning = true;
+    if (snapshot.status === 'queued') {
+      lastQueuedCount = Math.max(lastQueuedCount, Number(snapshot.queuedCount || 0));
+      lastQueuePosition = Math.max(lastQueuePosition, Number(snapshot.queuePosition || 0));
+    }
     if (line && !isQueuedAfterRunning && line !== lastLine) {
       writeOpenAiChunk(res, { id: streamId, model, content: `${line}\n` });
       lastLine = line;
     }
 
     if (snapshot.status === 'done') {
+      const finalQueueLine = openAiFinalQueueLine(lastQueuePosition, lastQueuedCount);
+      if (finalQueueLine && finalQueueLine !== lastLine) {
+        writeOpenAiChunk(res, { id: streamId, model, content: `${finalQueueLine}\n` });
+      }
       writeOpenAiChunk(res, { id: streamId, model, content: `生成完成\n</think>\n${openAiImageMarkdown(req, snapshot)}\n` });
       finishOpenAiStream(res, streamId, model);
       return;
@@ -667,6 +730,12 @@ function openAiProgressLine(job) {
     return '已路由账号，正在生成';
   }
   return '';
+}
+
+function openAiFinalQueueLine(position, count) {
+  const total = Number(count || 0);
+  if (total <= 1) return '';
+  return `排队中：第 ${total} / ${total} 个`;
 }
 
 function openAiImageMarkdown(req, imageOrJob) {
@@ -878,6 +947,12 @@ async function addAccount(body) {
       inFlight: 0,
       total: 0,
       failures: 0,
+      quotaPoints: null,
+      quotaFixed: null,
+      quotaPurchased: null,
+      quotaTier: null,
+      quotaCheckedAt: '',
+      quotaError: '',
       cooldownUntil: '',
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
@@ -905,6 +980,12 @@ async function importAccounts(body) {
       inFlight: 0,
       total: Number(account.total || 0),
       failures: Number(account.failures || 0),
+      quotaPoints: numberOrNull(account.quotaPoints),
+      quotaFixed: numberOrNull(account.quotaFixed),
+      quotaPurchased: numberOrNull(account.quotaPurchased),
+      quotaTier: account.quotaTier ?? null,
+      quotaCheckedAt: account.quotaCheckedAt || '',
+      quotaError: account.quotaError || '',
       cooldownUntil: '',
       createdAt: account.createdAt || now,
       updatedAt: now,
@@ -1000,6 +1081,80 @@ async function resetAccountStats(body) {
     });
     return { reset: accounts.length };
   });
+}
+
+async function refreshAccountQuotas(body) {
+  const ids = new Set(collectValues(body.ids || body.accounts));
+  const targets = await store.readCollections(['accounts']).then((db) => {
+    const accounts = ids.size ? db.accounts.filter((account) => ids.has(account.id)) : db.accounts;
+    return accounts.map((account) => ({
+      id: account.id,
+      token: account.token
+    }));
+  });
+  if (!targets.length) throw httpError(ids.size ? 404 : 400, ids.size ? 'no matching accounts found.' : 'no accounts found.');
+
+  const now = new Date().toISOString();
+  const results = [];
+  for (const target of targets) {
+    try {
+      const quota = await fetchNovelAiAccountQuotaWithTimeout(target.token);
+      results.push({
+        id: target.id,
+        ok: true,
+        quotaPoints: quota.points,
+        quotaFixed: quota.fixed,
+        quotaPurchased: quota.purchased,
+        quotaTier: quota.tier,
+        quotaCheckedAt: now,
+        quotaError: ''
+      });
+    } catch (error) {
+      results.push({
+        id: target.id,
+        ok: false,
+        quotaPoints: null,
+        quotaFixed: null,
+        quotaPurchased: null,
+        quotaTier: null,
+        quotaCheckedAt: now,
+        quotaError: publicErrorMessage(error.message || 'quota query failed.')
+      });
+    }
+  }
+
+  const resultMap = new Map(results.map((result) => [result.id, result]));
+  const accounts = await store.update((db) => {
+    db.accounts.forEach((account) => {
+      const result = resultMap.get(account.id);
+      if (!result) return;
+      account.quotaPoints = result.quotaPoints;
+      account.quotaFixed = result.quotaFixed;
+      account.quotaPurchased = result.quotaPurchased;
+      account.quotaTier = result.quotaTier;
+      account.quotaCheckedAt = result.quotaCheckedAt;
+      account.quotaError = result.quotaError;
+      account.updatedAt = now;
+    });
+    return db.accounts.filter((account) => resultMap.has(account.id));
+  });
+
+  return {
+    checked: results.length,
+    ok: results.filter((result) => result.ok).length,
+    failed: results.filter((result) => !result.ok).length,
+    accounts: accounts.map((account) => publicAccount(account, { revealToken: true }))
+  };
+}
+
+async function fetchNovelAiAccountQuotaWithTimeout(token) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 8000);
+  try {
+    return await fetchNovelAiAccountQuota(token, process.env, { signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function clearImageCache(body) {
@@ -1132,7 +1287,7 @@ async function createJob(token, body) {
       }
     }
 
-    const cost = generationCost();
+    const cost = generationCost(request);
     if (user.balance < cost) throw httpError(402, insufficientBalanceMessage);
     const queueTotal = activeJobCount(db.jobs) + 1;
     user.balance -= cost;
@@ -1172,7 +1327,7 @@ async function ensureAccountRouteIds() {
 async function createDirectJob(token, request, cacheKey, options = {}) {
   return store.update((db) => {
     const user = getUserOrThrow(db, token);
-    const cost = Number(options.cost ?? generationCost());
+    const cost = Number(options.cost ?? generationCost(request));
     const shouldCharge = !options.status && cost > 0;
     if (shouldCharge && user.balance < cost) throw httpError(402, insufficientBalanceMessage);
     const now = new Date().toISOString();
@@ -1302,8 +1457,15 @@ async function reserveQueuedJob(jobId) {
       job.updatedAt = new Date().toISOString();
       return { skip: true };
     }
-    const account = selectAccount(db.accounts, db.settings);
+    const account = selectAccount(db.accounts, db.settings, { cost: job.cost });
     if (!account && hasEnabledAccounts(db.accounts)) {
+      if (!hasAccountWithEnoughQuota(db.accounts, job.cost)) {
+        refundJob(db, job, 'NovelAI账号点数不足');
+        job.status = 'failed';
+        job.error = 'NovelAI账号点数不足';
+        job.updatedAt = new Date().toISOString();
+        return { skip: true };
+      }
       job.updatedAt = new Date().toISOString();
       return { queued: true };
     }
@@ -1366,11 +1528,16 @@ async function retryReservationWithNextAccount(reservation, error, tried, option
       failedAccount.inFlight = Math.max(0, Number(failedAccount.inFlight || 0) - 1);
       failedAccount.failures = Number(failedAccount.failures || 0) + 1;
       if (isNovelAiCapacityError(error)) failedAccount.cooldownUntil = new Date(Date.now() + accountBusyCooldownMs()).toISOString();
+      if (isNovelAiAccountQuotaError(error)) {
+        failedAccount.quotaPoints = 0;
+        failedAccount.quotaError = '点数不足';
+        failedAccount.quotaCheckedAt = new Date().toISOString();
+      }
       failedAccount.updatedAt = new Date().toISOString();
     }
 
     if (options.deadline && Date.now() >= options.deadline) return null;
-    const account = selectAccount(db.accounts, db.settings, { excludeIds: tried });
+    const account = selectAccount(db.accounts, db.settings, { excludeIds: tried, cost: reservation.cost });
     if (!account) return null;
     account.inFlight = Number(account.inFlight || 0) + 1;
     account.lastUsedAt = new Date().toISOString();
@@ -1420,10 +1587,11 @@ async function requeueReservedJob(reservation, error) {
 async function reserveCreditAndAccount(token, request, cacheKey) {
   return store.update((db) => {
     const user = getUserOrThrow(db, token);
-    const cost = generationCost();
+    const cost = generationCost(request);
     if (user.balance < cost) throw httpError(402, insufficientBalanceMessage);
-    const account = selectAccount(db.accounts, db.settings);
+    const account = selectAccount(db.accounts, db.settings, { cost });
     if (!account && hasEnabledAccounts(db.accounts)) {
+      if (!hasAccountWithEnoughQuota(db.accounts, cost)) throw httpError(503, 'NovelAI账号点数不足');
       throw httpError(429, 'all NovelAI accounts are busy, retry shortly.');
     }
     if (account) {
@@ -1456,10 +1624,13 @@ async function reserveCreditAndAccountWhenAvailable(token, request, cacheKey, de
 async function tryReserveCreditAndAccount(token, request, cacheKey) {
   return store.update((db) => {
     const user = getUserOrThrow(db, token);
-    const cost = generationCost();
+    const cost = generationCost(request);
     if (user.balance < cost) throw httpError(402, insufficientBalanceMessage);
-    const account = selectAccount(db.accounts, db.settings);
-    if (!account && hasEnabledAccounts(db.accounts)) return { busy: true };
+    const account = selectAccount(db.accounts, db.settings, { cost });
+    if (!account && hasEnabledAccounts(db.accounts)) {
+      if (!hasAccountWithEnoughQuota(db.accounts, cost)) throw httpError(503, 'NovelAI账号点数不足');
+      return { busy: true };
+    }
     if (account) {
       account.inFlight = Number(account.inFlight || 0) + 1;
       account.lastUsedAt = new Date().toISOString();
@@ -1487,6 +1658,9 @@ async function completeGeneration(reservation, request, image, meta = {}) {
     if (account) {
       account.inFlight = Math.max(0, Number(account.inFlight || 0) - 1);
       account.total = Number(account.total || 0) + 1;
+      if (Number.isFinite(Number(account.quotaPoints))) {
+        account.quotaPoints = Math.max(0, Number(account.quotaPoints) - Number(reservation.cost || 0));
+      }
       account.updatedAt = new Date().toISOString();
     }
 
@@ -1565,18 +1739,36 @@ async function failGeneration(reservation, error) {
 function selectAccount(accounts, settings = {}, options = {}) {
   resetStaleAccountLoads(accounts);
   const excludeIds = options.excludeIds || new Set();
+  const cost = Math.max(1, Number(options.cost || 1));
   const now = Date.now();
   const enabled = accounts.filter((account) => account.enabled !== false && !isAccountCoolingDown(account, now));
   if (!enabled.length) return null;
   const maxConcurrency = maxAccountConcurrency(settings);
-  const available = enabled.filter((account) => !excludeIds.has(account.id) && Number(account.inFlight || 0) < maxConcurrency);
+  const available = enabled.filter((account) => {
+    if (excludeIds.has(account.id)) return false;
+    if (Number(account.inFlight || 0) >= maxConcurrency) return false;
+    const quota = accountQuotaPoints(account);
+    return quota === null || quota >= cost;
+  });
   if (!available.length) return null;
   return available.sort((a, b) => {
+    const quotaA = accountQuotaPoints(a);
+    const quotaB = accountQuotaPoints(b);
+    if (quotaA !== null || quotaB !== null) {
+      if (quotaA === null) return 1;
+      if (quotaB === null) return -1;
+      if (quotaA !== quotaB) return quotaB - quotaA;
+    }
     const loadA = Number(a.inFlight || 0) / maxConcurrency;
     const loadB = Number(b.inFlight || 0) / maxConcurrency;
     if (loadA !== loadB) return loadA - loadB;
     return Date.parse(a.lastUsedAt || 0) - Date.parse(b.lastUsedAt || 0);
   })[0];
+}
+
+function accountQuotaPoints(account) {
+  const value = Number(account?.quotaPoints);
+  return Number.isFinite(value) ? value : null;
 }
 
 function maxAccountConcurrency(settings = {}) {
@@ -1664,6 +1856,15 @@ async function queueRetryDelay() {
 
 function hasEnabledAccounts(accounts) {
   return accounts.some((account) => account.enabled !== false);
+}
+
+function hasAccountWithEnoughQuota(accounts, cost = 1) {
+  const required = Math.max(1, Number(cost || 1));
+  return accounts.some((account) => {
+    if (account.enabled === false) return false;
+    const quota = accountQuotaPoints(account);
+    return quota === null || quota >= required;
+  });
 }
 
 function resetStaleAccountLoads(accounts) {
@@ -1765,6 +1966,12 @@ function publicAccount(account, options = {}) {
     inFlight: account.inFlight || 0,
     total: account.total || 0,
     failures: account.failures || 0,
+    quotaPoints: account.quotaPoints ?? null,
+    quotaFixed: account.quotaFixed ?? null,
+    quotaPurchased: account.quotaPurchased ?? null,
+    quotaTier: account.quotaTier ?? null,
+    quotaCheckedAt: account.quotaCheckedAt || '',
+    quotaError: account.quotaError || '',
     cooldownUntil: account.cooldownUntil || '',
     stats1h: options.stats1h || { done: 0, failed: 0, total: 0, successRate: 0 },
     lastUsedAt: account.lastUsedAt || ''
@@ -1781,6 +1988,12 @@ function exportAccount(account) {
     weight: account.weight || 1,
     total: account.total || 0,
     failures: account.failures || 0,
+    quotaPoints: account.quotaPoints ?? null,
+    quotaFixed: account.quotaFixed ?? null,
+    quotaPurchased: account.quotaPurchased ?? null,
+    quotaTier: account.quotaTier ?? null,
+    quotaCheckedAt: account.quotaCheckedAt || '',
+    quotaError: account.quotaError || '',
     createdAt: account.createdAt || '',
     updatedAt: account.updatedAt || '',
     lastUsedAt: account.lastUsedAt || ''
@@ -1995,8 +2208,16 @@ function publicImage(image) {
   };
 }
 
-function generationCost() {
-  return 1;
+function generationCost(request = null) {
+  const requestedCost = Number(request?.cost);
+  const sizeCost = sizeCostMap[normalizeSizeName(request?.size)] || 1;
+  const costs = [sizeCost];
+  if (Number.isFinite(requestedCost) && requestedCost > 0) costs.push(Math.ceil(requestedCost));
+  return Math.max(...costs);
+}
+
+function normalizeSizeName(value) {
+  return String(value || '').replace(/\s*\(-\d+\)\s*$/, '').trim();
 }
 
 function requestCacheKey(token, request, explicitSeed = '') {
@@ -2020,6 +2241,11 @@ function isNoCache(value) {
 
 function isInsufficientBalanceError(error) {
   return Number(error?.statusCode || error?.status) === 402 || /insufficient balance|额度不足|余额不足/i.test(String(error?.message || error || ''));
+}
+
+function isNovelAiAccountQuotaError(error) {
+  const text = String(error?.message || error || '');
+  return /NovelAI returned (402|400|403).*?(insufficient|balance|quota|anlas|training|point|额度|余额|点数)|insufficient.*?(quota|anlas|training|point|balance)/i.test(text);
 }
 
 function isNovelAiCapacityError(error) {
@@ -2233,6 +2459,11 @@ function assertAdmin(req, url) {
 function clamp(value, min, max) {
   if (!Number.isFinite(value)) return min;
   return Math.max(min, Math.min(max, value));
+}
+
+function numberOrNull(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
 }
 
 function sleep(ms) {

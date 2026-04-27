@@ -55,6 +55,7 @@ const ids = [
   'selectAllAccounts',
   'enableAccountsBtn',
   'disableAccountsBtn',
+  'refreshAccountQuotaBtn',
   'resetAccountStatsBtn',
   'deleteAccountsBtn',
   'userSearch',
@@ -64,6 +65,7 @@ const ids = [
   'addBalanceBtn',
   'deleteUsersBtn',
   'imageSearch',
+  'imageTier',
   'imageRows',
   'refreshImagesBtn',
   'clearImagesBtn',
@@ -117,6 +119,7 @@ function bindEvents() {
   el.addBalanceBtn.addEventListener('click', () => adjustSelectedUsers('delta'));
   el.enableAccountsBtn.addEventListener('click', () => setSelectedAccountsEnabled(true));
   el.disableAccountsBtn.addEventListener('click', () => setSelectedAccountsEnabled(false));
+  el.refreshAccountQuotaBtn.addEventListener('click', refreshSelectedAccountQuotas);
   el.resetAccountStatsBtn.addEventListener('click', resetSelectedAccountStats);
   el.deleteAccountsBtn.addEventListener('click', deleteSelectedAccounts);
   el.refreshImagesBtn.addEventListener('click', refreshImages);
@@ -130,6 +133,10 @@ function bindEvents() {
     state.imagePage = 1;
     refreshImages(false);
   }, 260));
+  el.imageTier.addEventListener('change', () => {
+    state.imagePage = 1;
+    refreshImages();
+  });
   el.imageRows.addEventListener('change', () => {
     state.imagePage = 1;
     refreshImages();
@@ -397,6 +404,21 @@ async function setSelectedAccountsEnabled(enabled) {
   }
 }
 
+async function refreshSelectedAccountQuotas() {
+  try {
+    const ids = Array.from(state.selectedAccounts);
+    const result = await api('/api/admin/accounts/quota', {
+      method: 'POST',
+      admin: true,
+      body: ids.length ? { ids } : {}
+    });
+    await reloadDashboard();
+    showToast(`点数已刷新：成功 ${result.ok} 个，失败 ${result.failed} 个`);
+  } catch (error) {
+    showToast(normalizeErrorMessage(error), true);
+  }
+}
+
 async function resetSelectedAccountStats() {
   try {
     const ids = Array.from(state.selectedAccounts);
@@ -450,6 +472,7 @@ async function refreshImages(withToast = true) {
     });
     const q = el.imageSearch.value.trim();
     if (q) params.set('q', q);
+    if (el.imageTier.value) params.set('tier', el.imageTier.value);
     const data = await api(`/api/admin/images?${params.toString()}`, { admin: true });
     const matched = data.matched ?? 0;
     const pageCount = Math.max(1, Math.ceil(matched / limit));
@@ -521,7 +544,7 @@ function renderSummary(summary, options = {}) {
 }
 
 function renderSummaryImages(summary) {
-  if (state.imagePage !== 1 || el.imageSearch.value.trim()) return;
+  if (state.imagePage !== 1 || el.imageSearch.value.trim() || el.imageTier.value) return;
   const images = Array.isArray(summary.images) ? summary.images : [];
   const total = summaryImageTotal(summary) ?? state.imageTotal ?? 0;
   state.images = images;
@@ -594,9 +617,11 @@ function renderImages(data) {
   const offset = data?.offset ?? (state.imagePage - 1) * state.imagePageSize;
   const start = matched ? offset + 1 : 0;
   const end = offset + state.images.length;
-  el.imageCountText.textContent = el.imageSearch.value.trim()
+  const tierText = el.imageTier.value ? ` · ${el.imageTier.value}` : '';
+  el.imageCountText.textContent = el.imageSearch.value.trim() || el.imageTier.value
     ? `${start}-${end} / ${matched} · ${rows} 行`
     : `${start}-${end} / ${total} · ${rows} 行`;
+  if (tierText) el.imageCountText.textContent += tierText;
   el.metricImages.textContent = Number.isFinite(total) ? total : '统计中';
   el.imageList.innerHTML = state.images.length
     ? state.images.map(renderImage).join('')
@@ -627,6 +652,11 @@ function renderAccount(account) {
   const statusClass = account.enabled ? 'ok' : 'muted';
   const lastUsed = account.lastUsedAt ? `最近使用 ${formatDate(account.lastUsedAt)}` : '尚未使用';
   const stats1h = account.stats1h || { done: 0, failed: 0, total: 0, successRate: 0 };
+  const quotaText = account.quotaError
+    ? '点数查询失败'
+    : account.quotaPoints === null || account.quotaPoints === undefined
+      ? '点数未查询'
+      : `${formatNumber(account.quotaPoints)} 点`;
   return `<article class="data-row selectable account-row">
     <input class="row-check account-select" type="checkbox" value="${escapeHtml(account.id)}" ${checked} />
     <div class="row-main">
@@ -639,6 +669,7 @@ function renderAccount(account) {
     </div>
     <div class="row-stats">
       <span><b>${account.inFlight}</b> 运行中</span>
+      <span><b>${escapeHtml(quotaText)}</b></span>
       <span><b>${formatPercent(stats1h.successRate)}</b>% 1h成功率</span>
       <span><b>${stats1h.total || 0}</b> 1h请求</span>
     </div>
@@ -902,6 +933,12 @@ function formatDuration(value) {
 
 function formatPercent(value) {
   return (Number(value || 0) * 100).toFixed(2);
+}
+
+function formatNumber(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return '-';
+  return number.toLocaleString('zh-CN', { maximumFractionDigits: 0 });
 }
 
 function showToast(message, isError = false) {

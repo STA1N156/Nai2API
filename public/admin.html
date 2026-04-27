@@ -170,6 +170,7 @@
               </label>
               <button id="enableAccountsBtn" class="secondary">启用</button>
               <button id="disableAccountsBtn" class="secondary">禁用</button>
+              <button id="refreshAccountQuotaBtn" class="secondary">刷新点数</button>
               <button id="resetAccountStatsBtn" class="ghost">重置监控</button>
               <button id="deleteAccountsBtn" class="ghost">批量删除</button>
             </div>
@@ -221,6 +222,12 @@
             </div>
             <div class="button-row compact-actions">
               <input id="imageSearch" class="search-input" placeholder="搜索提示词、模型或密钥" />
+              <select id="imageTier" class="inline-select" aria-label="缓存图片分辨率筛选">
+                <option value="">全部</option>
+                <option value="standard">普通</option>
+                <option value="2K">2K</option>
+                <option value="4K">4K</option>
+              </select>
               <select id="imageRows" class="inline-select" aria-label="缓存图片显示行数">
                 <option value="3" selected>3 行</option>
                 <option value="5">5 行</option>
