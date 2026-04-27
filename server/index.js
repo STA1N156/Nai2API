@@ -140,11 +140,11 @@ async function route(req, res) {
       users: db.users.map(publicUser),
       accounts: db.accounts.map((account) => publicAccount(account, {
         revealToken: revealTokens,
-        stats24h: accountStatsSince(account.id, db.jobs, 24 * 60 * 60 * 1000)
+        stats1h: accountStatsSince(account.id, db.jobs, 60 * 60 * 1000)
       })),
       images: db.images.slice(0, 12).map(publicImage),
       imageCount: db.images.length,
-      jobStats24h: jobStatsSince(db.jobs, 24 * 60 * 60 * 1000),
+      jobStats1h: jobStatsSince(db.jobs, 60 * 60 * 1000),
       jobs: db.jobs.slice(0, 50).map((job) => publicJob(job, db)),
       ledger: db.ledger.slice(0, 80)
     });
@@ -975,8 +975,7 @@ async function retryReservationWithNextAccount(reservation, error, tried, option
       const job = db.jobs.find((item) => item.id === reservation.job.id);
       if (job) {
         job.status = 'running';
-        job.accountId = account.id;
-        job.error = `Retrying after account #${failedAccount?.routeId || '?'} failed: ${error.message}`;
+        job.error = '';
         job.updatedAt = new Date().toISOString();
       }
     }
@@ -1087,6 +1086,7 @@ async function completeGeneration(reservation, request, image, meta = {}) {
       if (job) {
         job.status = 'done';
         job.imageId = saved.id;
+        job.accountId = reservation.account?.id || job.accountId || '';
         job.error = '';
         job.updatedAt = new Date().toISOString();
       }
@@ -1286,7 +1286,7 @@ function publicAccount(account, options = {}) {
     inFlight: account.inFlight || 0,
     total: account.total || 0,
     failures: account.failures || 0,
-    stats24h: options.stats24h || { done: 0, failed: 0 },
+    stats1h: options.stats1h || { done: 0, failed: 0, total: 0, successRate: 0 },
     lastUsedAt: account.lastUsedAt || ''
   };
 }
@@ -1414,25 +1414,37 @@ function jobDurationMs(job) {
 
 function jobStatsSince(jobs, rangeMs) {
   const since = Date.now() - rangeMs;
-  return jobs.reduce((stats, job) => {
+  return finalizeStats(jobs.reduce((stats, job) => {
     const createdAt = Date.parse(job.createdAt || '');
     if (!createdAt || createdAt < since) return stats;
     if (job.status === 'done') stats.done += 1;
     if (job.status === 'failed') stats.failed += 1;
     return stats;
-  }, { done: 0, failed: 0 });
+  }, { done: 0, failed: 0 }));
 }
 
 function accountStatsSince(accountId, jobs, rangeMs) {
   const since = Date.now() - rangeMs;
-  return jobs.reduce((stats, job) => {
+  return finalizeStats(jobs.reduce((stats, job) => {
     if (job.accountId !== accountId) return stats;
     const createdAt = Date.parse(job.createdAt || '');
     if (!createdAt || createdAt < since) return stats;
     if (job.status === 'done') stats.done += 1;
     if (job.status === 'failed') stats.failed += 1;
     return stats;
-  }, { done: 0, failed: 0 });
+  }, { done: 0, failed: 0 }));
+}
+
+function finalizeStats(stats) {
+  const done = Number(stats.done || 0);
+  const failed = Number(stats.failed || 0);
+  const total = done + failed;
+  return {
+    done,
+    failed,
+    total,
+    successRate: total ? done / total : 0
+  };
 }
 
 function publicImage(image) {

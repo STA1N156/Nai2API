@@ -489,11 +489,11 @@ async function clearImages() {
 
 function renderSummary(summary) {
   const enabledAccounts = summary.accounts.filter((account) => account.enabled).length;
-  const requestStats = requestStats24h(summary);
+  const requestStats = requestStats1h(summary);
   const jobPageCount = Math.max(1, Math.ceil(summary.jobs.length / jobPageSize));
   if (state.jobPage > jobPageCount) state.jobPage = jobPageCount;
   el.metricUsers.textContent = summary.users.length;
-  el.metricCredits.textContent = `${requestStats.done}/${requestStats.failed}`;
+  el.metricCredits.textContent = `${formatPercent(requestStats.successRate)}%`;
   el.metricAccounts.textContent = enabledAccounts;
   el.metricImages.textContent = summary.imageCount || 0;
   el.accountCount.textContent = `${summary.accounts.length} 个账号`;
@@ -511,21 +511,26 @@ function renderSummary(summary) {
   syncSelectionControls();
 }
 
-function requestStats24h(summary) {
-  if (summary.jobStats24h) {
+function requestStats1h(summary) {
+  if (summary.jobStats1h) {
     return {
-      done: Number(summary.jobStats24h.done || 0),
-      failed: Number(summary.jobStats24h.failed || 0)
+      done: Number(summary.jobStats1h.done || 0),
+      failed: Number(summary.jobStats1h.failed || 0),
+      total: Number(summary.jobStats1h.total || 0),
+      successRate: Number(summary.jobStats1h.successRate || 0)
     };
   }
-  const since = Date.now() - 24 * 60 * 60 * 1000;
-  return (summary.jobs || []).reduce((stats, job) => {
+  const since = Date.now() - 60 * 60 * 1000;
+  const stats = (summary.jobs || []).reduce((current, job) => {
     const createdAt = Date.parse(job.createdAt || '');
-    if (!createdAt || createdAt < since) return stats;
-    if (job.status === 'done') stats.done += 1;
-    if (job.status === 'failed') stats.failed += 1;
-    return stats;
+    if (!createdAt || createdAt < since) return current;
+    if (job.status === 'done') current.done += 1;
+    if (job.status === 'failed') current.failed += 1;
+    return current;
   }, { done: 0, failed: 0 });
+  stats.total = stats.done + stats.failed;
+  stats.successRate = stats.total ? stats.done / stats.total : 0;
+  return stats;
 }
 
 function renderJobs(jobs) {
@@ -594,7 +599,7 @@ function renderAccount(account) {
   const status = account.enabled ? '已启用' : '已禁用';
   const statusClass = account.enabled ? 'ok' : 'muted';
   const lastUsed = account.lastUsedAt ? `最近使用 ${formatDate(account.lastUsedAt)}` : '尚未使用';
-  const stats24h = account.stats24h || { done: 0, failed: 0 };
+  const stats1h = account.stats1h || { done: 0, failed: 0, total: 0, successRate: 0 };
   return `<article class="data-row selectable account-row">
     <input class="row-check account-select" type="checkbox" value="${escapeHtml(account.id)}" ${checked} />
     <div class="row-main">
@@ -607,9 +612,8 @@ function renderAccount(account) {
     </div>
     <div class="row-stats">
       <span><b>${account.inFlight}</b> 运行中</span>
-      <span><b>${stats24h.done || 0}</b> 24h成功</span>
-      <span><b>${stats24h.failed || 0}</b> 24h失败</span>
-      <small>累计 ${account.total || 0}/${account.failures || 0}</small>
+      <span><b>${formatPercent(stats1h.successRate)}</b>% 1h成功率</span>
+      <span><b>${stats1h.total || 0}</b> 1h请求</span>
     </div>
   </article>`;
 }
@@ -865,6 +869,10 @@ function formatDuration(value) {
   const minutes = Math.floor(seconds / 60);
   const rest = Math.round(seconds % 60);
   return `${minutes}m ${rest}s`;
+}
+
+function formatPercent(value) {
+  return (Number(value || 0) * 100).toFixed(2);
 }
 
 function showToast(message, isError = false) {

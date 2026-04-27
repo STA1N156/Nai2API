@@ -1307,9 +1307,9 @@ textarea:focus {
 .image-preview-trigger {
   display: block;
   width: 100%;
-  aspect-ratio: 5 / 4;
-  min-height: 260px;
-  max-height: 420px;
+  aspect-ratio: 4 / 3;
+  min-height: 320px;
+  max-height: 520px;
   padding: 0;
   border: 0;
   border-radius: 0;
