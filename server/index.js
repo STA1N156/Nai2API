@@ -1,5 +1,5 @@
 import http from 'node:http';
-import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { JsonStore, MAX_CACHE_IMAGES_LIMIT, createId, createPublicToken, defaultArtist2_5D, hashObject, legacyDefaultArtist, maskToken, normalizeDb } from './store.js';
@@ -56,6 +56,7 @@ await mkdir(imageDir, { recursive: true });
 await migrateInlineImages();
 await ensureAccountRouteIds();
 await applyRuntimeSettings();
+await cleanupImageStorage().catch((error) => console.error('Failed to cleanup image storage:', error));
 
 const server = http.createServer(async (req, res) => {
   try {
@@ -146,6 +147,7 @@ async function route(req, res) {
   if (method === 'PUT' && url.pathname === '/api/settings') {
     assertAdmin(req, url);
     const body = await readJson(req);
+    let trimmedImages = [];
     const settings = await store.update((db) => {
       db.settings = {
         ...db.settings,
@@ -159,8 +161,10 @@ async function route(req, res) {
           ...(body.defaults || {})
         }
       };
+      trimmedImages = trimImageCacheRecords(db);
       return db.settings;
     });
+    await removeStoredImages(trimmedImages);
     scheduleQueueDrain();
     sendJson(res, 200, settings);
     return;
@@ -1185,6 +1189,69 @@ async function clearImageCache(body) {
   return result;
 }
 
+async function cleanupImageStorage() {
+  const trimmedImages = await store.update((db) => trimImageCacheRecords(db), { flush: true }) || [];
+  await removeStoredImages(trimmedImages);
+
+  const db = await store.readCollections(['images']);
+  const referencedFiles = new Set((db.images || [])
+    .map((image) => image.file)
+    .filter(Boolean)
+    .map((file) => path.resolve(dataDir, file)));
+
+  let entries = [];
+  try {
+    entries = await readdir(imageDir, { withFileTypes: true });
+  } catch (error) {
+    if (error?.code === 'ENOENT') return;
+    throw error;
+  }
+
+  const orphanFiles = entries
+    .filter((entry) => entry.isFile() && entry.name.startsWith('img_'))
+    .map((entry) => path.join(imageDir, entry.name))
+    .filter((file) => !referencedFiles.has(path.resolve(file)));
+
+  await Promise.all(orphanFiles.map(async (file) => {
+    try {
+      await rm(file, { force: true });
+    } catch (error) {
+      console.error(`Failed to delete orphan cached image ${path.basename(file)}:`, error);
+    }
+  }));
+
+  if (trimmedImages.length || orphanFiles.length) {
+    console.log(`Image cache cleanup removed ${trimmedImages.length} expired records and ${orphanFiles.length} orphan files.`);
+  }
+}
+
+function trimImageCacheRecords(db) {
+  db.settings = db.settings || {};
+  db.images = Array.isArray(db.images) ? db.images : [];
+  const maxCacheImages = normalizeCacheImageLimit(db.settings.maxCacheImages);
+  db.settings.maxCacheImages = maxCacheImages;
+
+  if (db.images.length <= maxCacheImages) return [];
+
+  const removedImages = db.images.slice(maxCacheImages);
+  db.images = db.images.slice(0, maxCacheImages);
+
+  const removedIds = new Set(removedImages.map((image) => image.id));
+  if (removedIds.size && Array.isArray(db.jobs)) {
+    db.jobs.forEach((job) => {
+      if (removedIds.has(job.imageId)) job.imageId = '';
+    });
+  }
+
+  return removedImages;
+}
+
+function normalizeCacheImageLimit(value) {
+  const number = Number(value ?? 500);
+  if (!Number.isFinite(number)) return 500;
+  return Math.max(0, Math.min(MAX_CACHE_IMAGES_LIMIT, Math.floor(number)));
+}
+
 async function importPackage(body) {
   const mode = body.mode === 'merge' ? 'merge' : 'replace';
   const payload = body.data || body.package || body;
@@ -1201,6 +1268,7 @@ async function importPackage(body) {
     safeDb.accounts = safeDb.accounts.map((account) => ({ ...account, inFlight: 0 }));
     assignAccountRouteIds(safeDb.accounts);
     await store.write(safeDb);
+    await cleanupImageStorage();
     return {
       mode,
       users: safeDb.users.length,
@@ -1209,7 +1277,8 @@ async function importPackage(body) {
     };
   }
 
-  return store.update((db) => {
+  let trimmedImages = [];
+  const result = await store.update((db) => {
     db.settings = {
       ...db.settings,
       ...incoming.settings,
@@ -1221,6 +1290,7 @@ async function importPackage(body) {
     db.cards = mergeById(db.cards, incoming.cards);
     db.users = mergeById(db.users, incoming.users);
     db.accounts = mergeById(db.accounts, incoming.accounts).map((account) => ({ ...account, inFlight: 0 }));
+    trimmedImages = trimImageCacheRecords(db);
     return {
       mode,
       users: db.users.length,
@@ -1228,6 +1298,8 @@ async function importPackage(body) {
       images: db.images.length
     };
   });
+  await removeStoredImages(trimmedImages);
+  return result;
 }
 
 async function updateAccount(id, body) {
@@ -1636,51 +1708,61 @@ async function tryReserveCreditAndAccount(token, request, cacheKey) {
 async function completeGeneration(reservation, request, image, meta = {}) {
   const imageId = createId('img');
   const imageFile = await writeStoredImage(imageId, image);
-  const savedImage = await store.update((db) => {
-    const user = getUserOrThrow(db, reservation.token);
-    const account = reservation.account ? db.accounts.find((item) => item.id === reservation.account.id) : null;
-    if (account) {
-      account.inFlight = Math.max(0, Number(account.inFlight || 0) - 1);
-      account.total = Number(account.total || 0) + 1;
-      if (Number.isFinite(Number(account.quotaPoints))) {
-        account.quotaPoints = Math.max(0, Number(account.quotaPoints) - Number(reservation.cost || 0));
+  let trimmedImages = [];
+  let savedImage;
+  try {
+    savedImage = await store.update((db) => {
+      const user = getUserOrThrow(db, reservation.token);
+      const account = reservation.account ? db.accounts.find((item) => item.id === reservation.account.id) : null;
+      if (account) {
+        account.inFlight = Math.max(0, Number(account.inFlight || 0) - 1);
+        account.total = Number(account.total || 0) + 1;
+        if (Number.isFinite(Number(account.quotaPoints))) {
+          account.quotaPoints = Math.max(0, Number(account.quotaPoints) - Number(reservation.cost || 0));
+        }
+        account.updatedAt = new Date().toISOString();
       }
-      account.updatedAt = new Date().toISOString();
-    }
 
-    const saved = {
-      id: imageId,
-      token: reservation.token,
-      accountId: reservation.account?.id || '',
-      cacheKey: image.mock ? '' : reservation.cacheKey || '',
-      mock: Boolean(image.mock),
-      prompt: request.tag,
-      fullPrompt: request.prompt,
-      model: request.model,
-      width: request.width,
-      height: request.height,
-      requestedSteps: request.requestedSteps ?? request.steps,
-      routedSteps: request.steps,
-      cost: reservation.cost,
-      mimeType: image.mimeType,
-      file: imageFile,
-      createdAt: new Date().toISOString()
-    };
-    db.images.unshift(saved);
+      const saved = {
+        id: imageId,
+        token: reservation.token,
+        accountId: reservation.account?.id || '',
+        cacheKey: image.mock ? '' : reservation.cacheKey || '',
+        mock: Boolean(image.mock),
+        prompt: request.tag,
+        fullPrompt: request.prompt,
+        model: request.model,
+        width: request.width,
+        height: request.height,
+        requestedSteps: request.requestedSteps ?? request.steps,
+        routedSteps: request.steps,
+        cost: reservation.cost,
+        mimeType: image.mimeType,
+        file: imageFile,
+        createdAt: new Date().toISOString()
+      };
+      db.images.unshift(saved);
 
-    if (meta.jobId) {
-      const job = db.jobs.find((item) => item.id === meta.jobId);
-      if (job) {
-        job.status = 'done';
-        job.imageId = saved.id;
-        job.accountId = reservation.account?.id || job.accountId || '';
-        job.error = '';
-        job.updatedAt = new Date().toISOString();
+      if (meta.jobId) {
+        const job = db.jobs.find((item) => item.id === meta.jobId);
+        if (job) {
+          job.status = 'done';
+          job.imageId = saved.id;
+          job.accountId = reservation.account?.id || job.accountId || '';
+          job.error = '';
+          job.updatedAt = new Date().toISOString();
+        }
       }
-    }
 
-    return { ...saved, balance: user.balance };
-  });
+      trimmedImages = trimImageCacheRecords(db);
+
+      return { ...saved, balance: user.balance };
+    });
+  } catch (error) {
+    await removeStoredImages([{ id: imageId, file: imageFile }]);
+    throw error;
+  }
+  await removeStoredImages(trimmedImages);
   scheduleQueueDrain();
   if (meta.jobId) notifyJobWaiters(meta.jobId, { saved: savedImage, image, balance: savedImage.balance });
   return savedImage;
