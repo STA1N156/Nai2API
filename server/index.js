@@ -17,6 +17,7 @@ const store = new JsonStore(dataDir);
 let queueDrainTimer = null;
 let queueDraining = false;
 let queueDrainRequested = false;
+let queueFairCursor = '';
 const jobWaiters = new Map();
 const directGenerateTimeoutMs = Number(process.env.DIRECT_GENERATE_TIMEOUT_MS || 60_000);
 const openAiChatTimeoutMs = Number(process.env.OPENAI_CHAT_TIMEOUT_MS || 10 * 60_000);
@@ -1888,20 +1889,21 @@ async function drainQueuedJobs() {
       const slots = availableAccountSlots(db.accounts, db.settings);
       if (slots <= 0) return { jobIds: [], delay: nextAccountReadyDelay(db.accounts, db.settings) };
       return {
-        jobIds: db.jobs
-          .filter((job) => job.status === 'queued')
-          .reverse()
-          .slice(0, slots)
-          .map((job) => job.id),
+        ...selectFairQueuedJobIds(db.jobs, slots, queueFairCursor),
         delay: 0
       };
     });
+    if (drainPlan.cursor !== undefined) queueFairCursor = drainPlan.cursor;
     const jobIds = drainPlan.jobIds || [];
     if (!jobIds.length && drainPlan.delay > 0) queueDrainRequested = true;
     const reservations = await Promise.all(jobIds.map((id) => reserveQueuedJob(id).catch((error) => ({ error }))));
     reservations.forEach((reservation) => {
       if (reservation?.error) {
         console.error(reservation.error);
+        return;
+      }
+      if (reservation?.skip || reservation?.queued) {
+        queueDrainRequested = true;
         return;
       }
       runReservedJob(reservation);
@@ -1913,6 +1915,80 @@ async function drainQueuedJobs() {
       scheduleQueueDrain(delay);
     }
   }
+}
+
+function selectFairQueuedJobIds(jobs, slots, cursor = '') {
+  const limit = Math.max(0, Math.floor(Number(slots || 0)));
+  if (limit <= 0) return { jobIds: [], cursor };
+
+  const pendingByUser = new Map();
+  const runningByUser = new Map();
+  const queuedJobs = jobs
+    .filter((job) => job.status === 'queued')
+    .slice()
+    .sort(compareJobsByCreatedAt);
+
+  for (const job of queuedJobs) {
+    const userKey = queueUserKey(job);
+    if (!pendingByUser.has(userKey)) pendingByUser.set(userKey, []);
+    pendingByUser.get(userKey).push(job);
+  }
+
+  if (!pendingByUser.size) return { jobIds: [], cursor };
+
+  for (const job of jobs) {
+    if (job.status !== 'running') continue;
+    const userKey = queueUserKey(job);
+    runningByUser.set(userKey, Number(runningByUser.get(userKey) || 0) + 1);
+  }
+
+  const userOrder = Array.from(pendingByUser.keys()).sort((a, b) => {
+    const firstA = pendingByUser.get(a)?.[0] || {};
+    const firstB = pendingByUser.get(b)?.[0] || {};
+    return compareJobsByCreatedAt(firstA, firstB) || a.localeCompare(b);
+  });
+  const selectedByUser = new Map();
+  const jobIds = [];
+  let nextCursor = cursor;
+
+  while (jobIds.length < limit) {
+    const usersWithJobs = userOrder.filter((userKey) => pendingByUser.get(userKey)?.length);
+    if (!usersWithJobs.length) break;
+
+    const minLoad = Math.min(...usersWithJobs.map((userKey) => (
+      Number(runningByUser.get(userKey) || 0) + Number(selectedByUser.get(userKey) || 0)
+    )));
+    const eligible = new Set(usersWithJobs.filter((userKey) => (
+      Number(runningByUser.get(userKey) || 0) + Number(selectedByUser.get(userKey) || 0)
+    ) === minLoad));
+    const userKey = rotateQueueUsers(userOrder, nextCursor)
+      .find((candidate) => eligible.has(candidate) && pendingByUser.get(candidate)?.length)
+      || usersWithJobs[0];
+    const job = pendingByUser.get(userKey).shift();
+    jobIds.push(job.id);
+    selectedByUser.set(userKey, Number(selectedByUser.get(userKey) || 0) + 1);
+    nextCursor = userKey;
+  }
+
+  return { jobIds, cursor: jobIds.length ? nextCursor : cursor };
+}
+
+function queueUserKey(job) {
+  return String(job.userToken || '');
+}
+
+function rotateQueueUsers(users, cursor = '') {
+  if (!users.length) return [];
+  const index = users.indexOf(cursor);
+  if (index < 0) return users;
+  return [...users.slice(index + 1), ...users.slice(0, index + 1)];
+}
+
+function compareJobsByCreatedAt(a, b) {
+  const timeA = Date.parse(a.createdAt || '') || 0;
+  const timeB = Date.parse(b.createdAt || '') || 0;
+  if (timeA !== timeB) return timeA - timeB;
+  return String(a.id || '').localeCompare(String(b.id || ''));
 }
 
 async function queueRetryDelay() {
@@ -2138,9 +2214,7 @@ function sanitizeMigrationData(payload) {
 function publicJob(job, db = null) {
   const queue = db && job.status === 'queued'
     ? stableQueueProgress(job, db.jobs)
-    : job.status === 'running' && Number(job.queueTotal || 0) > 1
-      ? { progress: Number(job.queueTotal || 0), total: Number(job.queueTotal || 0) }
-      : { progress: 0, total: 0 };
+    : { progress: 0, total: 0 };
   const request = job.request || {};
   const account = db && job.accountId ? db.accounts.find((item) => item.id === job.accountId) : null;
   return {
@@ -2166,16 +2240,18 @@ function publicJob(job, db = null) {
 }
 
 function stableQueueProgress(job, jobs) {
-  const total = Math.max(1, Number(job.queueTotal || 0));
-  const createdAt = Date.parse(job.createdAt || '') || 0;
-  const activeAhead = jobs.filter((item) => {
-    if (item.id === job.id) return false;
-    if (!['queued', 'running'].includes(item.status)) return false;
-    const itemTime = Date.parse(item.createdAt || '') || 0;
-    return itemTime <= createdAt;
-  }).length;
+  const queued = jobs.filter((item) => item.status === 'queued');
+  const total = Math.max(1, queued.length);
+  const fairOrder = selectFairQueuedJobIds(jobs, total, queueFairCursor).jobIds;
+  const fairIndex = fairOrder.indexOf(job.id);
+  if (fairIndex >= 0) {
+    return {
+      progress: fairIndex + 1,
+      total
+    };
+  }
   return {
-    progress: Math.max(1, Math.min(total, total - activeAhead)),
+    progress: total,
     total
   };
 }
