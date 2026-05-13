@@ -393,20 +393,19 @@ async function route(req, res) {
     const token = String(body.token || tokenFrom(req, url) || '');
     const job = await createJob(token, body);
     scheduleQueueDrain();
-    const db = await store.readCollections(['accounts', 'jobs']);
-    const savedJob = db.jobs.find((item) => item.id === job.id) || job;
-    sendJson(res, 202, publicJob(savedJob, db));
+    const snapshot = await store.findJobContext(job.id);
+    sendJson(res, 202, publicJob(snapshot?.job || job, snapshot));
     return;
   }
 
   if (method === 'GET' && url.pathname.startsWith('/api/jobs/')) {
     const id = decodeURIComponent(url.pathname.split('/').pop() || '');
     const token = tokenFrom(req, url);
-    const db = await store.readCollections(['accounts', 'jobs']);
-    const job = db.jobs.find((item) => item.id === id);
+    const snapshot = await store.findJobContext(id);
+    const job = snapshot?.job;
     if (!job) throw httpError(404, 'job not found.');
     if (job.userToken !== token && !isAdmin(req, url)) throw httpError(403, 'forbidden.');
-    sendJson(res, 200, publicJob(job, db));
+    sendJson(res, 200, publicJob(job, snapshot));
     return;
   }
 
@@ -710,9 +709,8 @@ async function streamOpenAiImageJob(req, res, job, model) {
 }
 
 async function publicJobSnapshot(jobId) {
-  const db = await store.readCollections(['accounts', 'jobs']);
-  const job = db.jobs.find((item) => item.id === jobId);
-  return job ? publicJob(job, db) : null;
+  const snapshot = await store.findJobContext(jobId);
+  return snapshot ? publicJob(snapshot.job, snapshot) : null;
 }
 
 function openAiProgressLine(job) {
@@ -1833,6 +1831,7 @@ function selectAccount(accounts, settings = {}, options = {}) {
 }
 
 function accountQuotaPoints(account) {
+  if (account?.quotaPoints === null || account?.quotaPoints === undefined || account?.quotaPoints === '') return null;
   const value = Number(account?.quotaPoints);
   return Number.isFinite(value) ? value : null;
 }
@@ -2136,13 +2135,13 @@ function sanitizeMigrationData(payload) {
 }
 
 function publicJob(job, db = null) {
-  const queue = db && job.status === 'queued'
+  const queue = db?.queue || (db && job.status === 'queued'
     ? stableQueueProgress(job, db.jobs)
     : job.status === 'running' && Number(job.queueTotal || 0) > 1
       ? { progress: Number(job.queueTotal || 0), total: Number(job.queueTotal || 0) }
-      : { progress: 0, total: 0 };
+      : { progress: 0, total: 0 });
   const request = job.request || {};
-  const account = db && job.accountId ? db.accounts.find((item) => item.id === job.accountId) : null;
+  const account = db?.account || (db && job.accountId ? db.accounts.find((item) => item.id === job.accountId) : null);
   return {
     id: job.id,
     source: job.source || 'web',

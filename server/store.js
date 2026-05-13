@@ -96,6 +96,20 @@ export class JsonStore {
     return snapshot;
   }
 
+  async findJobContext(id) {
+    await this.ensureLoaded();
+    const job = this.db.jobs.find((item) => item.id === id);
+    if (!job) return null;
+    const account = job.accountId
+      ? this.db.accounts.find((item) => item.id === job.accountId) || null
+      : null;
+    return {
+      job: structuredClone(job),
+      account: account ? structuredClone(account) : null,
+      queue: jobQueueProgress(job, this.db.jobs)
+    };
+  }
+
   async readSettings() {
     await this.ensureLoaded();
     return structuredClone(this.db.settings);
@@ -258,6 +272,26 @@ function imageResolutionTier(image) {
   return 'standard';
 }
 
+function jobQueueProgress(job, jobs) {
+  if (job.status === 'running' && Number(job.queueTotal || 0) > 1) {
+    const total = Number(job.queueTotal || 0);
+    return { progress: total, total };
+  }
+  if (job.status !== 'queued') return { progress: 0, total: 0 };
+  const total = Math.max(1, Number(job.queueTotal || 0));
+  const createdAt = Date.parse(job.createdAt || '') || 0;
+  const activeAhead = jobs.filter((item) => {
+    if (item.id === job.id) return false;
+    if (!['queued', 'running'].includes(item.status)) return false;
+    const itemTime = Date.parse(item.createdAt || '') || 0;
+    return itemTime <= createdAt;
+  }).length;
+  return {
+    progress: Math.max(1, Math.min(total, total - activeAhead)),
+    total
+  };
+}
+
 function cloneDb(db) {
   return normalizeDb(structuredClone(db));
 }
@@ -378,10 +412,26 @@ function trimDb(db) {
   db.settings.costPerImage = 1;
   db.settings.maxCacheImages = maxCacheImages;
   db.settings.accountConcurrency = clampNumber(db.settings.accountConcurrency, 1, 20);
-  db.jobs = db.jobs.slice(0, 500);
+  db.jobs = trimJobs(db.jobs, 500);
   db.images = db.images.slice(0, maxCacheImages);
   db.ledger = db.ledger.slice(0, 1000);
   return db;
+}
+
+function trimJobs(jobs, terminalLimit) {
+  const now = Date.now();
+  const retainMs = clampNumber(process.env.JOB_HISTORY_RETENTION_MS ?? 6 * 60 * 60 * 1000, 60_000, 24 * 60 * 60 * 1000);
+  let terminalCount = 0;
+  return jobs.filter((job) => {
+    if (['queued', 'running'].includes(job.status)) return true;
+    const updatedAt = Date.parse(job.updatedAt || job.createdAt || '');
+    if (updatedAt && now - updatedAt <= retainMs) return true;
+    if (terminalCount < terminalLimit) {
+      terminalCount += 1;
+      return true;
+    }
+    return false;
+  });
 }
 
 export function normalizeDb(db = {}) {
