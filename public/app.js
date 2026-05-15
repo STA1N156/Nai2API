@@ -50,6 +50,9 @@ const el = Object.fromEntries(ids.map((id) => [id, document.querySelector(`#${id
 const maxSteps = 28;
 const maxUrlSteps = 28;
 const defaultSteps = 28;
+const jobPollIntervalMs = 650;
+const queueStepIntervalMs = 180;
+const queueCompleteStepIntervalMs = 70;
 const artistPresets = {
   '2.5d': {
     label: '2.5D唯美风',
@@ -342,7 +345,7 @@ async function startJob() {
     el.jobText.textContent = jobStatusText(job);
     updateLoadingStatus(job);
     await loadMe().catch(() => {});
-    state.pollTimer = setInterval(() => pollJob(job.id), 1100);
+    state.pollTimer = setInterval(() => pollJob(job.id), jobPollIntervalMs);
     await pollJob(job.id);
   } catch (error) {
     renderFrameNotice('生成失败', true);
@@ -518,7 +521,7 @@ function ensureQueueViewTimer() {
       el.jobText.textContent = '生成中';
       setLoadingStep(2);
     }
-  }, state.queueView?.completing ? 120 : 420);
+  }, state.queueView?.completing ? queueCompleteStepIntervalMs : queueStepIntervalMs);
 }
 
 function renderQueueText() {

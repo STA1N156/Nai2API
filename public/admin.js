@@ -4,6 +4,7 @@ const state = {
   adminToken: localStorage.getItem('nai.adminToken') || '',
   selectedUsers: new Set(),
   selectedAccounts: new Set(),
+  testingAccounts: new Set(),
   summary: null,
   images: [],
   imageTotal: 0,
@@ -143,6 +144,7 @@ function bindEvents() {
   });
   el.userList.addEventListener('change', handleUserSelection);
   el.accountList.addEventListener('change', handleAccountSelection);
+  el.accountList.addEventListener('click', handleAccountAction);
   el.imageList.addEventListener('click', handleImagePreview);
   window.addEventListener('resize', debounce(() => {
     if (state.adminToken && !el.dashboard.classList.contains('hidden')) refreshImages(false);
@@ -419,6 +421,33 @@ async function refreshSelectedAccountQuotas() {
   }
 }
 
+async function testAccount(accountId) {
+  if (!accountId || state.testingAccounts.has(accountId)) return;
+  try {
+    state.testingAccounts.add(accountId);
+    renderAccounts();
+    const result = await api(`/api/admin/accounts/${encodeURIComponent(accountId)}/test`, {
+      method: 'POST',
+      admin: true
+    });
+    replaceSummaryAccount(result.account);
+    renderAccounts();
+    showToast(result.message || (result.ok ? '账号测试通过' : '账号测试失败'), !result.ok);
+  } catch (error) {
+    showToast(normalizeErrorMessage(error), true);
+  } finally {
+    state.testingAccounts.delete(accountId);
+    renderAccounts();
+    syncSelectionControls();
+  }
+}
+
+function replaceSummaryAccount(account) {
+  if (!account || !state.summary?.accounts) return;
+  const index = state.summary.accounts.findIndex((item) => item.id === account.id);
+  if (index >= 0) state.summary.accounts[index] = account;
+}
+
 async function resetSelectedAccountStats() {
   try {
     const ids = Array.from(state.selectedAccounts);
@@ -531,9 +560,7 @@ function renderSummary(summary, options = {}) {
   el.maxCacheImages.value = summary.settings?.maxCacheImages ?? 500;
   el.accountConcurrency.value = summary.settings?.accountConcurrency ?? 2;
 
-  el.accountList.innerHTML = summary.accounts.length
-    ? summary.accounts.map(renderAccount).join('')
-    : '<div class="empty small">暂无账号</div>';
+  renderAccounts(summary.accounts);
 
   renderUsers(summary.users);
 
@@ -631,6 +658,12 @@ function renderImages(data) {
   el.imageNextBtn.disabled = state.imagePage >= pageCount;
 }
 
+function renderAccounts(accounts = state.summary?.accounts || []) {
+  el.accountList.innerHTML = accounts.length
+    ? accounts.map(renderAccount).join('')
+    : '<div class="empty small">暂无账号</div>';
+}
+
 function changeJobPage(delta) {
   const jobs = state.summary?.jobs || [];
   const pageCount = Math.max(1, Math.ceil(jobs.length / jobPageSize));
@@ -648,6 +681,7 @@ async function changeImagePage(delta) {
 
 function renderAccount(account) {
   const checked = state.selectedAccounts.has(account.id) ? 'checked' : '';
+  const testing = state.testingAccounts.has(account.id);
   const status = account.enabled ? '已启用' : '已禁用';
   const statusClass = account.enabled ? 'ok' : 'muted';
   const lastUsed = account.lastUsedAt ? `最近使用 ${formatDate(account.lastUsedAt)}` : '尚未使用';
@@ -672,6 +706,7 @@ function renderAccount(account) {
       <span><b>${escapeHtml(quotaText)}</b></span>
       <span><b>${formatPercent(stats1h.successRate)}</b>% 1h成功率</span>
       <span><b>${stats1h.total || 0}</b> 1h请求</span>
+      <button class="row-action account-test-btn" type="button" data-account-id="${escapeHtml(account.id)}" ${testing ? 'disabled' : ''}>${testing ? '测试中' : '测试'}</button>
     </div>
   </article>`;
 }
@@ -817,6 +852,14 @@ function handleAccountSelection(event) {
   if (!event.target.classList.contains('account-select')) return;
   toggleSelection(state.selectedAccounts, event.target.value, event.target.checked);
   syncSelectionControls();
+}
+
+function handleAccountAction(event) {
+  const testButton = event.target.closest('.account-test-btn');
+  if (!testButton) return;
+  event.preventDefault();
+  event.stopPropagation();
+  testAccount(testButton.dataset.accountId);
 }
 
 function toggleAllUsers() {

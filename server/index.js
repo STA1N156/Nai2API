@@ -20,6 +20,7 @@ let queueDrainRequested = false;
 const jobWaiters = new Map();
 const directGenerateTimeoutMs = Number(process.env.DIRECT_GENERATE_TIMEOUT_MS || 60_000);
 const openAiChatTimeoutMs = Number(process.env.OPENAI_CHAT_TIMEOUT_MS || 10 * 60_000);
+const openAiQueuePollMs = 650;
 const openAiFixedSteps = 28;
 const openAiSamplers = [
   'k_euler_ancestral',
@@ -352,6 +353,15 @@ async function route(req, res) {
     assertAdmin(req, url);
     const body = await readJson(req);
     const result = await refreshAccountQuotas(body);
+    sendJson(res, 200, result);
+    return;
+  }
+
+  if (method === 'POST' && url.pathname.startsWith('/api/admin/accounts/') && url.pathname.endsWith('/test')) {
+    assertAdmin(req, url);
+    const parts = url.pathname.split('/');
+    const id = decodeURIComponent(parts.at(-2) || '');
+    const result = await testAccount(id);
     sendJson(res, 200, result);
     return;
   }
@@ -701,7 +711,7 @@ async function streamOpenAiImageJob(req, res, job, model) {
       return;
     }
 
-    await sleep(1100);
+    await sleep(openAiQueuePollMs);
   }
 
   writeOpenAiChunk(res, { id: streamId, model, content: '连接超时\n</think>\n连接超时\n' });
@@ -1085,27 +1095,9 @@ async function refreshAccountQuotas(body) {
   for (const target of targets) {
     try {
       const quota = await fetchNovelAiAccountQuotaWithTimeout(target.token);
-      results.push({
-        id: target.id,
-        ok: true,
-        quotaPoints: quota.points,
-        quotaFixed: quota.fixed,
-        quotaPurchased: quota.purchased,
-        quotaTier: quota.tier,
-        quotaCheckedAt: now,
-        quotaError: ''
-      });
+      results.push(accountQuotaResult(target.id, quota, now));
     } catch (error) {
-      results.push({
-        id: target.id,
-        ok: false,
-        quotaPoints: null,
-        quotaFixed: null,
-        quotaPurchased: null,
-        quotaTier: null,
-        quotaCheckedAt: now,
-        quotaError: publicErrorMessage(error.message || 'quota query failed.')
-      });
+      results.push(accountQuotaErrorResult(target.id, error, now));
     }
   }
 
@@ -1114,13 +1106,7 @@ async function refreshAccountQuotas(body) {
     db.accounts.forEach((account) => {
       const result = resultMap.get(account.id);
       if (!result) return;
-      account.quotaPoints = result.quotaPoints;
-      account.quotaFixed = result.quotaFixed;
-      account.quotaPurchased = result.quotaPurchased;
-      account.quotaTier = result.quotaTier;
-      account.quotaCheckedAt = result.quotaCheckedAt;
-      account.quotaError = result.quotaError;
-      account.updatedAt = now;
+      applyAccountQuotaResult(account, result, now);
     });
     return db.accounts.filter((account) => resultMap.has(account.id));
   });
@@ -1131,6 +1117,112 @@ async function refreshAccountQuotas(body) {
     failed: results.filter((result) => !result.ok).length,
     accounts: accounts.map((account) => publicAccount(account, { revealToken: true }))
   };
+}
+
+async function testAccount(id) {
+  const db = await store.readCollections(['settings', 'accounts']);
+  const target = db.accounts.find((account) => account.id === id);
+  if (!target) throw httpError(404, 'account not found.');
+
+  const now = new Date().toISOString();
+  let result;
+  try {
+    const quota = await fetchNovelAiAccountQuotaWithTimeout(target.token);
+    result = accountQuotaResult(target.id, quota, now);
+  } catch (error) {
+    result = accountQuotaErrorResult(target.id, error, now);
+  }
+
+  const account = await store.update((writeDb) => {
+    const item = writeDb.accounts.find((entry) => entry.id === id);
+    if (!item) throw httpError(404, 'account not found.');
+    applyAccountQuotaResult(item, result, now);
+    return item;
+  });
+  const availability = accountAvailability(account, db.settings);
+  const ok = Boolean(result.ok);
+  const available = ok && availability.available;
+
+  return {
+    ok,
+    available,
+    message: accountTestMessage(result, availability),
+    checkedAt: now,
+    availability,
+    account: publicAccount(account, { revealToken: true })
+  };
+}
+
+function accountQuotaResult(id, quota, now) {
+  return {
+    id,
+    ok: true,
+    quotaPoints: quota.points,
+    quotaFixed: quota.fixed,
+    quotaPurchased: quota.purchased,
+    quotaTier: quota.tier,
+    quotaCheckedAt: now,
+    quotaError: ''
+  };
+}
+
+function accountQuotaErrorResult(id, error, now) {
+  return {
+    id,
+    ok: false,
+    quotaPoints: null,
+    quotaFixed: null,
+    quotaPurchased: null,
+    quotaTier: null,
+    quotaCheckedAt: now,
+    quotaError: publicErrorMessage(error.message || 'quota query failed.')
+  };
+}
+
+function applyAccountQuotaResult(account, result, now) {
+  account.quotaPoints = result.quotaPoints;
+  account.quotaFixed = result.quotaFixed;
+  account.quotaPurchased = result.quotaPurchased;
+  account.quotaTier = result.quotaTier;
+  account.quotaCheckedAt = result.quotaCheckedAt;
+  account.quotaError = result.quotaError;
+  account.updatedAt = now;
+}
+
+function accountAvailability(account, settings = {}) {
+  const now = Date.now();
+  const maxConcurrency = maxAccountConcurrency(settings);
+  const inFlight = Number(account.inFlight || 0);
+  const cooldownUntilMs = Date.parse(account.cooldownUntil || '');
+  const coolingDown = Number.isFinite(cooldownUntilMs) && cooldownUntilMs > now;
+  const quotaPoints = accountQuotaPoints(account);
+  const enabled = account.enabled !== false;
+  const hasSlot = inFlight < maxConcurrency;
+  const standardAvailable = enabled && !coolingDown && hasSlot;
+  const highResolutionAvailable = standardAvailable && (quotaPoints === null || quotaPoints >= 20);
+
+  return {
+    enabled,
+    coolingDown,
+    cooldownUntil: coolingDown ? account.cooldownUntil : '',
+    inFlight,
+    maxConcurrency,
+    hasSlot,
+    quotaPoints,
+    available: standardAvailable,
+    standardAvailable,
+    highResolutionAvailable
+  };
+}
+
+function accountTestMessage(result, availability) {
+  if (!result.ok) return `测试失败：${result.quotaError || '账号不可用'}`;
+  if (!availability.enabled) return '测试通过：Token 有效，但这个账号已禁用';
+  if (availability.coolingDown) return '测试通过：Token 有效，但账号正在冷却中';
+  if (!availability.hasSlot) return '测试通过：Token 有效，但账号当前并发已满';
+  const quotaText = availability.quotaPoints === null ? '点数未知' : `剩余 ${availability.quotaPoints} 点`;
+  if (!availability.highResolutionAvailable) return `测试通过：普通生成可用，2K/4K 点数不足（${quotaText}）`;
+  return `测试通过：账号当前可用（${quotaText}）`;
 }
 
 async function fetchNovelAiAccountQuotaWithTimeout(token) {
@@ -1330,6 +1422,7 @@ async function createJob(token, body) {
           request,
           cacheKey,
           cost: 0,
+          accountCost: 0,
           accountId: cached.accountId || '',
           createdAt: now,
           updatedAt: now,
@@ -1342,6 +1435,7 @@ async function createJob(token, body) {
     }
 
     const cost = generationCost(request);
+    const accountCost = accountGenerationCost(request);
     if (user.balance < cost) throw httpError(402, insufficientBalanceMessage);
     const queueTotal = activeJobCount(db.jobs) + 1;
     user.balance -= cost;
@@ -1354,6 +1448,7 @@ async function createJob(token, body) {
       cacheKey,
       queueTotal,
       cost,
+      accountCost,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
       imageId: '',
@@ -1382,6 +1477,7 @@ async function createDirectJob(token, request, cacheKey, options = {}) {
   return store.update((db) => {
     const user = getUserOrThrow(db, token);
     const cost = Number(options.cost ?? generationCost(request));
+    const accountCost = Number(options.accountCost ?? (options.status ? 0 : accountGenerationCost(request)));
     const shouldCharge = !options.status && cost > 0;
     if (shouldCharge && user.balance < cost) throw httpError(402, insufficientBalanceMessage);
     const now = new Date().toISOString();
@@ -1398,6 +1494,7 @@ async function createDirectJob(token, request, cacheKey, options = {}) {
       cacheKey,
       queueTotal: options.status === 'done' ? 1 : activeJobCount(db.jobs) + 1,
       cost: shouldCharge ? cost : Number(options.cost || 0),
+      accountCost,
       accountId: options.accountId || '',
       deadlineAt: options.deadlineAt || '',
       createdAt: now,
@@ -1427,6 +1524,7 @@ async function markDirectJobRunning(jobId, reservation) {
     job.status = 'running';
     job.accountId = reservation.account?.id || '';
     job.cost = Number(reservation.cost || 0);
+    job.accountCost = Number(reservation.accountCost || 0);
     job.updatedAt = new Date().toISOString();
   });
 }
@@ -1504,6 +1602,8 @@ async function reserveQueuedJob(jobId) {
     const job = db.jobs.find((item) => item.id === jobId);
     if (!job) throw new Error('job not found.');
     if (job.status !== 'queued') return { skip: true };
+    const accountCost = jobAccountCost(job);
+    job.accountCost = accountCost;
     if (isExpiredJob(job)) {
       refundJob(db, job, '连接超时');
       job.status = 'failed';
@@ -1511,9 +1611,9 @@ async function reserveQueuedJob(jobId) {
       job.updatedAt = new Date().toISOString();
       return { skip: true };
     }
-    const account = selectAccount(db.accounts, db.settings, { cost: job.cost });
+    const account = selectAccount(db.accounts, db.settings, { cost: accountCost });
     if (!account && hasEnabledAccounts(db.accounts)) {
-      if (!hasAccountWithEnoughQuota(db.accounts, job.cost)) {
+      if (!hasAccountWithEnoughQuota(db.accounts, accountCost)) {
         refundJob(db, job, 'NovelAI账号点数不足');
         job.status = 'failed';
         job.error = 'NovelAI账号点数不足';
@@ -1530,7 +1630,7 @@ async function reserveQueuedJob(jobId) {
     job.status = 'running';
     job.accountId = account?.id || '';
     job.updatedAt = new Date().toISOString();
-    return { job, account: account ? { ...account } : null, token: job.userToken, cost: job.cost, cacheKey: job.cacheKey || '' };
+    return { job, account: account ? { ...account } : null, token: job.userToken, cost: job.cost, accountCost, cacheKey: job.cacheKey || '' };
   });
 }
 
@@ -1591,7 +1691,8 @@ async function retryReservationWithNextAccount(reservation, error, tried, option
     }
 
     if (options.deadline && Date.now() >= options.deadline) return null;
-    const account = selectAccount(db.accounts, db.settings, { excludeIds: tried, cost: reservation.cost });
+    const accountCost = reservationAccountCost(reservation, reservation.job?.request);
+    const account = selectAccount(db.accounts, db.settings, { excludeIds: tried, cost: accountCost });
     if (!account) return null;
     account.inFlight = Number(account.inFlight || 0) + 1;
     account.lastUsedAt = new Date().toISOString();
@@ -1608,6 +1709,7 @@ async function retryReservationWithNextAccount(reservation, error, tried, option
 
     return {
       ...reservation,
+      accountCost,
       account: { ...account },
       job: reservation.job ? { ...reservation.job, accountId: account.id } : reservation.job
     };
@@ -1642,10 +1744,11 @@ async function reserveCreditAndAccount(token, request, cacheKey) {
   return store.update((db) => {
     const user = getUserOrThrow(db, token);
     const cost = generationCost(request);
+    const accountCost = accountGenerationCost(request);
     if (user.balance < cost) throw httpError(402, insufficientBalanceMessage);
-    const account = selectAccount(db.accounts, db.settings, { cost });
+    const account = selectAccount(db.accounts, db.settings, { cost: accountCost });
     if (!account && hasEnabledAccounts(db.accounts)) {
-      if (!hasAccountWithEnoughQuota(db.accounts, cost)) throw httpError(503, 'NovelAI账号点数不足');
+      if (!hasAccountWithEnoughQuota(db.accounts, accountCost)) throw httpError(503, 'NovelAI账号点数不足');
       throw httpError(429, 'all NovelAI accounts are busy, retry shortly.');
     }
     if (account) {
@@ -1662,7 +1765,7 @@ async function reserveCreditAndAccount(token, request, cacheKey) {
       amount: -cost,
       at: new Date().toISOString()
     });
-    return { token, account: account ? { ...account } : null, cost, cacheKey };
+    return { token, account: account ? { ...account } : null, cost, accountCost, cacheKey };
   });
 }
 
@@ -1679,10 +1782,11 @@ async function tryReserveCreditAndAccount(token, request, cacheKey) {
   return store.update((db) => {
     const user = getUserOrThrow(db, token);
     const cost = generationCost(request);
+    const accountCost = accountGenerationCost(request);
     if (user.balance < cost) throw httpError(402, insufficientBalanceMessage);
-    const account = selectAccount(db.accounts, db.settings, { cost });
+    const account = selectAccount(db.accounts, db.settings, { cost: accountCost });
     if (!account && hasEnabledAccounts(db.accounts)) {
-      if (!hasAccountWithEnoughQuota(db.accounts, cost)) throw httpError(503, 'NovelAI账号点数不足');
+      if (!hasAccountWithEnoughQuota(db.accounts, accountCost)) throw httpError(503, 'NovelAI账号点数不足');
       return { busy: true };
     }
     if (account) {
@@ -1699,13 +1803,14 @@ async function tryReserveCreditAndAccount(token, request, cacheKey) {
       amount: -cost,
       at: new Date().toISOString()
     });
-    return { busy: false, reservation: { token, account: account ? { ...account } : null, cost, cacheKey } };
+    return { busy: false, reservation: { token, account: account ? { ...account } : null, cost, accountCost, cacheKey } };
   });
 }
 
 async function completeGeneration(reservation, request, image, meta = {}) {
   const imageId = createId('img');
   const imageFile = await writeStoredImage(imageId, image);
+  const accountCost = reservationAccountCost(reservation, request);
   let trimmedImages = [];
   let savedImage;
   try {
@@ -1715,8 +1820,8 @@ async function completeGeneration(reservation, request, image, meta = {}) {
       if (account) {
         account.inFlight = Math.max(0, Number(account.inFlight || 0) - 1);
         account.total = Number(account.total || 0) + 1;
-        if (Number.isFinite(Number(account.quotaPoints))) {
-          account.quotaPoints = Math.max(0, Number(account.quotaPoints) - Number(reservation.cost || 0));
+        if (accountCost > 0 && Number.isFinite(Number(account.quotaPoints))) {
+          account.quotaPoints = Math.max(0, Number(account.quotaPoints) - accountCost);
         }
         account.updatedAt = new Date().toISOString();
       }
@@ -1735,6 +1840,7 @@ async function completeGeneration(reservation, request, image, meta = {}) {
         requestedSteps: request.requestedSteps ?? request.steps,
         routedSteps: request.steps,
         cost: reservation.cost,
+        accountCost,
         mimeType: image.mimeType,
         file: imageFile,
         createdAt: new Date().toISOString()
@@ -1803,7 +1909,7 @@ async function failGeneration(reservation, error) {
 function selectAccount(accounts, settings = {}, options = {}) {
   resetStaleAccountLoads(accounts);
   const excludeIds = options.excludeIds || new Set();
-  const cost = Math.max(1, Number(options.cost || 1));
+  const cost = normalizeAccountCost(options.cost);
   const now = Date.now();
   const enabled = accounts.filter((account) => account.enabled !== false && !isAccountCoolingDown(account, now));
   if (!enabled.length) return null;
@@ -1818,7 +1924,7 @@ function selectAccount(accounts, settings = {}, options = {}) {
   return available.sort((a, b) => {
     const quotaA = accountQuotaPoints(a);
     const quotaB = accountQuotaPoints(b);
-    if (quotaA !== null || quotaB !== null) {
+    if (cost > 0 && (quotaA !== null || quotaB !== null)) {
       if (quotaA === null) return 1;
       if (quotaB === null) return -1;
       if (quotaA !== quotaB) return quotaB - quotaA;
@@ -1903,6 +2009,10 @@ async function drainQueuedJobs() {
         console.error(reservation.error);
         return;
       }
+      if (reservation?.skip || reservation?.queued) {
+        queueDrainRequested = true;
+        return;
+      }
       runReservedJob(reservation);
     });
   } finally {
@@ -1924,7 +2034,7 @@ function hasEnabledAccounts(accounts) {
 }
 
 function hasAccountWithEnoughQuota(accounts, cost = 1) {
-  const required = Math.max(1, Number(cost || 1));
+  const required = normalizeAccountCost(cost);
   return accounts.some((account) => {
     if (account.enabled === false) return false;
     const quota = accountQuotaPoints(account);
@@ -2153,6 +2263,7 @@ function publicJob(job, db = null) {
     accountId: job.accountId || '',
     accountRouteId: account?.routeId || 0,
     cost: job.cost,
+    accountCost: jobAccountCost(job),
     imageId: job.imageId || '',
     imageUrl: job.imageId ? `/api/images/${job.imageId}/content` : '',
     error: publicErrorMessage(job.error || ''),
@@ -2267,6 +2378,7 @@ function publicImage(image) {
     requestedSteps: image.requestedSteps ?? image.routedSteps ?? 0,
     routedSteps: image.routedSteps ?? image.requestedSteps ?? 0,
     cost: image.cost || 1,
+    accountCost: image.accountCost || 0,
     mock: Boolean(image.mock),
     mimeType: image.mimeType || '',
     createdAt: image.createdAt || ''
@@ -2279,6 +2391,38 @@ function generationCost(request = null) {
   const costs = [sizeCost];
   if (Number.isFinite(requestedCost) && requestedCost > 0) costs.push(Math.ceil(requestedCost));
   return Math.max(...costs);
+}
+
+function accountGenerationCost(request = null) {
+  const sizeCost = sizeCostMap[normalizeSizeName(request?.size)] || 1;
+  const resolutionCost = resolutionGenerationCost(request);
+  const cost = Math.max(sizeCost, resolutionCost);
+  return cost > 1 ? cost : 0;
+}
+
+function resolutionGenerationCost(request = null) {
+  const width = Number(request?.width || 0);
+  const height = Number(request?.height || 0);
+  if (width >= 1700 || height >= 1900) return 35;
+  if (width >= 1300 || height >= 1500) return 20;
+  return 1;
+}
+
+function jobAccountCost(job = {}) {
+  const stored = Number(job.accountCost);
+  if (Number.isFinite(stored) && stored >= 0) return normalizeAccountCost(stored);
+  return accountGenerationCost(job.request);
+}
+
+function reservationAccountCost(reservation = {}, request = null) {
+  const stored = Number(reservation.accountCost);
+  if (Number.isFinite(stored) && stored >= 0) return normalizeAccountCost(stored);
+  return accountGenerationCost(request);
+}
+
+function normalizeAccountCost(value) {
+  const cost = Number(value);
+  return Number.isFinite(cost) && cost > 0 ? Math.ceil(cost) : 0;
 }
 
 function normalizeSizeName(value) {

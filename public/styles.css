@@ -1214,6 +1214,19 @@ textarea:focus {
   font-size: 14px;
 }
 
+.row-stats .row-action {
+  min-height: 30px;
+  padding: 0 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  box-shadow: none;
+}
+
+.row-stats .row-action:disabled {
+  opacity: 0.58;
+  cursor: wait;
+}
+
 .status-badge {
   min-height: 26px;
   display: inline-flex;
