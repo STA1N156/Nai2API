@@ -412,22 +412,19 @@ function trimDb(db) {
   db.settings.costPerImage = 1;
   db.settings.maxCacheImages = maxCacheImages;
   db.settings.accountConcurrency = 1;
-  db.jobs = trimJobs(db.jobs, 10000);
+  db.jobs = trimJobs(db.jobs);
   db.images = db.images.slice(0, maxCacheImages);
   db.ledger = db.ledger.slice(0, 1000);
   return db;
 }
 
-function trimJobs(jobs, terminalLimit) {
+function trimJobs(jobs) {
   const now = Date.now();
   const retainMs = clampNumber(process.env.JOB_HISTORY_RETENTION_MS ?? 7 * 24 * 60 * 60 * 1000, 60_000, 7 * 24 * 60 * 60 * 1000);
-  let terminalCount = 0;
   return jobs.filter((job) => {
     if (['queued', 'running'].includes(job.status)) return true;
     const updatedAt = Date.parse(job.updatedAt || job.createdAt || '');
     if (!updatedAt || now - updatedAt > retainMs) return false;
-    if (terminalCount >= terminalLimit) return false;
-    terminalCount += 1;
     return true;
   });
 }

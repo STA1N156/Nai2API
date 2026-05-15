@@ -1188,6 +1188,20 @@ textarea:focus {
   width: 148px;
 }
 
+.usage-chart-controls {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  flex-wrap: nowrap;
+}
+
+.usage-chart-controls button {
+  min-height: 36px;
+  padding: 0 14px;
+  white-space: nowrap;
+}
+
 .usage-chart-scroll {
   width: 100%;
   overflow-x: auto;
@@ -1268,6 +1282,9 @@ textarea:focus {
 .chart-point {
   stroke: #fff;
   stroke-width: 2;
+  transition:
+    r 0.16s ease,
+    filter 0.16s ease;
 }
 
 .chart-point-count {
@@ -1276,6 +1293,45 @@ textarea:focus {
 
 .chart-point-rate {
   fill: var(--rose);
+}
+
+.chart-hit-point {
+  fill: transparent;
+  stroke: transparent;
+  cursor: default;
+}
+
+.chart-hour-point:hover .chart-point {
+  r: 6.2px;
+  filter: drop-shadow(0 4px 8px rgba(17, 24, 39, 0.18));
+}
+
+.chart-node-tooltip {
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.12s ease;
+}
+
+.chart-hour-point:hover .chart-node-tooltip {
+  opacity: 1;
+}
+
+.chart-node-tooltip rect {
+  fill: rgba(255, 255, 255, 0.98);
+  stroke: rgba(17, 24, 39, 0.1);
+  stroke-width: 1;
+  filter: drop-shadow(0 10px 24px rgba(17, 24, 39, 0.16));
+}
+
+.chart-node-tooltip text {
+  fill: var(--muted);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.chart-node-tooltip .chart-tooltip-title {
+  fill: var(--ink);
+  font-weight: 800;
 }
 
 .chart-label,

@@ -62,7 +62,10 @@
               <h2>使用图表</h2>
               <span id="usageChartSummary">北京时间，按小时 00-23 统计</span>
             </div>
-            <select id="usageDateSelect" class="inline-select usage-date-select" aria-label="选择图表日期"></select>
+            <div class="usage-chart-controls">
+              <button id="clearLogsBtn" class="danger" type="button">清空日志</button>
+              <select id="usageDateSelect" class="inline-select usage-date-select" aria-label="选择图表日期"></select>
+            </div>
           </div>
           <div id="usageChart" class="usage-chart" aria-label="选中日期使用统计"></div>
         </section>

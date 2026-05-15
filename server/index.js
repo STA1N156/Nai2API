@@ -242,6 +242,13 @@ async function route(req, res) {
     return;
   }
 
+  if (method === 'DELETE' && url.pathname === '/api/admin/logs') {
+    assertAdmin(req, url);
+    const result = await clearRequestLogs();
+    sendJson(res, 200, result);
+    return;
+  }
+
   if (method === 'POST' && url.pathname === '/api/admin/cards') {
     assertAdmin(req, url);
     const body = await readJson(req);
@@ -1282,6 +1289,17 @@ async function clearImageCache(body) {
   });
   await removeStoredImages(deletedImages);
   return result;
+}
+
+async function clearRequestLogs() {
+  return store.update((db) => {
+    const before = Array.isArray(db.jobs) ? db.jobs.length : 0;
+    db.jobs = (Array.isArray(db.jobs) ? db.jobs : []).filter((job) => ['queued', 'running'].includes(job.status));
+    return {
+      removed: before - db.jobs.length,
+      remaining: db.jobs.length
+    };
+  }, { flush: true });
 }
 
 async function cleanupImageStorage() {

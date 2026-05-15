@@ -31,6 +31,7 @@ const ids = [
   'metricAccounts',
   'metricImages',
   'usageChartSummary',
+  'clearLogsBtn',
   'usageDateSelect',
   'usageChart',
   'userCount',
@@ -129,6 +130,7 @@ function bindEvents() {
   el.resetAccountStatsBtn.addEventListener('click', resetSelectedAccountStats);
   el.deleteAccountsBtn.addEventListener('click', deleteSelectedAccounts);
   el.refreshImagesBtn.addEventListener('click', refreshImages);
+  el.clearLogsBtn.addEventListener('click', clearLogs);
   el.usageDateSelect.addEventListener('change', () => {
     state.selectedUsageDate = el.usageDateSelect.value;
     renderUsageChart(state.summary?.usageHourlyDays || []);
@@ -546,6 +548,24 @@ async function clearImages() {
   }
 }
 
+async function clearLogs() {
+  try {
+    const message = '确定清空请求日志吗？会清除已完成和失败的历史记录，并重置图表和错误日志；排队中、生成中的任务不受影响。';
+    if (!confirm(message)) return;
+    const result = await api('/api/admin/logs', {
+      method: 'DELETE',
+      admin: true
+    });
+    state.jobPage = 1;
+    state.selectedUsageDate = '';
+    const summary = await loadSummary();
+    renderSummary(summary);
+    showToast(`已清空 ${formatNumber(result.removed || 0)} 条日志`);
+  } catch (error) {
+    showToast(normalizeErrorMessage(error), true);
+  }
+}
+
 function renderSummary(summary, options = {}) {
   const enabledAccounts = summary.accounts.filter((account) => account.enabled).length;
   const requestStats = requestStats1h(summary);
@@ -661,8 +681,8 @@ function renderUsageChart(days) {
 function renderSelectedUsageChart(day) {
   const hours = normalizeChartHours(day?.hours);
   const width = 1440;
-  const height = 360;
-  const pad = { top: 38, right: 76, bottom: 66, left: 66 };
+  const height = 460;
+  const pad = { top: 52, right: 76, bottom: 74, left: 66 };
   const plotWidth = width - pad.left - pad.right;
   const plotHeight = height - pad.top - pad.bottom;
   const maxTotal = Math.max(1, ...hours.map((hour) => Number(hour.total || 0)));
@@ -687,9 +707,24 @@ function renderSelectedUsageChart(day) {
   const points = hours.map((hour) => {
     const x = xFor(hour.hour);
     const failed = Number(hour.failed || 0);
-    return `<g>
-      <circle cx="${x}" cy="${countY(hour.total)}" r="4" class="chart-point chart-point-count"><title>${escapeHtml(day.date)} ${escapeHtml(hour.label)} 请求 ${hour.total || 0} 次，成功 ${hour.done || 0} 次，失败 ${failed} 次</title></circle>
-      <circle cx="${x}" cy="${rateY(hour.successRate)}" r="4" class="chart-point chart-point-rate"><title>${escapeHtml(day.date)} ${escapeHtml(hour.label)} 成功率 ${formatPercent(hour.successRate)}%</title></circle>
+    const tooltipWidth = 186;
+    const tooltipHeight = 66;
+    const tooltipX = Math.max(pad.left + 4, Math.min(width - pad.right - tooltipWidth - 4, x - tooltipWidth / 2));
+    const topPointY = Math.min(countY(hour.total), rateY(hour.successRate));
+    const tooltipY = Math.max(8, topPointY - tooltipHeight - 12);
+    return `<g class="chart-hour-point">
+      <circle cx="${x}" cy="${countY(hour.total)}" r="4.8" class="chart-point chart-point-count"></circle>
+      <circle cx="${x}" cy="${rateY(hour.successRate)}" r="4.8" class="chart-point chart-point-rate"></circle>
+      <circle cx="${x}" cy="${countY(hour.total)}" r="13" class="chart-hit-point"></circle>
+      <circle cx="${x}" cy="${rateY(hour.successRate)}" r="13" class="chart-hit-point"></circle>
+      <g class="chart-node-tooltip" transform="translate(${tooltipX} ${tooltipY})">
+        <rect width="${tooltipWidth}" height="${tooltipHeight}" rx="12"></rect>
+        <text x="12" y="22">
+          <tspan class="chart-tooltip-title">${escapeHtml(day.date)} ${escapeHtml(hour.label)}</tspan>
+          <tspan x="12" dy="18">请求 ${formatNumber(hour.total || 0)} 次 · 成功率 ${formatPercent(hour.successRate)}%</tspan>
+          <tspan x="12" dy="18">成功 ${formatNumber(hour.done || 0)} 次 · 失败 ${formatNumber(failed)} 次</tspan>
+        </text>
+      </g>
     </g>`;
   }).join('');
 
