@@ -22,6 +22,9 @@ const directGenerateTimeoutMs = Number(process.env.DIRECT_GENERATE_TIMEOUT_MS ||
 const openAiChatTimeoutMs = Number(process.env.OPENAI_CHAT_TIMEOUT_MS || 10 * 60_000);
 const openAiQueuePollMs = 650;
 const openAiFixedSteps = 28;
+const beijingOffsetMs = 8 * 60 * 60 * 1000;
+const usageChartDays = 7;
+const errorLogRetentionMs = usageChartDays * 24 * 60 * 60 * 1000;
 const openAiSamplers = [
   'k_euler_ancestral',
   'k_euler',
@@ -156,7 +159,7 @@ async function route(req, res) {
         costPerImage: 1,
         publicBaseUrl: normalizePublicBaseUrl(body.publicBaseUrl ?? db.settings.publicBaseUrl ?? ''),
         maxCacheImages: clamp(Number(body.maxCacheImages ?? db.settings.maxCacheImages ?? 500), 0, MAX_CACHE_IMAGES_LIMIT),
-        accountConcurrency: clamp(Number(body.accountConcurrency ?? db.settings.accountConcurrency ?? 2), 1, 20),
+        accountConcurrency: 1,
         defaults: {
           ...(db.settings.defaults || {}),
           ...(body.defaults || {})
@@ -231,6 +234,8 @@ async function route(req, res) {
       imageTotal: db.imageCount ?? db.images.length,
       cacheImageCount: db.imageCount ?? db.images.length,
       jobStats1h: jobStatsSince(db.jobs, 60 * 60 * 1000),
+      usageHourlyDays: hourlyUsageStatsByDay(db.jobs),
+      errorLogs: errorLogs(db.jobs, db, 100),
       jobs: db.jobs.slice(0, 50).map((job) => publicJob(job, db)),
       ledger: db.ledger.slice(0, 80)
     });
@@ -492,7 +497,7 @@ async function handleDirectGenerate(url, res) {
       if (isInsufficientBalanceError(error)) {
         await removeJob(directJob.id);
       } else {
-        await markDirectJobFailed(directJob.id, publicErrorMessage(error.message || 'direct generate failed.'));
+        await markDirectJobFailed(directJob.id, error.message || 'direct generate failed.');
       }
     }
     if (error.message === 'direct generate timeout') {
@@ -1427,7 +1432,8 @@ async function createJob(token, body) {
           createdAt: now,
           updatedAt: now,
           imageId: cached.id,
-          error: ''
+          error: '',
+          errorDetail: ''
         };
         db.jobs.unshift(job);
         return job;
@@ -1452,7 +1458,8 @@ async function createJob(token, body) {
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
       imageId: '',
-      error: ''
+      error: '',
+      errorDetail: ''
     };
     db.jobs.unshift(job);
     db.ledger.unshift({
@@ -1500,7 +1507,8 @@ async function createDirectJob(token, request, cacheKey, options = {}) {
       createdAt: now,
       updatedAt: now,
       imageId: options.imageId || '',
-      error: ''
+      error: '',
+      errorDetail: ''
     };
     db.jobs.unshift(job);
     if (shouldCharge) {
@@ -1525,19 +1533,23 @@ async function markDirectJobRunning(jobId, reservation) {
     job.accountId = reservation.account?.id || '';
     job.cost = Number(reservation.cost || 0);
     job.accountCost = Number(reservation.accountCost || 0);
+    job.error = '';
+    job.errorDetail = '';
     job.updatedAt = new Date().toISOString();
   });
 }
 
 async function markDirectJobFailed(jobId, message) {
+  const detail = errorDetailMessage(message);
   await store.update((db) => {
     const job = db.jobs.find((item) => item.id === jobId);
     if (!job) return;
     job.status = 'failed';
-    job.error = publicErrorMessage(message);
+    job.error = publicErrorMessage(detail);
+    job.errorDetail = detail;
     job.updatedAt = new Date().toISOString();
   });
-  notifyJobWaiters(jobId, { error: publicErrorMessage(message) });
+  notifyJobWaiters(jobId, { error: publicErrorMessage(detail) });
 }
 
 async function removeJob(jobId) {
@@ -1554,6 +1566,7 @@ async function timeoutDirectJob(jobId) {
     refundJob(db, job, '连接超时');
     job.status = 'failed';
     job.error = '连接超时';
+    job.errorDetail = 'direct generate timeout';
     job.updatedAt = new Date().toISOString();
   });
 }
@@ -1608,6 +1621,7 @@ async function reserveQueuedJob(jobId) {
       refundJob(db, job, '连接超时');
       job.status = 'failed';
       job.error = '连接超时';
+      job.errorDetail = 'job deadline expired before account reservation';
       job.updatedAt = new Date().toISOString();
       return { skip: true };
     }
@@ -1617,6 +1631,7 @@ async function reserveQueuedJob(jobId) {
         refundJob(db, job, 'NovelAI账号点数不足');
         job.status = 'failed';
         job.error = 'NovelAI账号点数不足';
+        job.errorDetail = `No NovelAI account has enough quota for accountCost=${accountCost}`;
         job.updatedAt = new Date().toISOString();
         return { skip: true };
       }
@@ -1703,6 +1718,7 @@ async function retryReservationWithNextAccount(reservation, error, tried, option
       if (job) {
         job.status = 'running';
         job.error = '';
+        job.errorDetail = '';
         job.updatedAt = new Date().toISOString();
       }
     }
@@ -1732,6 +1748,7 @@ async function requeueReservedJob(reservation, error) {
       job.status = 'queued';
       job.accountId = '';
       job.error = '';
+      job.errorDetail = '';
       job.retryCount = Number(job.retryCount || 0) + 1;
       job.updatedAt = new Date().toISOString();
     }
@@ -1854,6 +1871,7 @@ async function completeGeneration(reservation, request, image, meta = {}) {
           job.imageId = saved.id;
           job.accountId = reservation.account?.id || job.accountId || '';
           job.error = '';
+          job.errorDetail = '';
           job.updatedAt = new Date().toISOString();
         }
       }
@@ -1873,6 +1891,8 @@ async function completeGeneration(reservation, request, image, meta = {}) {
 }
 
 async function failGeneration(reservation, error) {
+  const detail = errorDetailMessage(error);
+  const message = publicErrorMessage(error?.message || detail);
   await store.update((db) => {
     const user = db.users.find((item) => item.token === reservation.token);
     if (user) {
@@ -1889,7 +1909,8 @@ async function failGeneration(reservation, error) {
       const job = db.jobs.find((item) => item.id === reservation.job.id);
       if (job) {
         job.status = 'failed';
-        job.error = publicErrorMessage(error.message);
+        job.error = message;
+        job.errorDetail = detail;
         job.updatedAt = new Date().toISOString();
       }
     }
@@ -1899,11 +1920,11 @@ async function failGeneration(reservation, error) {
       token: reservation.token,
       amount: Number(reservation.cost || 0),
       at: new Date().toISOString(),
-      note: publicErrorMessage(error.message)
+      note: message
     });
   });
   scheduleQueueDrain();
-  if (reservation.job?.id) notifyJobWaiters(reservation.job.id, { error: publicErrorMessage(error.message) });
+  if (reservation.job?.id) notifyJobWaiters(reservation.job.id, { error: message });
 }
 
 function selectAccount(accounts, settings = {}, options = {}) {
@@ -1943,7 +1964,7 @@ function accountQuotaPoints(account) {
 }
 
 function maxAccountConcurrency(settings = {}) {
-  return clamp(Number(settings.accountConcurrency || 2), 1, 20);
+  return 1;
 }
 
 function availableAccountSlots(accounts, settings = {}) {
@@ -2327,6 +2348,132 @@ function refundJob(db, job, note) {
   });
 }
 
+function hourlyUsageStatsByDay(jobs, days = usageChartDays) {
+  const keys = recentBeijingDateKeys(days);
+  const buckets = new Map(keys.map((key) => [key, {
+    date: key,
+    label: key.slice(5),
+    done: 0,
+    failed: 0,
+    total: 0,
+    successRate: 0,
+    hours: Array.from({ length: 24 }, (_, hour) => ({
+      hour,
+      label: `${String(hour).padStart(2, '0')}:00`,
+      done: 0,
+      failed: 0,
+      total: 0,
+      successRate: 0
+    }))
+  }]));
+
+  jobs.forEach((job) => {
+    if (!['done', 'failed'].includes(job.status)) return;
+    const timestamp = Date.parse(job.updatedAt || job.createdAt || '');
+    if (!timestamp) return;
+    const key = beijingDateKey(timestamp);
+    const bucket = buckets.get(key);
+    if (!bucket) return;
+    const hourBucket = bucket.hours[beijingHour(timestamp)];
+    if (!hourBucket) return;
+    if (job.status === 'done') bucket.done += 1;
+    if (job.status === 'failed') bucket.failed += 1;
+    if (job.status === 'done') hourBucket.done += 1;
+    if (job.status === 'failed') hourBucket.failed += 1;
+  });
+
+  return keys.map((key) => {
+    const bucket = buckets.get(key);
+    bucket.total = bucket.done + bucket.failed;
+    bucket.successRate = bucket.total ? bucket.done / bucket.total : 0;
+    bucket.hours.forEach((hour) => {
+      hour.total = hour.done + hour.failed;
+      hour.successRate = hour.total ? hour.done / hour.total : 0;
+    });
+    return bucket;
+  });
+}
+
+function errorLogs(jobs, db = {}, limit = 100) {
+  const cutoff = Date.now() - errorLogRetentionMs;
+  return jobs
+    .filter((job) => job.status === 'failed')
+    .filter((job) => {
+      const timestamp = Date.parse(job.updatedAt || job.createdAt || '');
+      return timestamp && timestamp >= cutoff;
+    })
+    .sort((a, b) => Date.parse(b.updatedAt || b.createdAt || '') - Date.parse(a.updatedAt || a.createdAt || ''))
+    .slice(0, limit)
+    .map((job) => publicErrorLog(job, db));
+}
+
+function publicErrorLog(job, db = {}) {
+  const request = job.request || {};
+  const account = job.accountId && Array.isArray(db.accounts)
+    ? db.accounts.find((item) => item.id === job.accountId)
+    : null;
+  return {
+    id: job.id,
+    source: job.source || 'web',
+    userToken: maskToken(job.userToken || ''),
+    accountId: job.accountId || '',
+    accountRouteId: account?.routeId || 0,
+    status: job.status,
+    error: publicErrorMessage(job.error || ''),
+    errorDetail: errorDetailMessage(job.errorDetail || job.error || ''),
+    retryCount: Number(job.retryCount || 0),
+    cost: Number(job.cost || 0),
+    accountCost: jobAccountCost(job),
+    queueTotal: Number(job.queueTotal || 0),
+    durationMs: jobDurationMs(job),
+    request: errorLogRequest(request),
+    createdAt: job.createdAt,
+    updatedAt: job.updatedAt,
+    beijingDate: beijingDateKey(Date.parse(job.updatedAt || job.createdAt || ''))
+  };
+}
+
+function errorLogRequest(request = {}) {
+  return {
+    tag: request.tag || '',
+    prompt: request.prompt || '',
+    artist: request.artist || '',
+    negative: request.negative || '',
+    model: request.model || '',
+    size: request.size || '',
+    width: request.width || 0,
+    height: request.height || 0,
+    requestedSteps: request.requestedSteps ?? request.steps ?? 0,
+    routedSteps: request.steps ?? 0,
+    scale: request.scale ?? '',
+    cfg: request.cfg ?? '',
+    sampler: request.sampler || '',
+    noiseSchedule: request.noiseSchedule || '',
+    seed: request.seed ?? ''
+  };
+}
+
+function recentBeijingDateKeys(days) {
+  const now = new Date(Date.now() + beijingOffsetMs);
+  const midnight = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+  return Array.from({ length: days }, (_, index) => {
+    const dayOffset = index - days + 1;
+    return new Date(midnight + dayOffset * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  });
+}
+
+function beijingDateKey(timestamp) {
+  const value = Number(timestamp);
+  if (!Number.isFinite(value)) return '';
+  return new Date(value + beijingOffsetMs).toISOString().slice(0, 10);
+}
+
+function beijingHour(timestamp) {
+  const value = Number(timestamp);
+  if (!Number.isFinite(value)) return 0;
+  return new Date(value + beijingOffsetMs).getUTCHours();
+}
+
 function jobStatsSince(jobs, rangeMs) {
   const since = Date.now() - rangeMs;
   return finalizeStats(jobs.reduce((stats, job) => {
@@ -2473,6 +2620,11 @@ function publicErrorMessage(message) {
   if (/invalid token/i.test(text)) return '密钥无效或已被禁用。';
   if (/all NovelAI accounts are busy|server busy/i.test(text)) return '服务器繁忙，请稍后再试。';
   return text;
+}
+
+function errorDetailMessage(error) {
+  const detail = String(error?.stack || error?.message || error || '').trim();
+  return detail.slice(0, 4000);
 }
 
 function isAbortError(error) {

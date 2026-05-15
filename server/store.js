@@ -14,7 +14,7 @@ const defaultSettings = {
   serviceName: 'Nai2API',
   costPerImage: 1,
   maxCacheImages: 500,
-  accountConcurrency: 2,
+  accountConcurrency: 1,
   publicBaseUrl: '',
   mockWhenNoAccount: true,
   defaultModel: 'nai-diffusion-4-5-full',
@@ -411,8 +411,8 @@ function trimDb(db) {
   const maxCacheImages = clampNumber(db.settings.maxCacheImages, 0, MAX_CACHE_IMAGES_LIMIT);
   db.settings.costPerImage = 1;
   db.settings.maxCacheImages = maxCacheImages;
-  db.settings.accountConcurrency = clampNumber(db.settings.accountConcurrency, 1, 20);
-  db.jobs = trimJobs(db.jobs, 500);
+  db.settings.accountConcurrency = 1;
+  db.jobs = trimJobs(db.jobs, 10000);
   db.images = db.images.slice(0, maxCacheImages);
   db.ledger = db.ledger.slice(0, 1000);
   return db;
@@ -420,17 +420,15 @@ function trimDb(db) {
 
 function trimJobs(jobs, terminalLimit) {
   const now = Date.now();
-  const retainMs = clampNumber(process.env.JOB_HISTORY_RETENTION_MS ?? 6 * 60 * 60 * 1000, 60_000, 24 * 60 * 60 * 1000);
+  const retainMs = clampNumber(process.env.JOB_HISTORY_RETENTION_MS ?? 7 * 24 * 60 * 60 * 1000, 60_000, 7 * 24 * 60 * 60 * 1000);
   let terminalCount = 0;
   return jobs.filter((job) => {
     if (['queued', 'running'].includes(job.status)) return true;
     const updatedAt = Date.parse(job.updatedAt || job.createdAt || '');
-    if (updatedAt && now - updatedAt <= retainMs) return true;
-    if (terminalCount < terminalLimit) {
-      terminalCount += 1;
-      return true;
-    }
-    return false;
+    if (!updatedAt || now - updatedAt > retainMs) return false;
+    if (terminalCount >= terminalLimit) return false;
+    terminalCount += 1;
+    return true;
   });
 }
 
@@ -439,6 +437,7 @@ export function normalizeDb(db = {}) {
     settings: {
       ...defaultSettings,
       ...(db.settings || {}),
+      accountConcurrency: 1,
       defaults: {
         ...defaultSettings.defaults,
         ...(db.settings?.defaults || {})

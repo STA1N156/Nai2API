@@ -1,10 +1,11 @@
-import { enhanceSelects } from './select-ui.js';
+import { enhanceSelects, refreshSelect } from './select-ui.js';
 
 const state = {
   adminToken: localStorage.getItem('nai.adminToken') || '',
   selectedUsers: new Set(),
   selectedAccounts: new Set(),
   testingAccounts: new Set(),
+  selectedUsageDate: '',
   summary: null,
   images: [],
   imageTotal: 0,
@@ -29,13 +30,15 @@ const ids = [
   'metricCredits',
   'metricAccounts',
   'metricImages',
+  'usageChartSummary',
+  'usageDateSelect',
+  'usageChart',
   'userCount',
   'userCredits',
   'userNote',
   'createUsersBtn',
   'newUsersOutput',
   'maxCacheImages',
-  'accountConcurrency',
   'saveSettingsBtn',
   'accountName',
   'accountToken',
@@ -73,6 +76,8 @@ const ids = [
   'jobPrevBtn',
   'jobNextBtn',
   'jobPageText',
+  'errorLogCount',
+  'errorLogList',
   'imagePrevBtn',
   'imageNextBtn',
   'imagePageText',
@@ -124,6 +129,10 @@ function bindEvents() {
   el.resetAccountStatsBtn.addEventListener('click', resetSelectedAccountStats);
   el.deleteAccountsBtn.addEventListener('click', deleteSelectedAccounts);
   el.refreshImagesBtn.addEventListener('click', refreshImages);
+  el.usageDateSelect.addEventListener('change', () => {
+    state.selectedUsageDate = el.usageDateSelect.value;
+    renderUsageChart(state.summary?.usageHourlyDays || []);
+  });
   el.jobPrevBtn.addEventListener('click', () => changeJobPage(-1));
   el.jobNextBtn.addEventListener('click', () => changeJobPage(1));
   el.imagePrevBtn.addEventListener('click', () => changeImagePage(-1));
@@ -232,19 +241,15 @@ async function createUsers() {
 async function saveSettings() {
   try {
     const maxCacheImages = Number(el.maxCacheImages.value);
-    const accountConcurrency = Number(el.accountConcurrency.value);
     if (!Number.isFinite(maxCacheImages)) return showToast('请输入有效缓存数量', true);
-    if (!Number.isFinite(accountConcurrency)) return showToast('请输入有效并发数', true);
     const settings = await api('/api/settings', {
       method: 'PUT',
       admin: true,
       body: {
-        maxCacheImages,
-        accountConcurrency
+        maxCacheImages
       }
     });
     el.maxCacheImages.value = settings.maxCacheImages;
-    el.accountConcurrency.value = settings.accountConcurrency;
     const summary = await loadSummary();
     renderSummary(summary);
     await refreshImages(false);
@@ -558,9 +563,10 @@ function renderSummary(summary, options = {}) {
   }
   el.accountCount.textContent = `${summary.accounts.length} 个账号`;
   el.maxCacheImages.value = summary.settings?.maxCacheImages ?? 500;
-  el.accountConcurrency.value = summary.settings?.accountConcurrency ?? 2;
 
   renderAccounts(summary.accounts);
+  renderUsageChart(summary.usageHourlyDays || []);
+  renderErrorLogs(summary.errorLogs || []);
 
   renderUsers(summary.users);
 
@@ -607,6 +613,158 @@ function requestStats1h(summary) {
   stats.total = stats.done + stats.failed;
   stats.successRate = stats.total ? stats.done / stats.total : 0;
   return stats;
+}
+
+function renderUsageChart(days) {
+  const data = (Array.isArray(days) ? days : []).filter((day) => day?.date);
+  if (!data.length) {
+    state.selectedUsageDate = '';
+    el.usageDateSelect.innerHTML = '';
+    el.usageDateSelect.disabled = true;
+    refreshSelect(el.usageDateSelect);
+    el.usageChartSummary.textContent = '北京时间，按 00:00-23:00 小时统计';
+    el.usageChart.innerHTML = '<div class="empty small">暂无图表数据</div>';
+    return;
+  }
+
+  const newestFirst = data.slice().reverse();
+  const availableDates = new Set(data.map((day) => day.date));
+  if (!state.selectedUsageDate || !availableDates.has(state.selectedUsageDate)) {
+    state.selectedUsageDate = newestFirst[0].date;
+  }
+  const selectedDay = data.find((day) => day.date === state.selectedUsageDate) || newestFirst[0];
+  el.usageDateSelect.disabled = false;
+  el.usageDateSelect.innerHTML = newestFirst.map((day) => (
+    `<option value="${escapeHtml(day.date)}"${day.date === selectedDay.date ? ' selected' : ''}>${escapeHtml(day.date)}</option>`
+  )).join('');
+  el.usageDateSelect.value = selectedDay.date;
+  refreshSelect(el.usageDateSelect);
+
+  const totalRequests = Number(selectedDay.total || 0);
+  const totalDone = Number(selectedDay.done || 0);
+  const totalFailed = Number(selectedDay.failed || 0);
+  const successRate = totalRequests ? totalDone / totalRequests : 0;
+  el.usageChartSummary.textContent = `北京时间，${selectedDay.date} 00:00-23:00 · ${formatNumber(totalRequests)} 次请求 · 成功率 ${formatPercent(successRate)}%`;
+  el.usageChart.innerHTML = `<div class="chart-stat-row">
+    <span><b>${formatNumber(totalRequests)}</b> 当天请求</span>
+    <span><b>${formatNumber(totalDone)}</b> 成功</span>
+    <span><b>${formatNumber(totalFailed)}</b> 失败</span>
+    <span><b>${formatPercent(successRate)}%</b> 当天成功率</span>
+  </div>
+  <div class="chart-legend">
+    <span><i class="legend-count"></i>每小时请求次数</span>
+    <span><i class="legend-rate"></i>每小时成功率</span>
+  </div>
+  ${renderSelectedUsageChart(selectedDay)}`;
+}
+
+function renderSelectedUsageChart(day) {
+  const hours = normalizeChartHours(day?.hours);
+  const width = 1440;
+  const height = 360;
+  const pad = { top: 38, right: 76, bottom: 66, left: 66 };
+  const plotWidth = width - pad.left - pad.right;
+  const plotHeight = height - pad.top - pad.bottom;
+  const maxTotal = Math.max(1, ...hours.map((hour) => Number(hour.total || 0)));
+  const xFor = (hour) => pad.left + (plotWidth * Number(hour || 0)) / 23;
+  const countY = (value) => pad.top + plotHeight - (Number(value || 0) / maxTotal) * plotHeight;
+  const rateY = (value) => pad.top + plotHeight - Math.max(0, Math.min(1, Number(value || 0))) * plotHeight;
+  const countPoints = hours.map((hour) => `${xFor(hour.hour)},${countY(hour.total)}`).join(' ');
+  const ratePoints = hours.map((hour) => `${xFor(hour.hour)},${rateY(hour.successRate)}`).join(' ');
+  const horizontalGridLines = [0, 0.25, 0.5, 0.75, 1].map((ratio) => {
+    const y = pad.top + plotHeight - ratio * plotHeight;
+    return `<line x1="${pad.left}" y1="${y}" x2="${width - pad.right}" y2="${y}" class="chart-grid" />`;
+  }).join('');
+  const verticalGridLines = hours.map((hour) => {
+    const x = xFor(hour.hour);
+    return `<line x1="${x}" y1="${pad.top}" x2="${x}" y2="${pad.top + plotHeight}" class="chart-grid chart-grid-hour" />`;
+  }).join('');
+  const labels = hours.map((hour) => {
+    const x = xFor(hour.hour);
+    const label = `${String(hour.hour).padStart(2, '0')}:00`;
+    return `<text x="${x}" y="${height - 24}" class="chart-label chart-hour-label" text-anchor="middle">${label}</text>`;
+  }).join('');
+  const points = hours.map((hour) => {
+    const x = xFor(hour.hour);
+    const failed = Number(hour.failed || 0);
+    return `<g>
+      <circle cx="${x}" cy="${countY(hour.total)}" r="4" class="chart-point chart-point-count"><title>${escapeHtml(day.date)} ${escapeHtml(hour.label)} 请求 ${hour.total || 0} 次，成功 ${hour.done || 0} 次，失败 ${failed} 次</title></circle>
+      <circle cx="${x}" cy="${rateY(hour.successRate)}" r="4" class="chart-point chart-point-rate"><title>${escapeHtml(day.date)} ${escapeHtml(hour.label)} 成功率 ${formatPercent(hour.successRate)}%</title></circle>
+    </g>`;
+  }).join('');
+
+  return `<div class="usage-chart-scroll">
+  <svg class="single-hourly-chart" viewBox="0 0 ${width} ${height}" role="img">
+    <rect x="0" y="0" width="${width}" height="${height}" rx="12" class="chart-bg"></rect>
+    ${horizontalGridLines}
+    ${verticalGridLines}
+    <line x1="${pad.left}" y1="${pad.top + plotHeight}" x2="${width - pad.right}" y2="${pad.top + plotHeight}" class="chart-axis" />
+    <text x="${pad.left}" y="24" class="chart-axis-label">请求次数</text>
+    <text x="${width - pad.right}" y="24" class="chart-axis-label" text-anchor="end">成功率</text>
+    <text x="${pad.left - 10}" y="${countY(maxTotal)}" class="chart-tick" text-anchor="end">${formatNumber(maxTotal)}</text>
+    <text x="${pad.left - 10}" y="${countY(0)}" class="chart-tick" text-anchor="end">0</text>
+    <text x="${width - pad.right + 10}" y="${rateY(0.5)}" class="chart-tick">50%</text>
+    <text x="${width - pad.right + 10}" y="${rateY(1)}" class="chart-tick">100%</text>
+    <text x="${width - pad.right + 10}" y="${rateY(0)}" class="chart-tick">0%</text>
+    <polyline points="${countPoints}" class="chart-line chart-line-count"></polyline>
+    <polyline points="${ratePoints}" class="chart-line chart-line-rate"></polyline>
+    ${labels}
+    ${points}
+  </svg>
+  </div>`;
+}
+
+function normalizeChartHours(hours) {
+  const byHour = new Map((Array.isArray(hours) ? hours : []).map((hour) => [Number(hour.hour), hour]));
+  return Array.from({ length: 24 }, (_, hour) => {
+    const item = byHour.get(hour) || {};
+    return {
+      hour,
+      label: item.label || `${String(hour).padStart(2, '0')}:00`,
+      done: Number(item.done || 0),
+      failed: Number(item.failed || 0),
+      total: Number(item.total || 0),
+      successRate: Number(item.successRate || 0)
+    };
+  });
+}
+
+function renderErrorLogs(logs) {
+  const list = Array.isArray(logs) ? logs : [];
+  el.errorLogCount.textContent = list.length ? `最近 7 天失败请求 · ${list.length} 条` : '最近 7 天没有失败请求';
+  el.errorLogList.innerHTML = list.length
+    ? list.map(renderErrorLog).join('')
+    : '<div class="empty small">最近 7 天没有失败请求</div>';
+}
+
+function renderErrorLog(log) {
+  const requestJson = escapeHtml(JSON.stringify(log.request || {}, null, 2));
+  const routeText = log.accountRouteId ? `账号 #${log.accountRouteId}` : '未路由账号';
+  const sourceText = log.source === 'direct' ? 'URL' : '网页';
+  const detail = log.errorDetail || log.error || '未知错误';
+  return `<article class="data-row error-log-row">
+    <div class="row-main">
+      <div class="row-heading">
+        <span class="status-badge danger">失败</span>
+        <strong>${escapeHtml(log.error || '未知错误')}</strong>
+      </div>
+      <span class="step-route">${escapeHtml([sourceText, routeText, formatDuration(log.durationMs), formatBeijingDate(log.updatedAt)].filter(Boolean).join(' · '))}</span>
+      <details class="error-detail">
+        <summary>查看失败原因和请求参数</summary>
+        <div class="error-detail-grid">
+          <div>
+            <strong>失败原因</strong>
+            <pre>${escapeHtml(detail)}</pre>
+          </div>
+          <div>
+            <strong>请求参数</strong>
+            <pre>${requestJson}</pre>
+          </div>
+        </div>
+      </details>
+    </div>
+    <div class="pill">${escapeHtml(log.userToken || '-')}</div>
+  </article>`;
 }
 
 function renderJobs(jobs) {
@@ -962,6 +1120,11 @@ function dateStamp() {
 function formatDate(value) {
   if (!value) return '';
   return new Date(value).toLocaleString('zh-CN', { hour12: false });
+}
+
+function formatBeijingDate(value) {
+  if (!value) return '';
+  return new Date(value).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false });
 }
 
 function formatDuration(value) {

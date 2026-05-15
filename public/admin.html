@@ -56,6 +56,17 @@
           </article>
         </div>
 
+        <section class="panel usage-panel">
+          <div class="panel-title">
+            <div>
+              <h2>使用图表</h2>
+              <span id="usageChartSummary">北京时间，按小时 00-23 统计</span>
+            </div>
+            <select id="usageDateSelect" class="inline-select usage-date-select" aria-label="选择图表日期"></select>
+          </div>
+          <div id="usageChart" class="usage-chart" aria-label="选中日期使用统计"></div>
+        </section>
+
         <div class="admin-grid">
           <section class="panel">
             <div class="panel-title">
@@ -86,17 +97,13 @@
             <div class="panel-title">
               <div>
                 <h2>系统设置</h2>
-                <span>单次生图固定扣 1 点</span>
+                <span>单次生图固定扣 1 点，每账号最高并发固定为 1</span>
               </div>
             </div>
             <div class="grid-two">
               <label class="settings-wide">
                 最大缓存图片数
                 <input id="maxCacheImages" type="number" min="0" max="200000" value="500" />
-              </label>
-              <label class="settings-wide">
-                每账号最高并发
-                <input id="accountConcurrency" type="number" min="1" max="20" value="2" />
               </label>
             </div>
             <button id="saveSettingsBtn" class="primary wide">保存设置</button>
@@ -214,13 +221,23 @@
           </section>
         </div>
 
+        <section class="panel error-log-panel">
+          <div class="panel-title">
+            <div>
+              <h2>错误日志</h2>
+              <span id="errorLogCount">最近 7 天失败请求</span>
+            </div>
+          </div>
+          <div id="errorLogList" class="data-list error-log-list"></div>
+        </section>
+
         <section class="panel">
           <div class="panel-title">
             <div>
               <h2>缓存图片</h2>
               <span id="imageCountText">0 / 0</span>
             </div>
-            <div class="button-row compact-actions">
+            <div class="button-row compact-actions image-cache-actions">
               <input id="imageSearch" class="search-input" placeholder="搜索提示词、模型或密钥" />
               <select id="imageTier" class="inline-select" aria-label="缓存图片分辨率筛选">
                 <option value="">全部</option>

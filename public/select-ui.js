@@ -36,6 +36,7 @@ export function enhanceSelects(root = document) {
     select.insertAdjacentElement('afterend', custom);
 
     const api = { select, custom, button, label, menu };
+    select.customSelectApi = api;
     customSelectOptions(api);
     syncCustomSelect(api);
 
@@ -45,6 +46,15 @@ export function enhanceSelects(root = document) {
   });
 
   bindGlobalSelectListeners();
+}
+
+export function refreshSelect(select) {
+  const api = select?.customSelectApi;
+  if (!api) return;
+  api.button.disabled = api.select.disabled;
+  api.custom.classList.toggle('is-disabled', api.select.disabled);
+  customSelectOptions(api);
+  syncCustomSelect(api);
 }
 
 function customSelectOptions(api) {

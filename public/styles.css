@@ -193,6 +193,10 @@ textarea {
   width: 96px;
 }
 
+.custom-select.inline-select.usage-date-select {
+  width: 172px;
+}
+
 .custom-select.inline-select .custom-select-button {
   min-height: 36px;
   padding: 0 8px 0 10px;
@@ -200,6 +204,10 @@ textarea {
 
 .custom-select.inline-select .custom-select-menu {
   min-width: 118px;
+}
+
+.custom-select.inline-select.usage-date-select .custom-select-menu {
+  min-width: 172px;
 }
 
 button,
@@ -977,6 +985,11 @@ textarea:focus {
   margin-bottom: 18px;
 }
 
+.usage-panel,
+.error-log-panel {
+  margin-bottom: 18px;
+}
+
 .wide-grid {
   grid-template-columns: repeat(2, minmax(0, 1fr));
   align-items: start;
@@ -1010,6 +1023,31 @@ textarea:focus {
 .compact-actions button,
 .compact-actions .file-button {
   flex: 0 1 auto;
+}
+
+.image-cache-actions {
+  flex: 1 1 700px;
+  min-width: 0;
+  flex-wrap: nowrap;
+  overflow-x: auto;
+  padding-bottom: 2px;
+}
+
+.image-cache-actions .search-input {
+  flex: 1 1 260px;
+  min-width: 220px;
+  width: auto;
+}
+
+.image-cache-actions .custom-select.inline-select {
+  flex: 0 0 112px;
+  width: 112px;
+}
+
+.image-cache-actions button {
+  flex: 0 0 auto;
+  min-width: 112px;
+  white-space: nowrap;
 }
 
 .toolbar {
@@ -1141,6 +1179,134 @@ textarea:focus {
   grid-template-columns: 18px minmax(0, 1fr) auto;
 }
 
+.usage-chart {
+  display: grid;
+  gap: 12px;
+}
+
+.usage-date-select {
+  width: 148px;
+}
+
+.usage-chart-scroll {
+  width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+  border: 1px solid rgba(17, 24, 39, 0.08);
+  border-radius: var(--radius-md);
+  background: rgba(255, 255, 255, 0.54);
+}
+
+.single-hourly-chart {
+  min-width: 1180px;
+}
+
+.chart-stat-row,
+.chart-legend {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.chart-stat-row span,
+.chart-legend span {
+  min-height: 30px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 10px;
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 12px;
+  background: rgba(17, 24, 39, 0.045);
+}
+
+.chart-stat-row b {
+  color: var(--ink);
+  font-size: 14px;
+}
+
+.usage-chart svg {
+  width: 100%;
+  display: block;
+}
+
+.chart-bg {
+  fill: rgba(248, 250, 252, 0.72);
+}
+
+.chart-grid {
+  stroke: rgba(102, 112, 133, 0.18);
+  stroke-width: 1;
+}
+
+.chart-grid-hour {
+  stroke: rgba(102, 112, 133, 0.1);
+}
+
+.chart-axis {
+  stroke: rgba(102, 112, 133, 0.34);
+  stroke-width: 1.2;
+}
+
+.chart-line {
+  fill: none;
+  stroke-width: 4;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.chart-line-count {
+  stroke: var(--teal);
+}
+
+.chart-line-rate {
+  stroke: var(--rose);
+}
+
+.chart-point {
+  stroke: #fff;
+  stroke-width: 2;
+}
+
+.chart-point-count {
+  fill: var(--teal);
+}
+
+.chart-point-rate {
+  fill: var(--rose);
+}
+
+.chart-label,
+.chart-axis-label,
+.chart-tick {
+  fill: var(--muted);
+  font-size: 12px;
+}
+
+.chart-hour-label {
+  font-size: 11px;
+}
+
+.chart-axis-label {
+  font-weight: 760;
+}
+
+.chart-legend i {
+  width: 18px;
+  height: 4px;
+  border-radius: 999px;
+}
+
+.legend-count {
+  background: var(--teal);
+}
+
+.legend-rate {
+  background: var(--rose);
+}
+
 .account-row,
 .user-row,
 .job-row {
@@ -1263,6 +1429,61 @@ textarea:focus {
 .job-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.error-log-list {
+  max-height: 620px;
+}
+
+.error-log-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+}
+
+.error-log-row .pill {
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.error-detail {
+  margin-top: 6px;
+}
+
+.error-detail summary {
+  width: fit-content;
+  cursor: pointer;
+  color: var(--indigo);
+  font-size: 12px;
+  font-weight: 760;
+}
+
+.error-detail-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.error-detail-grid strong {
+  margin-bottom: 6px;
+}
+
+.error-detail pre {
+  max-height: 260px;
+  overflow: auto;
+  margin: 0;
+  padding: 10px;
+  border: 1px solid rgba(17, 24, 39, 0.08);
+  border-radius: var(--radius-md);
+  background: rgba(15, 23, 42, 0.04);
+  color: #344054;
+  font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .job-row strong {
@@ -1746,6 +1967,18 @@ html:has(body.modal-open) {
 
   .account-row.selectable .row-stats {
     grid-column: 2;
+  }
+
+  .error-detail-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .error-log-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .error-log-row .pill {
+    justify-self: start;
   }
 
   .user-row.selectable {
