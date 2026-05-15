@@ -671,26 +671,17 @@ function renderUsageChart(days) {
     <span><b>${formatNumber(totalFailed)}</b> 失败</span>
     <span><b>${formatPercent(successRate)}%</b> 当天成功率</span>
   </div>
-  <div class="chart-legend">
-    <span><i class="legend-count"></i>每小时请求次数</span>
-    <span><i class="legend-rate"></i>每小时成功率</span>
-  </div>
   ${renderSelectedUsageChart(selectedDay)}`;
 }
 
 function renderSelectedUsageChart(day) {
   const hours = normalizeChartHours(day?.hours);
   const width = 1440;
-  const height = 460;
-  const pad = { top: 52, right: 76, bottom: 74, left: 66 };
+  const height = 340;
+  const pad = { top: 42, right: 38, bottom: 64, left: 66 };
   const plotWidth = width - pad.left - pad.right;
   const plotHeight = height - pad.top - pad.bottom;
-  const maxTotal = Math.max(1, ...hours.map((hour) => Number(hour.total || 0)));
   const xFor = (hour) => pad.left + (plotWidth * Number(hour || 0)) / 23;
-  const countY = (value) => pad.top + plotHeight - (Number(value || 0) / maxTotal) * plotHeight;
-  const rateY = (value) => pad.top + plotHeight - Math.max(0, Math.min(1, Number(value || 0))) * plotHeight;
-  const countPoints = hours.map((hour) => `${xFor(hour.hour)},${countY(hour.total)}`).join(' ');
-  const ratePoints = hours.map((hour) => `${xFor(hour.hour)},${rateY(hour.successRate)}`).join(' ');
   const horizontalGridLines = [0, 0.25, 0.5, 0.75, 1].map((ratio) => {
     const y = pad.top + plotHeight - ratio * plotHeight;
     return `<line x1="${pad.left}" y1="${y}" x2="${width - pad.right}" y2="${y}" class="chart-grid" />`;
@@ -704,49 +695,138 @@ function renderSelectedUsageChart(day) {
     const label = `${String(hour.hour).padStart(2, '0')}:00`;
     return `<text x="${x}" y="${height - 24}" class="chart-label chart-hour-label" text-anchor="middle">${label}</text>`;
   }).join('');
+  const base = {
+    width,
+    height,
+    pad,
+    plotHeight,
+    xFor,
+    horizontalGridLines,
+    verticalGridLines,
+    labels
+  };
+
+  return `<div class="usage-chart-stack">
+    ${renderHourlyRequestChart(day, hours, base)}
+    ${renderHourlyRateChart(day, hours, base)}
+  </div>`;
+}
+
+function renderHourlyRequestChart(day, hours, base) {
+  const { width, height, pad, plotHeight, xFor, horizontalGridLines, verticalGridLines, labels } = base;
+  const maxTotal = Math.max(1, ...hours.map((hour) => Number(hour.total || 0)));
+  const countY = (value) => pad.top + plotHeight - (Number(value || 0) / maxTotal) * plotHeight;
+  const countPoints = hours.map((hour) => `${xFor(hour.hour)},${countY(hour.total)}`).join(' ');
+  const peak = Math.max(0, ...hours.map((hour) => Number(hour.total || 0)));
   const points = hours.map((hour) => {
     const x = xFor(hour.hour);
+    const hasRequests = Number(hour.total || 0) > 0;
     const failed = Number(hour.failed || 0);
     const tooltipWidth = 186;
     const tooltipHeight = 66;
     const tooltipX = Math.max(pad.left + 4, Math.min(width - pad.right - tooltipWidth - 4, x - tooltipWidth / 2));
-    const topPointY = Math.min(countY(hour.total), rateY(hour.successRate));
+    const topPointY = countY(hour.total);
     const tooltipY = Math.max(8, topPointY - tooltipHeight - 12);
+    const successRateText = hasRequests ? `${formatPercent(hour.successRate)}%` : '无请求';
     return `<g class="chart-hour-point">
       <circle cx="${x}" cy="${countY(hour.total)}" r="4.8" class="chart-point chart-point-count"></circle>
-      <circle cx="${x}" cy="${rateY(hour.successRate)}" r="4.8" class="chart-point chart-point-rate"></circle>
       <circle cx="${x}" cy="${countY(hour.total)}" r="13" class="chart-hit-point"></circle>
-      <circle cx="${x}" cy="${rateY(hour.successRate)}" r="13" class="chart-hit-point"></circle>
       <g class="chart-node-tooltip" transform="translate(${tooltipX} ${tooltipY})">
         <rect width="${tooltipWidth}" height="${tooltipHeight}" rx="12"></rect>
         <text x="12" y="22">
           <tspan class="chart-tooltip-title">${escapeHtml(day.date)} ${escapeHtml(hour.label)}</tspan>
-          <tspan x="12" dy="18">请求 ${formatNumber(hour.total || 0)} 次 · 成功率 ${formatPercent(hour.successRate)}%</tspan>
+          <tspan x="12" dy="18">请求 ${formatNumber(hour.total || 0)} 次 · 成功率 ${successRateText}</tspan>
           <tspan x="12" dy="18">成功 ${formatNumber(hour.done || 0)} 次 · 失败 ${formatNumber(failed)} 次</tspan>
         </text>
       </g>
     </g>`;
   }).join('');
 
-  return `<div class="usage-chart-scroll">
+  return `<article class="usage-chart-block">
+    <div class="usage-chart-heading">
+      <strong>每小时请求次数</strong>
+      <span>峰值 ${formatNumber(peak)} 次</span>
+    </div>
+    <div class="usage-chart-scroll">
   <svg class="single-hourly-chart" viewBox="0 0 ${width} ${height}" role="img">
     <rect x="0" y="0" width="${width}" height="${height}" rx="12" class="chart-bg"></rect>
     ${horizontalGridLines}
     ${verticalGridLines}
     <line x1="${pad.left}" y1="${pad.top + plotHeight}" x2="${width - pad.right}" y2="${pad.top + plotHeight}" class="chart-axis" />
     <text x="${pad.left}" y="24" class="chart-axis-label">请求次数</text>
-    <text x="${width - pad.right}" y="24" class="chart-axis-label" text-anchor="end">成功率</text>
     <text x="${pad.left - 10}" y="${countY(maxTotal)}" class="chart-tick" text-anchor="end">${formatNumber(maxTotal)}</text>
     <text x="${pad.left - 10}" y="${countY(0)}" class="chart-tick" text-anchor="end">0</text>
-    <text x="${width - pad.right + 10}" y="${rateY(0.5)}" class="chart-tick">50%</text>
-    <text x="${width - pad.right + 10}" y="${rateY(1)}" class="chart-tick">100%</text>
-    <text x="${width - pad.right + 10}" y="${rateY(0)}" class="chart-tick">0%</text>
     <polyline points="${countPoints}" class="chart-line chart-line-count"></polyline>
-    <polyline points="${ratePoints}" class="chart-line chart-line-rate"></polyline>
     ${labels}
     ${points}
   </svg>
-  </div>`;
+    </div>
+  </article>`;
+}
+
+function renderHourlyRateChart(day, hours, base) {
+  const { width, height, pad, plotHeight, xFor, horizontalGridLines, verticalGridLines, labels } = base;
+  const rateY = (value) => pad.top + plotHeight - Math.max(0, Math.min(1, Number(value || 0))) * plotHeight;
+  const validHours = hours.filter((hour) => Number(hour.total || 0) > 0);
+  const rateSegments = [];
+  let currentRateSegment = [];
+  hours.forEach((hour) => {
+    if (Number(hour.total || 0) > 0) {
+      currentRateSegment.push(`${xFor(hour.hour)},${rateY(hour.successRate)}`);
+      return;
+    }
+    if (currentRateSegment.length > 1) rateSegments.push(currentRateSegment);
+    currentRateSegment = [];
+  });
+  if (currentRateSegment.length > 1) rateSegments.push(currentRateSegment);
+  const rateLines = rateSegments.map((segment) => (
+    `<polyline points="${segment.join(' ')}" class="chart-line chart-line-rate"></polyline>`
+  )).join('');
+  const bestRate = validHours.length ? Math.max(...validHours.map((hour) => Number(hour.successRate || 0))) : 0;
+  const points = validHours.map((hour) => {
+    const x = xFor(hour.hour);
+    const failed = Number(hour.failed || 0);
+    const y = rateY(hour.successRate);
+    const tooltipWidth = 186;
+    const tooltipHeight = 66;
+    const tooltipX = Math.max(pad.left + 4, Math.min(width - pad.right - tooltipWidth - 4, x - tooltipWidth / 2));
+    const tooltipY = Math.max(8, y - tooltipHeight - 12);
+    return `<g class="chart-hour-point">
+      <circle cx="${x}" cy="${y}" r="4.8" class="chart-point chart-point-rate"></circle>
+      <circle cx="${x}" cy="${y}" r="13" class="chart-hit-point"></circle>
+      <g class="chart-node-tooltip" transform="translate(${tooltipX} ${tooltipY})">
+        <rect width="${tooltipWidth}" height="${tooltipHeight}" rx="12"></rect>
+        <text x="12" y="22">
+          <tspan class="chart-tooltip-title">${escapeHtml(day.date)} ${escapeHtml(hour.label)}</tspan>
+          <tspan x="12" dy="18">成功率 ${formatPercent(hour.successRate)}% · 请求 ${formatNumber(hour.total || 0)} 次</tspan>
+          <tspan x="12" dy="18">成功 ${formatNumber(hour.done || 0)} 次 · 失败 ${formatNumber(failed)} 次</tspan>
+        </text>
+      </g>
+    </g>`;
+  }).join('');
+
+  return `<article class="usage-chart-block">
+    <div class="usage-chart-heading">
+      <strong>每小时成功率</strong>
+      <span>${validHours.length ? `最高 ${formatPercent(bestRate)}%` : '暂无有请求的小时'}</span>
+    </div>
+    <div class="usage-chart-scroll">
+  <svg class="single-hourly-chart" viewBox="0 0 ${width} ${height}" role="img">
+    <rect x="0" y="0" width="${width}" height="${height}" rx="12" class="chart-bg"></rect>
+    ${horizontalGridLines}
+    ${verticalGridLines}
+    <line x1="${pad.left}" y1="${pad.top + plotHeight}" x2="${width - pad.right}" y2="${pad.top + plotHeight}" class="chart-axis" />
+    <text x="${pad.left}" y="24" class="chart-axis-label">成功率</text>
+    <text x="${pad.left - 10}" y="${rateY(1)}" class="chart-tick" text-anchor="end">100%</text>
+    <text x="${pad.left - 10}" y="${rateY(0.5)}" class="chart-tick" text-anchor="end">50%</text>
+    <text x="${pad.left - 10}" y="${rateY(0)}" class="chart-tick" text-anchor="end">0%</text>
+    ${rateLines}
+    ${!validHours.length ? `<text x="${width / 2}" y="${pad.top + plotHeight / 2}" class="chart-empty-note" text-anchor="middle">暂无成功率数据</text>` : ''}
+    ${labels}
+    ${points}
+  </svg>
+    </div>
+  </article>`;
 }
 
 function normalizeChartHours(hours) {
