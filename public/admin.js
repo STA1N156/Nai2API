@@ -6,6 +6,9 @@ const state = {
   selectedAccounts: new Set(),
   testingAccounts: new Set(),
   selectedUsageDate: '',
+  chartScrollSyncing: false,
+  chartDrag: null,
+  userMonitorExpanded: false,
   summary: null,
   images: [],
   imageTotal: 0,
@@ -34,6 +37,9 @@ const ids = [
   'clearLogsBtn',
   'usageDateSelect',
   'usageChart',
+  'userMonitorPanel',
+  'userMonitorToggle',
+  'userMonitorBody',
   'userCount',
   'userCredits',
   'userNote',
@@ -131,10 +137,16 @@ function bindEvents() {
   el.deleteAccountsBtn.addEventListener('click', deleteSelectedAccounts);
   el.refreshImagesBtn.addEventListener('click', refreshImages);
   el.clearLogsBtn.addEventListener('click', clearLogs);
+  el.userMonitorToggle.addEventListener('click', toggleUserMonitor);
   el.usageDateSelect.addEventListener('change', () => {
     state.selectedUsageDate = el.usageDateSelect.value;
     renderUsageChart(state.summary?.usageHourlyDays || []);
   });
+  el.usageChart.addEventListener('scroll', syncUsageChartScroll, true);
+  el.usageChart.addEventListener('pointerdown', startChartDrag);
+  el.usageChart.addEventListener('pointermove', dragUsageChart);
+  el.usageChart.addEventListener('pointerup', stopChartDrag);
+  el.usageChart.addEventListener('pointercancel', stopChartDrag);
   el.jobPrevBtn.addEventListener('click', () => changeJobPage(-1));
   el.jobNextBtn.addEventListener('click', () => changeJobPage(1));
   el.imagePrevBtn.addEventListener('click', () => changeImagePage(-1));
@@ -607,6 +619,55 @@ function renderSummaryImages(summary) {
   renderImages({ images, total, matched: total, offset: 0 });
 }
 
+function toggleUserMonitor() {
+  state.userMonitorExpanded = !state.userMonitorExpanded;
+  el.userMonitorBody.hidden = !state.userMonitorExpanded;
+  el.userMonitorPanel.classList.toggle('is-collapsed', !state.userMonitorExpanded);
+  el.userMonitorToggle.textContent = state.userMonitorExpanded ? '收起' : '展开';
+  el.userMonitorToggle.setAttribute('aria-expanded', String(state.userMonitorExpanded));
+}
+
+function syncUsageChartScroll(event) {
+  const source = event.target?.closest?.('.usage-chart-scroll');
+  if (!source || !el.usageChart.contains(source) || state.chartScrollSyncing) return;
+  state.chartScrollSyncing = true;
+  el.usageChart.querySelectorAll('.usage-chart-scroll').forEach((target) => {
+    if (target !== source) target.scrollLeft = source.scrollLeft;
+  });
+  requestAnimationFrame(() => {
+    state.chartScrollSyncing = false;
+  });
+}
+
+function startChartDrag(event) {
+  if (event.button !== 0) return;
+  const source = event.target?.closest?.('.usage-chart-scroll');
+  if (!source) return;
+  state.chartDrag = {
+    source,
+    pointerId: event.pointerId,
+    startX: event.clientX,
+    scrollLeft: source.scrollLeft
+  };
+  source.classList.add('dragging');
+  source.setPointerCapture?.(event.pointerId);
+}
+
+function dragUsageChart(event) {
+  const drag = state.chartDrag;
+  if (!drag || drag.pointerId !== event.pointerId) return;
+  drag.source.scrollLeft = drag.scrollLeft - (event.clientX - drag.startX);
+  event.preventDefault();
+}
+
+function stopChartDrag(event) {
+  const drag = state.chartDrag;
+  if (!drag || drag.pointerId !== event.pointerId) return;
+  drag.source.classList.remove('dragging');
+  drag.source.releasePointerCapture?.(event.pointerId);
+  state.chartDrag = null;
+}
+
 function summaryImageTotal(summary = {}) {
   const value = summary.imageCount ?? summary.imageTotal ?? summary.cacheImageCount;
   const total = Number(value);
@@ -663,13 +724,13 @@ function renderUsageChart(days) {
   const totalRequests = Number(selectedDay.total || 0);
   const totalDone = Number(selectedDay.done || 0);
   const totalFailed = Number(selectedDay.failed || 0);
-  const successRate = totalRequests ? totalDone / totalRequests : 0;
-  el.usageChartSummary.textContent = `北京时间，${selectedDay.date} 00:00-23:00 · ${formatNumber(totalRequests)} 次请求 · 成功率 ${formatPercent(successRate)}%`;
+  const failureRate = totalRequests ? totalFailed / totalRequests : 0;
+  el.usageChartSummary.textContent = `北京时间，${selectedDay.date} 00:00-23:00 · ${formatNumber(totalRequests)} 次请求 · 失败率 ${formatPercent(failureRate)}%`;
   el.usageChart.innerHTML = `<div class="chart-stat-row">
     <span><b>${formatNumber(totalRequests)}</b> 当天请求</span>
     <span><b>${formatNumber(totalDone)}</b> 成功</span>
     <span><b>${formatNumber(totalFailed)}</b> 失败</span>
-    <span><b>${formatPercent(successRate)}%</b> 当天成功率</span>
+    <span><b>${formatPercent(failureRate)}%</b> 当天失败率</span>
   </div>
   ${renderSelectedUsageChart(selectedDay)}`;
 }
@@ -708,7 +769,7 @@ function renderSelectedUsageChart(day) {
 
   return `<div class="usage-chart-stack">
     ${renderHourlyRequestChart(day, hours, base)}
-    ${renderHourlyRateChart(day, hours, base)}
+    ${renderHourlyFailureRateChart(day, hours, base)}
   </div>`;
 }
 
@@ -727,7 +788,7 @@ function renderHourlyRequestChart(day, hours, base) {
     const tooltipX = Math.max(pad.left + 4, Math.min(width - pad.right - tooltipWidth - 4, x - tooltipWidth / 2));
     const topPointY = countY(hour.total);
     const tooltipY = Math.max(8, topPointY - tooltipHeight - 12);
-    const successRateText = hasRequests ? `${formatPercent(hour.successRate)}%` : '无请求';
+    const failureRateText = hasRequests ? `${formatPercent(hourFailureRate(hour))}%` : '无请求';
     return `<g class="chart-hour-point">
       <circle cx="${x}" cy="${countY(hour.total)}" r="4.8" class="chart-point chart-point-count"></circle>
       <circle cx="${x}" cy="${countY(hour.total)}" r="13" class="chart-hit-point"></circle>
@@ -735,7 +796,7 @@ function renderHourlyRequestChart(day, hours, base) {
         <rect width="${tooltipWidth}" height="${tooltipHeight}" rx="12"></rect>
         <text x="12" y="22">
           <tspan class="chart-tooltip-title">${escapeHtml(day.date)} ${escapeHtml(hour.label)}</tspan>
-          <tspan x="12" dy="18">请求 ${formatNumber(hour.total || 0)} 次 · 成功率 ${successRateText}</tspan>
+          <tspan x="12" dy="18">请求 ${formatNumber(hour.total || 0)} 次 · 失败率 ${failureRateText}</tspan>
           <tspan x="12" dy="18">成功 ${formatNumber(hour.done || 0)} 次 · 失败 ${formatNumber(failed)} 次</tspan>
         </text>
       </g>
@@ -764,7 +825,7 @@ function renderHourlyRequestChart(day, hours, base) {
   </article>`;
 }
 
-function renderHourlyRateChart(day, hours, base) {
+function renderHourlyFailureRateChart(day, hours, base) {
   const { width, height, pad, plotHeight, xFor, horizontalGridLines, verticalGridLines, labels } = base;
   const rateY = (value) => pad.top + plotHeight - Math.max(0, Math.min(1, Number(value || 0))) * plotHeight;
   const validHours = hours.filter((hour) => Number(hour.total || 0) > 0);
@@ -772,7 +833,7 @@ function renderHourlyRateChart(day, hours, base) {
   let currentRateSegment = [];
   hours.forEach((hour) => {
     if (Number(hour.total || 0) > 0) {
-      currentRateSegment.push(`${xFor(hour.hour)},${rateY(hour.successRate)}`);
+      currentRateSegment.push(`${xFor(hour.hour)},${rateY(hourFailureRate(hour))}`);
       return;
     }
     if (currentRateSegment.length > 1) rateSegments.push(currentRateSegment);
@@ -780,25 +841,25 @@ function renderHourlyRateChart(day, hours, base) {
   });
   if (currentRateSegment.length > 1) rateSegments.push(currentRateSegment);
   const rateLines = rateSegments.map((segment) => (
-    `<polyline points="${segment.join(' ')}" class="chart-line chart-line-rate"></polyline>`
+    `<polyline points="${segment.join(' ')}" class="chart-line chart-line-failure"></polyline>`
   )).join('');
-  const bestRate = validHours.length ? Math.max(...validHours.map((hour) => Number(hour.successRate || 0))) : 0;
+  const worstRate = validHours.length ? Math.max(...validHours.map((hour) => hourFailureRate(hour))) : 0;
   const points = validHours.map((hour) => {
     const x = xFor(hour.hour);
     const failed = Number(hour.failed || 0);
-    const y = rateY(hour.successRate);
+    const y = rateY(hourFailureRate(hour));
     const tooltipWidth = 186;
     const tooltipHeight = 66;
     const tooltipX = Math.max(pad.left + 4, Math.min(width - pad.right - tooltipWidth - 4, x - tooltipWidth / 2));
     const tooltipY = Math.max(8, y - tooltipHeight - 12);
     return `<g class="chart-hour-point">
-      <circle cx="${x}" cy="${y}" r="4.8" class="chart-point chart-point-rate"></circle>
+      <circle cx="${x}" cy="${y}" r="4.8" class="chart-point chart-point-failure"></circle>
       <circle cx="${x}" cy="${y}" r="13" class="chart-hit-point"></circle>
       <g class="chart-node-tooltip" transform="translate(${tooltipX} ${tooltipY})">
         <rect width="${tooltipWidth}" height="${tooltipHeight}" rx="12"></rect>
         <text x="12" y="22">
           <tspan class="chart-tooltip-title">${escapeHtml(day.date)} ${escapeHtml(hour.label)}</tspan>
-          <tspan x="12" dy="18">成功率 ${formatPercent(hour.successRate)}% · 请求 ${formatNumber(hour.total || 0)} 次</tspan>
+          <tspan x="12" dy="18">失败率 ${formatPercent(hourFailureRate(hour))}% · 请求 ${formatNumber(hour.total || 0)} 次</tspan>
           <tspan x="12" dy="18">成功 ${formatNumber(hour.done || 0)} 次 · 失败 ${formatNumber(failed)} 次</tspan>
         </text>
       </g>
@@ -807,8 +868,8 @@ function renderHourlyRateChart(day, hours, base) {
 
   return `<article class="usage-chart-block">
     <div class="usage-chart-heading">
-      <strong>每小时成功率</strong>
-      <span>${validHours.length ? `最高 ${formatPercent(bestRate)}%` : '暂无有请求的小时'}</span>
+      <strong>每小时失败率</strong>
+      <span>${validHours.length ? `最高 ${formatPercent(worstRate)}%` : '暂无有请求的小时'}</span>
     </div>
     <div class="usage-chart-scroll">
   <svg class="single-hourly-chart" viewBox="0 0 ${width} ${height}" role="img">
@@ -816,12 +877,12 @@ function renderHourlyRateChart(day, hours, base) {
     ${horizontalGridLines}
     ${verticalGridLines}
     <line x1="${pad.left}" y1="${pad.top + plotHeight}" x2="${width - pad.right}" y2="${pad.top + plotHeight}" class="chart-axis" />
-    <text x="${pad.left}" y="24" class="chart-axis-label">成功率</text>
+    <text x="${pad.left}" y="24" class="chart-axis-label">失败率</text>
     <text x="${pad.left - 10}" y="${rateY(1)}" class="chart-tick" text-anchor="end">100%</text>
     <text x="${pad.left - 10}" y="${rateY(0.5)}" class="chart-tick" text-anchor="end">50%</text>
     <text x="${pad.left - 10}" y="${rateY(0)}" class="chart-tick" text-anchor="end">0%</text>
     ${rateLines}
-    ${!validHours.length ? `<text x="${width / 2}" y="${pad.top + plotHeight / 2}" class="chart-empty-note" text-anchor="middle">暂无成功率数据</text>` : ''}
+    ${!validHours.length ? `<text x="${width / 2}" y="${pad.top + plotHeight / 2}" class="chart-empty-note" text-anchor="middle">暂无失败率数据</text>` : ''}
     ${labels}
     ${points}
   </svg>
@@ -842,6 +903,11 @@ function normalizeChartHours(hours) {
       successRate: Number(item.successRate || 0)
     };
   });
+}
+
+function hourFailureRate(hour) {
+  const total = Number(hour?.total || 0);
+  return total ? Number(hour?.failed || 0) / total : 0;
 }
 
 function renderErrorLogs(logs) {

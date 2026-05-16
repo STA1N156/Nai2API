@@ -187,25 +187,28 @@
             <div id="accountList" class="data-list"></div>
           </section>
 
-          <section class="panel">
+          <section id="userMonitorPanel" class="panel collapsible-panel is-collapsed">
             <div class="panel-title">
               <div>
                 <h2>密钥监控</h2>
                 <span id="userCountText">0 个密钥</span>
               </div>
+              <button id="userMonitorToggle" class="secondary collapse-toggle" type="button" aria-expanded="false" aria-controls="userMonitorBody">展开</button>
             </div>
-            <div class="toolbar">
-              <input id="userSearch" class="search-input" placeholder="搜索密钥、备注或卡密来源" />
-              <label class="checkline">
-                <input id="selectAllUsers" type="checkbox" />
-                全选
-              </label>
-              <input id="balanceAdjustValue" class="inline-input" type="number" value="10" />
-              <button id="setBalanceBtn" class="secondary">设置额度</button>
-              <button id="addBalanceBtn" class="secondary">增加额度</button>
-              <button id="deleteUsersBtn" class="danger">批量删除</button>
+            <div id="userMonitorBody" class="collapsible-body" hidden>
+              <div class="toolbar">
+                <input id="userSearch" class="search-input" placeholder="搜索密钥、备注或卡密来源" />
+                <label class="checkline">
+                  <input id="selectAllUsers" type="checkbox" />
+                  全选
+                </label>
+                <input id="balanceAdjustValue" class="inline-input" type="number" value="10" />
+                <button id="setBalanceBtn" class="secondary">设置额度</button>
+                <button id="addBalanceBtn" class="secondary">增加额度</button>
+                <button id="deleteUsersBtn" class="danger">批量删除</button>
+              </div>
+              <div id="userList" class="data-list"></div>
             </div>
-            <div id="userList" class="data-list"></div>
           </section>
 
           <section class="panel">

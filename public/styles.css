@@ -1025,6 +1025,17 @@ textarea:focus {
   flex: 0 1 auto;
 }
 
+.collapse-toggle {
+  flex: 0 0 auto;
+  min-height: 36px;
+  min-width: 86px;
+  border-radius: 999px;
+}
+
+.collapsible-body[hidden] {
+  display: none !important;
+}
+
 .image-cache-actions {
   flex: 1 1 700px;
   min-width: 0;
@@ -1240,6 +1251,13 @@ textarea:focus {
   border: 1px solid rgba(17, 24, 39, 0.08);
   border-radius: var(--radius-md);
   background: rgba(255, 255, 255, 0.54);
+  cursor: grab;
+  touch-action: pan-y;
+  user-select: none;
+}
+
+.usage-chart-scroll.dragging {
+  cursor: grabbing;
 }
 
 .single-hourly-chart {
@@ -1306,7 +1324,8 @@ textarea:focus {
   stroke: var(--teal);
 }
 
-.chart-line-rate {
+.chart-line-rate,
+.chart-line-failure {
   stroke: var(--rose);
 }
 
@@ -1322,7 +1341,8 @@ textarea:focus {
   fill: var(--teal);
 }
 
-.chart-point-rate {
+.chart-point-rate,
+.chart-point-failure {
   fill: var(--rose);
 }
 
