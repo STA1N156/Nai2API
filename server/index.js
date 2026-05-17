@@ -224,13 +224,14 @@ async function route(req, res) {
     const db = await store.readAdminSummary();
     resetStaleAccountLoads(db.accounts);
     const revealTokens = url.searchParams.get('revealTokens') === '1';
+    const accountStats1h = accountStatsMapSince(db.jobs, 60 * 60 * 1000);
     sendJson(res, 200, {
       settings: db.settings,
       cards: db.cards.map(publicCard),
       users: db.users.map(publicUser),
       accounts: db.accounts.map((account) => publicAccount(account, {
         revealToken: revealTokens,
-        stats1h: accountStatsSince(account.id, db.jobs, 60 * 60 * 1000)
+        stats1h: accountStats1h.get(account.id) || finalizeStats({})
       })),
       images: db.images.slice(0, 12).map(publicImage),
       imageCount: db.imageCount ?? db.images.length,
@@ -2777,6 +2778,27 @@ function accountStatsSince(accountId, jobs, rangeMs) {
     if (job.status === 'failed') stats.failed += 1;
     return stats;
   }, { done: 0, failed: 0 }));
+}
+
+function accountStatsMapSince(jobs, rangeMs) {
+  const since = Date.now() - rangeMs;
+  const map = new Map();
+  jobs.forEach((job) => {
+    if (isQuotaFailureJob(job) || !job.accountId) return;
+    const createdAt = Date.parse(job.createdAt || '');
+    if (!createdAt || createdAt < since) return;
+    let stats = map.get(job.accountId);
+    if (!stats) {
+      stats = { done: 0, failed: 0 };
+      map.set(job.accountId, stats);
+    }
+    if (job.status === 'done') stats.done += 1;
+    if (job.status === 'failed') stats.failed += 1;
+  });
+  map.forEach((stats, accountId) => {
+    map.set(accountId, finalizeStats(stats));
+  });
+  return map;
 }
 
 function finalizeStats(stats) {
