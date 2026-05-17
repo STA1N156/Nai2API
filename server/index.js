@@ -23,11 +23,15 @@ const userGenerateGateWaiters = new Map();
 let userGenerateGateLock = Promise.resolve();
 let storedImageRemovalQueue = [];
 let storedImageRemovalRunning = false;
+let imageCacheTrimTimer = null;
 const directGenerateTimeoutMs = Number(process.env.DIRECT_GENERATE_TIMEOUT_MS || 60_000);
 const userGenerateConcurrency = positiveIntegerEnv('USER_GENERATE_CONCURRENCY', 5, 1);
 const userGenerateGatePollMs = positiveIntegerEnv('USER_GENERATE_GATE_POLL_MS', 1000, 250);
-const imageCleanupBatchSize = positiveIntegerEnv('IMAGE_CLEANUP_BATCH_SIZE', 200, 1);
-const imageCleanupConcurrency = positiveIntegerEnv('IMAGE_CLEANUP_CONCURRENCY', 8, 1);
+const imageCleanupBatchSize = positiveIntegerEnv('IMAGE_CLEANUP_BATCH_SIZE', 50, 1);
+const imageCleanupConcurrency = positiveIntegerEnv('IMAGE_CLEANUP_CONCURRENCY', 2, 1);
+const imageCleanupBatchDelayMs = positiveIntegerEnv('IMAGE_CLEANUP_BATCH_DELAY_MS', 100, 0);
+const imageCacheTrimDelayMs = positiveIntegerEnv('IMAGE_CACHE_TRIM_DELAY_MS', 60_000, 0);
+const startupImageCleanupDelayMs = positiveIntegerEnv('IMAGE_CLEANUP_STARTUP_DELAY_MS', 300_000, 0);
 const openAiChatTimeoutMs = Number(process.env.OPENAI_CHAT_TIMEOUT_MS || 10 * 60_000);
 const openAiQueuePollMs = 650;
 const openAiFixedSteps = 28;
@@ -69,7 +73,9 @@ await mkdir(imageDir, { recursive: true });
 await migrateInlineImages();
 await ensureAccountRouteIds();
 await applyRuntimeSettings();
-await cleanupImageStorage().catch((error) => console.error('Failed to cleanup image storage:', error));
+setTimeout(() => {
+  cleanupImageStorage().catch((error) => console.error('Failed to cleanup image storage:', error));
+}, startupImageCleanupDelayMs);
 
 const server = http.createServer(async (req, res) => {
   try {
@@ -95,11 +101,12 @@ server.listen(port, host, () => {
 
 async function applyRuntimeSettings() {
   const publicBaseUrl = normalizePublicBaseUrl(process.env.PUBLIC_BASE_URL || '');
-  await store.update((db) => {
-    if (publicBaseUrl && !db.settings.publicBaseUrl) db.settings.publicBaseUrl = publicBaseUrl;
-    if (!db.settings.defaultArtist || db.settings.defaultArtist === legacyDefaultArtist) {
-      db.settings.defaultArtist = defaultArtist2_5D;
+  await store.updateSettings((settings) => {
+    if (publicBaseUrl && !settings.publicBaseUrl) settings.publicBaseUrl = publicBaseUrl;
+    if (!settings.defaultArtist || settings.defaultArtist === legacyDefaultArtist) {
+      settings.defaultArtist = defaultArtist2_5D;
     }
+    return settings;
   });
 }
 
@@ -160,24 +167,19 @@ async function route(req, res) {
   if (method === 'PUT' && url.pathname === '/api/settings') {
     assertAdmin(req, url);
     const body = await readJson(req);
-    let trimmedImages = [];
-    const settings = await store.update((db) => {
-      db.settings = {
-        ...db.settings,
-        ...body,
-        costPerImage: 1,
-        publicBaseUrl: normalizePublicBaseUrl(body.publicBaseUrl ?? db.settings.publicBaseUrl ?? ''),
-        maxCacheImages: clamp(Number(body.maxCacheImages ?? db.settings.maxCacheImages ?? 500), 0, MAX_CACHE_IMAGES_LIMIT),
-        accountConcurrency: 1,
-        defaults: {
-          ...(db.settings.defaults || {}),
-          ...(body.defaults || {})
-        }
-      };
-      trimmedImages = trimImageCacheRecords(db);
-      return db.settings;
-    });
-    scheduleStoredImageRemoval(trimmedImages);
+    const settings = await store.updateSettings((currentSettings) => ({
+      ...currentSettings,
+      ...body,
+      costPerImage: 1,
+      publicBaseUrl: normalizePublicBaseUrl(body.publicBaseUrl ?? currentSettings.publicBaseUrl ?? ''),
+      maxCacheImages: clamp(Number(body.maxCacheImages ?? currentSettings.maxCacheImages ?? 500), 0, MAX_CACHE_IMAGES_LIMIT),
+      accountConcurrency: 1,
+      defaults: {
+        ...(currentSettings.defaults || {}),
+        ...(body.defaults || {})
+      }
+    }));
+    scheduleImageCacheTrim();
     scheduleQueueDrain();
     sendJson(res, 200, settings);
     return;
@@ -1314,6 +1316,19 @@ async function clearRequestLogs() {
   }, { flush: true });
 }
 
+function scheduleImageCacheTrim(delay = imageCacheTrimDelayMs) {
+  if (imageCacheTrimTimer) clearTimeout(imageCacheTrimTimer);
+  imageCacheTrimTimer = setTimeout(() => {
+    imageCacheTrimTimer = null;
+    trimImageCacheInBackground().catch((error) => console.error('Failed to trim image cache:', error));
+  }, delay);
+}
+
+async function trimImageCacheInBackground() {
+  const trimmedImages = await store.update((db) => trimImageCacheRecords(db)) || [];
+  scheduleStoredImageRemoval(trimmedImages);
+}
+
 async function cleanupImageStorage() {
   const trimmedImages = await store.update((db) => trimImageCacheRecords(db), { flush: true }) || [];
   await removeStoredImages(trimmedImages);
@@ -2379,7 +2394,7 @@ async function processStoredImageRemovalQueue() {
     while (storedImageRemovalQueue.length) {
       const batch = storedImageRemovalQueue.splice(0, imageCleanupBatchSize);
       await removeStoredImageBatch(batch);
-      await sleep(0);
+      await sleep(imageCleanupBatchDelayMs);
     }
   } finally {
     storedImageRemovalRunning = false;

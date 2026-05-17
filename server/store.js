@@ -47,6 +47,7 @@ export class JsonStore {
   constructor(dataDir) {
     this.dataDir = dataDir;
     this.dbPath = path.join(dataDir, 'library.json');
+    this.settingsPath = path.join(dataDir, 'settings.json');
     this.queue = Promise.resolve();
     this.flushQueue = Promise.resolve();
     this.flushTimer = null;
@@ -60,18 +61,21 @@ export class JsonStore {
       db.accounts.forEach((account) => {
         account.inFlight = 0;
       });
-      await this.write(db);
+      this.db = db;
+      await this.applySettingsOverride();
     } catch (error) {
       const backupDb = await this.readBackup().catch(() => null);
       if (backupDb) {
         backupDb.accounts.forEach((account) => {
           account.inFlight = 0;
         });
-        await this.write(backupDb);
+        this.db = backupDb;
+        await this.applySettingsOverride();
         return;
       }
       if (error?.code === 'ENOENT') {
         await this.write(defaultDb);
+        await this.applySettingsOverride();
         return;
       }
       throw error;
@@ -113,6 +117,18 @@ export class JsonStore {
   async readSettings() {
     await this.ensureLoaded();
     return structuredClone(this.db.settings);
+  }
+
+  async updateSettings(mutator) {
+    this.queue = this.queue.catch(() => {}).then(async () => {
+      if (!this.db) this.db = await this.readRaw();
+      const result = await mutator(this.db.settings);
+      if (result && typeof result === 'object') this.db.settings = result;
+      this.db.settings = normalizeSettings(this.db.settings);
+      await this.writeSettingsSnapshot(this.db.settings);
+      return cloneValue(this.db.settings);
+    });
+    return this.queue;
   }
 
   async findImage(id) {
@@ -197,6 +213,7 @@ export class JsonStore {
     if (this.db) return;
     await this.queue.catch(() => {});
     this.db = await this.readRaw();
+    await this.applySettingsOverride();
   }
 
   async readRaw() {
@@ -261,6 +278,24 @@ export class JsonStore {
     await writeJsonSnapshot(tempPath, db);
     await renameWithRetry(tempPath, this.dbPath);
     await copyFile(this.dbPath, `${this.dbPath}.bak`).catch(() => {});
+  }
+
+  async applySettingsOverride() {
+    if (!this.db) return;
+    const settings = await this.readSettingsSnapshot().catch(() => null);
+    if (!settings) return;
+    this.db.settings = normalizeSettings(mergeSettings(this.db.settings, settings));
+  }
+
+  async readSettingsSnapshot() {
+    const raw = await readFile(this.settingsPath, 'utf8');
+    return JSON.parse(raw);
+  }
+
+  async writeSettingsSnapshot(settings) {
+    const tempPath = `${this.settingsPath}.${process.pid}.${Date.now()}.tmp`;
+    await writeFile(tempPath, `${JSON.stringify(normalizeSettings(settings), null, 2)}\n`);
+    await renameWithRetry(tempPath, this.settingsPath);
   }
 }
 
@@ -332,6 +367,21 @@ function snapshotDb(db) {
     images: db.images.slice(),
     ledger: db.ledger.slice()
   };
+}
+
+function mergeSettings(base = {}, override = {}) {
+  return {
+    ...base,
+    ...override,
+    defaults: {
+      ...(base.defaults || {}),
+      ...(override.defaults || {})
+    }
+  };
+}
+
+function normalizeSettings(settings = {}) {
+  return normalizeDb({ settings }).settings;
 }
 
 async function writeObjectProperty(stream, key, value, first = false) {
@@ -413,7 +463,6 @@ function trimDb(db) {
   db.settings.maxCacheImages = maxCacheImages;
   db.settings.accountConcurrency = 1;
   db.jobs = trimJobs(db.jobs);
-  db.images = db.images.slice(0, maxCacheImages);
   db.ledger = db.ledger.slice(0, 1000);
   return db;
 }
