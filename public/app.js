@@ -348,8 +348,8 @@ async function startJob() {
     resetQueueView(job);
     el.jobText.textContent = jobStatusText(job);
     updateLoadingStatus(job);
-    await loadMe().catch(() => {});
     state.pollTimer = setInterval(() => pollJob(job.id), jobPollIntervalMs);
+    loadMe().catch(() => {});
     await pollJob(job.id);
   } catch (error) {
     renderFrameNotice('生成失败', true);

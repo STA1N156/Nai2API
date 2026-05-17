@@ -67,7 +67,6 @@ await applyRuntimeSettings();
 await cleanupImageStorage().catch((error) => console.error('Failed to cleanup image storage:', error));
 
 const server = http.createServer(async (req, res) => {
-  attachRequestRuntimeLog(req, res);
   try {
     await route(req, res);
   } catch (error) {
@@ -2042,58 +2041,20 @@ function accountInflightTimeoutMs() {
   return Number.isFinite(configured) && configured > 0 ? Math.max(1000, Math.floor(configured)) : 10 * 60 * 1000;
 }
 
-function novelAiGenerateSlowLogMs() {
-  const configured = Number(process.env.NOVELAI_GENERATE_SLOW_LOG_MS || 3000);
-  return Number.isFinite(configured) && configured >= 0 ? Math.floor(configured) : 3000;
-}
-
-function novelAiGenerateLogDetail(reservation, account, attempt, image = null) {
-  const timings = image?.timings || {};
-  return [
-    `job=${runtimeId(reservation?.job?.id)}`,
-    `attempt=${attempt}`,
-    `route=${account?.routeId || '-'}`,
-    `account=${runtimeId(account?.id)}`,
-    `proxy=${account?.proxyUrl ? 1 : 0}`,
-    timings.responseMs === undefined ? '' : `responseMs=${timings.responseMs}`,
-    timings.readMs === undefined ? '' : `readMs=${timings.readMs}`,
-    timings.decodeMs === undefined ? '' : `decodeMs=${timings.decodeMs}`,
-    timings.bytes === undefined ? '' : `bytes=${timings.bytes}`
-  ].filter(Boolean).join(' ');
-}
-
-function runtimeId(value = '') {
-  const text = String(value || '');
-  if (!text) return '-';
-  if (text.length <= 14) return text;
-  return `${text.slice(0, 8)}…${text.slice(-4)}`;
-}
-
-function shortRuntimeError(error) {
-  return String(publicErrorMessage(error?.message || error || 'unknown error'))
-    .replace(/\s+/g, '_')
-    .slice(0, 120);
-}
-
 async function generateWithAccountRetry(reservation, request, options = {}) {
   const tried = new Set();
   let firstError = null;
   let current = reservation;
-  let attempt = 0;
 
   while (true) {
     if (options.signal?.aborted) throw options.signal.reason || new Error('direct generate timeout');
     if (current.account?.id) tried.add(current.account.id);
-    attempt += 1;
-    const startedAt = Date.now();
     try {
       const image = await generateNovelAiImage(request, current.account, process.env, { signal: options.signal });
-      runtimeSlowLog('NovelAI generate', startedAt, novelAiGenerateLogDetail(reservation, current.account, attempt, image), novelAiGenerateSlowLogMs());
       reservation.account = current.account;
       return image;
     } catch (error) {
       if (options.signal?.aborted || isAbortError(error)) throw error;
-      runtimeSlowLog('NovelAI generate retry', startedAt, `${novelAiGenerateLogDetail(reservation, current.account, attempt)} error=${shortRuntimeError(error)}`, 0);
       if (!firstError) firstError = error;
       const next = await retryReservationWithNextAccount(current, error, tried, options);
       if (!next) {
@@ -3462,49 +3423,6 @@ function runtimeRequestLog(label, startedAt, detail = {}) {
     .map(([key, value]) => `${key}=${value}`)
     .join(' ');
   console.log(`[runtime] ${label}: total=${duration}ms${parts ? ` ${parts}` : ''}`);
-}
-
-function attachRequestRuntimeLog(req, res) {
-  const method = req.method || 'GET';
-  const pathname = requestPathname(req);
-  if (!shouldLogRuntimeRequest(method, pathname)) return;
-  const startedAt = Date.now();
-  const agent = shortUserAgent(req.headers['user-agent']);
-  console.log(`[runtime] request start ${method} ${pathname}${agent ? ` agent=${agent}` : ''}`);
-  let logged = false;
-  const finish = (event) => {
-    if (logged) return;
-    logged = true;
-    const status = Number(res.statusCode || 0);
-    console.log(`[runtime] request ${event} ${method} ${pathname}: status=${status} duration=${Date.now() - startedAt}ms`);
-  };
-  res.once('finish', () => finish('finish'));
-  res.once('close', () => finish('close'));
-}
-
-function requestPathname(req) {
-  try {
-    return new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`).pathname;
-  } catch {
-    return String(req.url || '');
-  }
-}
-
-function shouldLogRuntimeRequest(method, pathname) {
-  if (method === 'OPTIONS') return false;
-  if (pathname === '/' || pathname === '/admin' || pathname === '/admin.html') return true;
-  if (pathname.endsWith('.js') || pathname.endsWith('.css')) return true;
-  if (pathname === '/api/health' || pathname === '/api/settings') return true;
-  if (pathname === '/api/jobs' || pathname.startsWith('/api/jobs/')) return true;
-  if (pathname === '/generate' || pathname === '/v1/chat/completions') return true;
-  if (pathname.startsWith('/api/admin/')) return true;
-  return false;
-}
-
-function shortUserAgent(value = '') {
-  return String(value || '')
-    .replace(/\s+/g, '_')
-    .slice(0, 80);
 }
 
 function installRuntimeSafetyHandlers() {
