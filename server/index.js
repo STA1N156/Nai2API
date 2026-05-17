@@ -18,12 +18,7 @@ let queueDrainTimer = null;
 let queueDraining = false;
 let queueDrainRequested = false;
 const jobWaiters = new Map();
-const userGenerateGateReservations = new Map();
-const userGenerateGateWaiters = new Map();
-let userGenerateGateLock = Promise.resolve();
 const directGenerateTimeoutMs = Number(process.env.DIRECT_GENERATE_TIMEOUT_MS || 60_000);
-const userGenerateConcurrency = positiveIntegerEnv('USER_GENERATE_CONCURRENCY', 5, 1);
-const userGenerateGatePollMs = positiveIntegerEnv('USER_GENERATE_GATE_POLL_MS', 1000, 250);
 const openAiChatTimeoutMs = Number(process.env.OPENAI_CHAT_TIMEOUT_MS || 10 * 60_000);
 const openAiQueuePollMs = 650;
 const openAiFixedSteps = 28;
@@ -418,7 +413,7 @@ async function route(req, res) {
   if (method === 'POST' && url.pathname === '/api/jobs') {
     const body = await readJson(req);
     const token = String(body.token || tokenFrom(req, url) || '');
-    const job = await createGatedJob(token, body);
+    const job = await createJob(token, body);
     scheduleQueueDrain();
     const snapshot = await store.findJobContext(job.id);
     sendJson(res, 202, publicJob(snapshot?.job || job, snapshot));
@@ -487,12 +482,10 @@ async function handleDirectGenerate(url, res) {
     }
   }
 
-  const releaseGateReservation = await acquireUserGenerateGate(token);
   const deadline = Date.now() + directGenerateTimeoutMs;
   let directJob = null;
   try {
     directJob = await createDirectJob(token, request, cacheKey, { deadlineAt: new Date(deadline).toISOString() });
-    releaseGateReservation();
     scheduleQueueDrain();
     const result = await waitForJobResult(directJob.id, deadline);
     if (!result) {
@@ -507,7 +500,6 @@ async function handleDirectGenerate(url, res) {
       'x-balance': String(result.balance ?? '')
     });
   } catch (error) {
-    releaseGateReservation();
     if (directJob) {
       if (isInsufficientBalanceError(error)) {
         await removeJob(directJob.id);
@@ -533,7 +525,7 @@ async function handleOpenAiChatCompletion(req, res) {
   const body = await readJson(req);
   const settings = await store.readSettings();
   const parsed = parseOpenAiImageRequest(body, settings);
-  const job = await createGatedJob(token, parsed.request);
+  const job = await createJob(token, parsed.request);
   scheduleQueueDrain();
 
   if (body.stream === true) {
@@ -1436,15 +1428,6 @@ async function updateAccount(id, body) {
   });
 }
 
-async function createGatedJob(token, body) {
-  const releaseGateReservation = await acquireUserGenerateGate(token);
-  try {
-    return await createJob(token, body);
-  } finally {
-    releaseGateReservation();
-  }
-}
-
 async function createJob(token, body) {
   return store.update((db) => {
     const user = getUserOrThrow(db, token);
@@ -1576,43 +1559,34 @@ async function markDirectJobRunning(jobId, reservation) {
 
 async function markDirectJobFailed(jobId, message) {
   const detail = errorDetailMessage(message);
-  const token = await store.update((db) => {
+  await store.update((db) => {
     const job = db.jobs.find((item) => item.id === jobId);
     if (!job) return;
-    const userToken = job.userToken;
     job.status = 'failed';
     job.error = publicErrorMessage(detail);
     job.errorDetail = detail;
     job.updatedAt = new Date().toISOString();
-    return userToken;
   });
-  if (token) notifyUserGenerateGate(token);
   notifyJobWaiters(jobId, { error: publicErrorMessage(detail) });
 }
 
 async function removeJob(jobId) {
-  const token = await store.update((db) => {
-    const job = db.jobs.find((item) => item.id === jobId);
+  await store.update((db) => {
     db.jobs = db.jobs.filter((job) => job.id !== jobId);
-    return job?.userToken || '';
   });
-  if (token) notifyUserGenerateGate(token);
 }
 
 async function timeoutDirectJob(jobId) {
-  const token = await store.update((db) => {
+  await store.update((db) => {
     const job = db.jobs.find((item) => item.id === jobId);
     if (!job || ['done', 'failed'].includes(job.status)) return;
     if (job.status !== 'queued') return;
-    const userToken = job.userToken;
     refundJob(db, job, '连接超时');
     job.status = 'failed';
     job.error = '连接超时';
     job.errorDetail = 'direct generate timeout';
     job.updatedAt = new Date().toISOString();
-    return userToken;
   });
-  if (token) notifyUserGenerateGate(token);
 }
 
 function waitForJobResult(jobId, deadline) {
@@ -1643,90 +1617,6 @@ function removeJobWaiter(jobId, waiter) {
   if (!waiters) return;
   waiters.delete(waiter);
   if (!waiters.size) jobWaiters.delete(jobId);
-}
-
-async function acquireUserGenerateGate(token) {
-  const key = String(token || '').trim();
-  if (!key) return () => {};
-
-  while (true) {
-    const release = await tryReserveUserGenerateGate(key);
-    if (release) return release;
-    await waitForUserGenerateGate(key);
-  }
-}
-
-async function tryReserveUserGenerateGate(token) {
-  return withUserGenerateGateLock(async () => {
-    const db = await store.readCollections(['jobs']);
-    const active = activeUserJobCount(db.jobs || [], token) + userGenerateGateReservationCount(token);
-    if (active >= userGenerateConcurrency) return null;
-
-    addUserGenerateGateReservation(token);
-    let released = false;
-    return () => {
-      if (released) return;
-      released = true;
-      releaseUserGenerateGateReservation(token);
-    };
-  });
-}
-
-async function withUserGenerateGateLock(fn) {
-  const previous = userGenerateGateLock;
-  let unlock = () => {};
-  userGenerateGateLock = new Promise((resolve) => {
-    unlock = resolve;
-  });
-  await previous.catch(() => {});
-  try {
-    return await fn();
-  } finally {
-    unlock();
-  }
-}
-
-function addUserGenerateGateReservation(token) {
-  userGenerateGateReservations.set(token, userGenerateGateReservationCount(token) + 1);
-}
-
-function releaseUserGenerateGateReservation(token) {
-  const next = userGenerateGateReservationCount(token) - 1;
-  if (next > 0) {
-    userGenerateGateReservations.set(token, next);
-  } else {
-    userGenerateGateReservations.delete(token);
-  }
-  notifyUserGenerateGate(token);
-}
-
-function userGenerateGateReservationCount(token) {
-  return Number(userGenerateGateReservations.get(token) || 0);
-}
-
-function waitForUserGenerateGate(token) {
-  return new Promise((resolve) => {
-    let done = null;
-    const timer = setTimeout(() => done?.(), userGenerateGatePollMs);
-    done = () => {
-      clearTimeout(timer);
-      const waiters = userGenerateGateWaiters.get(token);
-      if (waiters) {
-        waiters.delete(done);
-        if (!waiters.size) userGenerateGateWaiters.delete(token);
-      }
-      resolve();
-    };
-    if (!userGenerateGateWaiters.has(token)) userGenerateGateWaiters.set(token, new Set());
-    userGenerateGateWaiters.get(token).add(done);
-  });
-}
-
-function notifyUserGenerateGate(token) {
-  const waiters = userGenerateGateWaiters.get(token);
-  if (!waiters) return;
-  userGenerateGateWaiters.delete(token);
-  waiters.forEach((done) => done());
 }
 
 async function runJob(jobId) {
@@ -2014,7 +1904,6 @@ async function completeGeneration(reservation, request, image, meta = {}) {
   }
   await removeStoredImages(trimmedImages);
   scheduleQueueDrain();
-  notifyUserGenerateGate(reservation.token);
   if (meta.jobId) notifyJobWaiters(meta.jobId, { saved: savedImage, image, balance: savedImage.balance });
   return savedImage;
 }
@@ -2053,7 +1942,6 @@ async function failGeneration(reservation, error) {
     });
   });
   scheduleQueueDrain();
-  notifyUserGenerateGate(reservation.token);
   if (reservation.job?.id) notifyJobWaiters(reservation.job.id, { error: message });
 }
 
@@ -2452,10 +2340,6 @@ function jobDurationMs(job) {
 
 function activeJobCount(jobs) {
   return jobs.filter((job) => ['queued', 'running'].includes(job.status)).length;
-}
-
-function activeUserJobCount(jobs, token) {
-  return jobs.filter((job) => job.userToken === token && ['queued', 'running'].includes(job.status)).length;
 }
 
 function isExpiredJob(job) {
@@ -2955,12 +2839,6 @@ function assertAdmin(req, url) {
 function clamp(value, min, max) {
   if (!Number.isFinite(value)) return min;
   return Math.max(min, Math.min(max, value));
-}
-
-function positiveIntegerEnv(name, fallback, min = 1) {
-  const value = Number(process.env[name]);
-  if (!Number.isFinite(value)) return fallback;
-  return Math.max(min, Math.floor(value));
 }
 
 function numberOrNull(value) {
