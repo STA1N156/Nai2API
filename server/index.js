@@ -21,9 +21,13 @@ const jobWaiters = new Map();
 const userGenerateGateReservations = new Map();
 const userGenerateGateWaiters = new Map();
 let userGenerateGateLock = Promise.resolve();
+let storedImageRemovalQueue = [];
+let storedImageRemovalRunning = false;
 const directGenerateTimeoutMs = Number(process.env.DIRECT_GENERATE_TIMEOUT_MS || 60_000);
 const userGenerateConcurrency = positiveIntegerEnv('USER_GENERATE_CONCURRENCY', 5, 1);
 const userGenerateGatePollMs = positiveIntegerEnv('USER_GENERATE_GATE_POLL_MS', 1000, 250);
+const imageCleanupBatchSize = positiveIntegerEnv('IMAGE_CLEANUP_BATCH_SIZE', 200, 1);
+const imageCleanupConcurrency = positiveIntegerEnv('IMAGE_CLEANUP_CONCURRENCY', 8, 1);
 const openAiChatTimeoutMs = Number(process.env.OPENAI_CHAT_TIMEOUT_MS || 10 * 60_000);
 const openAiQueuePollMs = 650;
 const openAiFixedSteps = 28;
@@ -173,7 +177,7 @@ async function route(req, res) {
       trimmedImages = trimImageCacheRecords(db);
       return db.settings;
     });
-    await removeStoredImages(trimmedImages);
+    scheduleStoredImageRemoval(trimmedImages);
     scheduleQueueDrain();
     sendJson(res, 200, settings);
     return;
@@ -1295,7 +1299,7 @@ async function clearImageCache(body) {
 
     return { deleted: deletedIds.size, remaining: db.images.length };
   });
-  await removeStoredImages(deletedImages);
+  scheduleStoredImageRemoval(deletedImages);
   return result;
 }
 
@@ -1333,13 +1337,13 @@ async function cleanupImageStorage() {
     .map((entry) => path.join(imageDir, entry.name))
     .filter((file) => !referencedFiles.has(path.resolve(file)));
 
-  await Promise.all(orphanFiles.map(async (file) => {
+  await runWithConcurrency(orphanFiles, imageCleanupConcurrency, async (file) => {
     try {
       await rm(file, { force: true });
     } catch (error) {
       console.error(`Failed to delete orphan cached image ${path.basename(file)}:`, error);
     }
-  }));
+  });
 
   if (trimmedImages.length || orphanFiles.length) {
     console.log(`Image cache cleanup removed ${trimmedImages.length} expired records and ${orphanFiles.length} orphan files.`);
@@ -1419,7 +1423,7 @@ async function importPackage(body) {
       images: db.images.length
     };
   });
-  await removeStoredImages(trimmedImages);
+  scheduleStoredImageRemoval(trimmedImages);
   return result;
 }
 
@@ -2355,14 +2359,52 @@ async function readStoredImage(image) {
 }
 
 async function removeStoredImages(images) {
-  await Promise.all(images.map(async (image) => {
-    if (!image.file) return;
+  await removeStoredImageBatch(normalizeStoredImageRemovalItems(images));
+}
+
+function scheduleStoredImageRemoval(images) {
+  const items = normalizeStoredImageRemovalItems(images);
+  if (!items.length) return;
+  storedImageRemovalQueue.push(...items);
+  if (storedImageRemovalRunning) return;
+  setTimeout(() => {
+    processStoredImageRemovalQueue().catch((error) => console.error('Failed to cleanup cached images:', error));
+  }, 0);
+}
+
+async function processStoredImageRemovalQueue() {
+  if (storedImageRemovalRunning) return;
+  storedImageRemovalRunning = true;
+  try {
+    while (storedImageRemovalQueue.length) {
+      const batch = storedImageRemovalQueue.splice(0, imageCleanupBatchSize);
+      await removeStoredImageBatch(batch);
+      await sleep(0);
+    }
+  } finally {
+    storedImageRemovalRunning = false;
+    if (storedImageRemovalQueue.length) {
+      setTimeout(() => {
+        processStoredImageRemovalQueue().catch((error) => console.error('Failed to cleanup cached images:', error));
+      }, 0);
+    }
+  }
+}
+
+function normalizeStoredImageRemovalItems(images) {
+  return (Array.isArray(images) ? images : [])
+    .filter((image) => image?.file)
+    .map((image) => ({ id: image.id || '', file: image.file }));
+}
+
+async function removeStoredImageBatch(images) {
+  await runWithConcurrency(images, imageCleanupConcurrency, async (image) => {
     try {
       await rm(imageFilePath(image.file), { force: true });
     } catch (error) {
       console.error(`Failed to delete cached image ${image.id}:`, error);
     }
-  }));
+  });
 }
 
 function imageStorageName(id, mimeType = '') {
@@ -2966,6 +3008,19 @@ function positiveIntegerEnv(name, fallback, min = 1) {
 function numberOrNull(value) {
   const number = Number(value);
   return Number.isFinite(number) ? number : null;
+}
+
+async function runWithConcurrency(items, concurrency, worker) {
+  const list = Array.isArray(items) ? items : [];
+  const workers = Math.min(Math.max(1, concurrency), list.length);
+  let index = 0;
+  await Promise.all(Array.from({ length: workers }, async () => {
+    while (index < list.length) {
+      const item = list[index];
+      index += 1;
+      await worker(item);
+    }
+  }));
 }
 
 function sleep(ms) {
