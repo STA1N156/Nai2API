@@ -2755,6 +2755,7 @@ function sendImage(res, statusCode, mimeType, buffer, extraHeaders = {}) {
     'content-type': mimeType,
     'cache-control': 'public, max-age=31536000, immutable',
     'content-length': buffer.length,
+    ...corsHeaders(),
     ...extraHeaders
   });
   res.end(buffer);
