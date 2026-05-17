@@ -1096,7 +1096,7 @@ function renderJob(job) {
     : '';
   const sourceText = job.source === 'direct' ? 'URL' : '网页';
   const accountText = job.accountRouteId ? `路由账号 #${job.accountRouteId}` : '路由账号 -';
-  const durationText = job.durationMs ? `耗时 ${formatDuration(job.durationMs)}` : '';
+  const durationText = jobDurationText(job);
   const queueText = job.status === 'queued' && job.queuePosition
     ? `排队中：第 ${job.queuePosition} / ${job.queuedCount} 个`
     : '';
@@ -1172,6 +1172,17 @@ function jobStatusClass(status) {
   if (status === 'failed') return 'danger';
   if (status === 'running') return 'active';
   return 'muted';
+}
+
+function jobDurationText(job = {}) {
+  const rawDuration = Number(job.durationMs);
+  if (Number.isFinite(rawDuration) && rawDuration >= 0) return `耗时 ${formatDuration(rawDuration)}`;
+  const started = Date.parse(job.createdAt || '');
+  if (!started) return '';
+  const terminal = ['done', 'failed'].includes(job.status);
+  const ended = terminal ? Date.parse(job.completedAt || job.updatedAt || '') : Date.now();
+  if (!ended || ended < started) return '';
+  return `耗时 ${formatDuration(ended - started)}`;
 }
 
 function handleImagePreview(event) {

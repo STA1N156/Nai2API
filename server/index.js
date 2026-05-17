@@ -1428,6 +1428,7 @@ async function cleanupStaleActiveJobs(reason = 'stale active job cleanup') {
       job.error = message;
       job.errorDetail = `${reason}: ${detail}`;
       job.updatedAt = new Date().toISOString();
+      job.completedAt = job.updatedAt;
       failedJobIds.push(job.id);
     });
     return {
@@ -1485,6 +1486,7 @@ async function cleanupInterruptedStartupJobs() {
           ? 'startup: running job was interrupted by server restart'
           : 'startup: job deadline expired before restart completed';
       job.updatedAt = updatedAt;
+      job.completedAt = updatedAt;
       failedJobIds.push(job.id);
     });
 
@@ -1689,6 +1691,7 @@ async function createJob(token, body, options = {}) {
           accountId: cached.accountId || '',
           createdAt: now,
           updatedAt: now,
+          completedAt: now,
           imageId: cached.id,
           error: '',
           errorDetail: ''
@@ -1770,6 +1773,7 @@ async function createDirectJob(token, request, cacheKey, options = {}) {
       deadlineAt: options.deadlineAt || '',
       createdAt: now,
       updatedAt: now,
+      completedAt: options.status === 'done' ? now : '',
       imageId: options.imageId || '',
       error: '',
       errorDetail: ''
@@ -1800,6 +1804,7 @@ async function markDirectJobRunning(jobId, reservation) {
     job.accountId = reservation.account?.id || '';
     job.cost = Number(reservation.cost || 0);
     job.accountCost = Number(reservation.accountCost || 0);
+    job.completedAt = '';
     job.error = '';
     job.errorDetail = '';
     job.updatedAt = new Date().toISOString();
@@ -1815,6 +1820,7 @@ async function markDirectJobFailed(jobId, message) {
     job.error = publicErrorMessage(detail);
     job.errorDetail = detail;
     job.updatedAt = new Date().toISOString();
+    job.completedAt = job.updatedAt;
   }, { collections: ['jobs'], dirtyRows: dirtyJobRows(jobId) });
   notifyJobWaiters(jobId, { error: publicErrorMessage(detail) });
 }
@@ -1851,6 +1857,7 @@ async function cancelQueuedOrRunningJob(jobId, message, detail = message) {
     job.error = publicMessage;
     job.errorDetail = detail;
     job.updatedAt = new Date().toISOString();
+    job.completedAt = job.updatedAt;
     changed = true;
   }, {
     collections: ['jobs', 'accounts', 'users', 'ledger'],
@@ -1919,6 +1926,7 @@ async function reserveQueuedJob(jobId) {
       job.error = '连接超时';
       job.errorDetail = detail;
       job.updatedAt = new Date().toISOString();
+      job.completedAt = job.updatedAt;
       return { skip: true, jobId: job.id };
     }
     const account = selectAccount(db.accounts, db.settings, { cost: accountCost });
@@ -1929,6 +1937,7 @@ async function reserveQueuedJob(jobId) {
         job.error = 'NovelAI账号点数不足';
         job.errorDetail = `No NovelAI account has enough quota for accountCost=${accountCost}`;
         job.updatedAt = new Date().toISOString();
+        job.completedAt = job.updatedAt;
         return { skip: true, jobId: job.id };
       }
       job.updatedAt = new Date().toISOString();
@@ -1940,6 +1949,7 @@ async function reserveQueuedJob(jobId) {
     }
     job.status = 'running';
     job.accountId = account?.id || '';
+    job.completedAt = '';
     job.updatedAt = new Date().toISOString();
     return { job, account: account ? { ...account } : null, token: job.userToken, cost: job.cost, accountCost, cacheKey: job.cacheKey || '' };
   }, {
@@ -2032,20 +2042,58 @@ function accountInflightTimeoutMs() {
   return Number.isFinite(configured) && configured > 0 ? Math.max(1000, Math.floor(configured)) : 10 * 60 * 1000;
 }
 
+function novelAiGenerateSlowLogMs() {
+  const configured = Number(process.env.NOVELAI_GENERATE_SLOW_LOG_MS || 3000);
+  return Number.isFinite(configured) && configured >= 0 ? Math.floor(configured) : 3000;
+}
+
+function novelAiGenerateLogDetail(reservation, account, attempt, image = null) {
+  const timings = image?.timings || {};
+  return [
+    `job=${runtimeId(reservation?.job?.id)}`,
+    `attempt=${attempt}`,
+    `route=${account?.routeId || '-'}`,
+    `account=${runtimeId(account?.id)}`,
+    `proxy=${account?.proxyUrl ? 1 : 0}`,
+    timings.responseMs === undefined ? '' : `responseMs=${timings.responseMs}`,
+    timings.readMs === undefined ? '' : `readMs=${timings.readMs}`,
+    timings.decodeMs === undefined ? '' : `decodeMs=${timings.decodeMs}`,
+    timings.bytes === undefined ? '' : `bytes=${timings.bytes}`
+  ].filter(Boolean).join(' ');
+}
+
+function runtimeId(value = '') {
+  const text = String(value || '');
+  if (!text) return '-';
+  if (text.length <= 14) return text;
+  return `${text.slice(0, 8)}…${text.slice(-4)}`;
+}
+
+function shortRuntimeError(error) {
+  return String(publicErrorMessage(error?.message || error || 'unknown error'))
+    .replace(/\s+/g, '_')
+    .slice(0, 120);
+}
+
 async function generateWithAccountRetry(reservation, request, options = {}) {
   const tried = new Set();
   let firstError = null;
   let current = reservation;
+  let attempt = 0;
 
   while (true) {
     if (options.signal?.aborted) throw options.signal.reason || new Error('direct generate timeout');
     if (current.account?.id) tried.add(current.account.id);
+    attempt += 1;
+    const startedAt = Date.now();
     try {
       const image = await generateNovelAiImage(request, current.account, process.env, { signal: options.signal });
+      runtimeSlowLog('NovelAI generate', startedAt, novelAiGenerateLogDetail(reservation, current.account, attempt, image), novelAiGenerateSlowLogMs());
       reservation.account = current.account;
       return image;
     } catch (error) {
       if (options.signal?.aborted || isAbortError(error)) throw error;
+      runtimeSlowLog('NovelAI generate retry', startedAt, `${novelAiGenerateLogDetail(reservation, current.account, attempt)} error=${shortRuntimeError(error)}`, 0);
       if (!firstError) firstError = error;
       const next = await retryReservationWithNextAccount(current, error, tried, options);
       if (!next) {
@@ -2088,6 +2136,7 @@ async function retryReservationWithNextAccount(reservation, error, tried, option
       if (job) {
         job.status = 'running';
         job.accountId = account.id;
+        job.completedAt = '';
         job.error = '';
         job.errorDetail = '';
         job.updatedAt = new Date().toISOString();
@@ -2118,6 +2167,7 @@ async function requeueReservedJob(reservation, error) {
     if (job) {
       job.status = 'queued';
       job.accountId = '';
+      job.completedAt = '';
       job.error = '';
       job.errorDetail = '';
       job.retryCount = Number(job.retryCount || 0) + 1;
@@ -2244,6 +2294,7 @@ async function completeGeneration(reservation, request, image, meta = {}) {
           job.error = '';
           job.errorDetail = '';
           job.updatedAt = new Date().toISOString();
+          job.completedAt = job.updatedAt;
         }
       }
 
@@ -2287,6 +2338,7 @@ async function cancelReservedJob(reservation, error) {
     job.error = message;
     job.errorDetail = detail || 'job aborted';
     job.updatedAt = new Date().toISOString();
+    job.completedAt = job.updatedAt;
     changed = true;
   }, {
     collections: ['jobs', 'accounts', 'users', 'ledger'],
@@ -2320,6 +2372,7 @@ async function failGeneration(reservation, error) {
         job.error = message;
         job.errorDetail = detail;
         job.updatedAt = new Date().toISOString();
+        job.completedAt = job.updatedAt;
       }
     }
     db.ledger.unshift({
@@ -2706,7 +2759,8 @@ function publicJob(job, db = null) {
     queuedCount: queue.total,
     durationMs: jobDurationMs(job),
     createdAt: job.createdAt,
-    updatedAt: job.updatedAt
+    updatedAt: job.updatedAt,
+    completedAt: job.completedAt || (['done', 'failed'].includes(job.status) ? job.updatedAt : '')
   };
 }
 
@@ -2731,7 +2785,7 @@ function jobDurationMs(job) {
   const started = Date.parse(job.createdAt || '');
   if (!started) return 0;
   const terminal = ['done', 'failed'].includes(job.status);
-  const ended = terminal ? Date.parse(job.updatedAt || '') : Date.now();
+  const ended = terminal ? Date.parse(job.completedAt || job.updatedAt || '') : Date.now();
   if (!ended || ended < started) return 0;
   return ended - started;
 }
@@ -2884,6 +2938,7 @@ function publicErrorLog(job, db = {}) {
     request: errorLogRequest(request),
     createdAt: job.createdAt,
     updatedAt: job.updatedAt,
+    completedAt: job.completedAt || (['done', 'failed'].includes(job.status) ? job.updatedAt : ''),
     beijingDate: beijingDateKey(Date.parse(job.updatedAt || job.createdAt || ''))
   };
 }
@@ -3395,9 +3450,9 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function runtimeSlowLog(label, startedAt, detail = '') {
+function runtimeSlowLog(label, startedAt, detail = '', thresholdMs = 500) {
   const duration = Date.now() - startedAt;
-  if (duration < 500) return;
+  if (duration < thresholdMs) return;
   console.log(`[runtime] slow ${label}: ${duration}ms${detail ? ` (${detail})` : ''}`);
 }
 
@@ -3440,6 +3495,8 @@ function shouldLogRuntimeRequest(method, pathname) {
   if (pathname === '/' || pathname === '/admin' || pathname === '/admin.html') return true;
   if (pathname.endsWith('.js') || pathname.endsWith('.css')) return true;
   if (pathname === '/api/health' || pathname === '/api/settings') return true;
+  if (pathname === '/api/jobs' || pathname.startsWith('/api/jobs/')) return true;
+  if (pathname === '/generate' || pathname === '/v1/chat/completions') return true;
   if (pathname.startsWith('/api/admin/')) return true;
   return false;
 }

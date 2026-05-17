@@ -76,6 +76,8 @@ export async function generateNovelAiImage(request, account, env, options = {}) 
   }
 
   const baseUrl = (env.NOVELAI_API_URL || 'https://image.novelai.net').replace(/\/$/, '');
+  const proxyUrl = accountProxyUrl(account);
+  const requestStartedAt = Date.now();
   const response = await novelAiFetch(`${baseUrl}/ai/generate-image`, {
     method: 'POST',
     signal: options.signal,
@@ -93,30 +95,48 @@ export async function generateNovelAiImage(request, account, env, options = {}) 
       model: request.model,
       parameters: buildNovelAiParameters(request)
     })
-  }, accountProxyUrl(account));
+  }, proxyUrl);
+  const responseMs = Date.now() - requestStartedAt;
 
   const contentType = response.headers.get('content-type') || '';
+  const readStartedAt = Date.now();
   const buffer = Buffer.from(await response.arrayBuffer());
+  const readMs = Date.now() - readStartedAt;
 
   if (!response.ok) {
     const text = buffer.toString('utf8').slice(0, 1000);
     throw new Error(`NovelAI returned ${response.status}: ${text}`);
   }
 
+  const decodeStartedAt = Date.now();
+  const timings = {
+    responseMs,
+    readMs,
+    decodeMs: 0,
+    bytes: buffer.length,
+    proxied: Boolean(proxyUrl)
+  };
+
   if (contentType.includes('application/json')) {
     const payload = JSON.parse(buffer.toString('utf8'));
     const base64 = payload.image || payload.data || payload.images?.[0];
     if (!base64) throw new Error('NovelAI JSON response does not contain image data.');
-    return decodeDataUrl(base64);
+    const image = decodeDataUrl(base64);
+    timings.decodeMs = Date.now() - decodeStartedAt;
+    return { ...image, timings };
   }
 
   if (contentType.includes('zip') || looksLikeZip(buffer)) {
-    return extractFirstImageFromZip(buffer);
+    const image = extractFirstImageFromZip(buffer);
+    timings.decodeMs = Date.now() - decodeStartedAt;
+    return { ...image, timings };
   }
 
+  timings.decodeMs = Date.now() - decodeStartedAt;
   return {
     mimeType: contentType.includes('jpeg') ? 'image/jpeg' : 'image/png',
-    buffer
+    buffer,
+    timings
   };
 }
 

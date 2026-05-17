@@ -451,14 +451,18 @@ function resetQueueView(job = {}) {
 function updateQueueView(job = {}) {
   const total = Math.max(1, Number(job.queuedCount || 1));
   const target = Math.max(1, Number(job.queuePosition || 1));
+  let restartFastForward = false;
   if (!state.queueView) {
     state.queueView = { position: 1, target, count: total, completing: false, fastForward: target > 1 };
+    restartFastForward = state.queueView.fastForward;
   } else {
+    const wasFastForward = Boolean(state.queueView.fastForward || state.queueView.completing);
     state.queueView.count = Math.max(Number(state.queueView.count || 0), total);
     state.queueView.target = Math.max(Number(state.queueView.target || 0), target);
     state.queueView.fastForward = state.queueView.position < state.queueView.target;
+    restartFastForward = !wasFastForward && state.queueView.fastForward;
   }
-  ensureQueueViewTimer();
+  ensureQueueViewTimer(restartFastForward);
   return state.queueView;
 }
 
@@ -504,12 +508,16 @@ function finishQueueView(job = {}) {
     clearInterval(state.queueViewTimer);
     state.queueViewTimer = null;
   }
-  ensureQueueViewTimer();
+  ensureQueueViewTimer(true);
   renderQueueText();
   return true;
 }
 
-function ensureQueueViewTimer() {
+function ensureQueueViewTimer(restart = false) {
+  if (restart && state.queueViewTimer) {
+    clearInterval(state.queueViewTimer);
+    state.queueViewTimer = null;
+  }
   if (state.queueViewTimer) return;
   state.queueViewTimer = setInterval(() => {
     if (!state.queueView) {
