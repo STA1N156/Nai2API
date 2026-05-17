@@ -1,5 +1,5 @@
 import { createWriteStream } from 'node:fs';
-import { copyFile, mkdir, readFile, rename, unlink } from 'node:fs/promises';
+import { copyFile, mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import crypto from 'node:crypto';
 import path from 'node:path';
 
