@@ -18,20 +18,7 @@ let queueDrainTimer = null;
 let queueDraining = false;
 let queueDrainRequested = false;
 const jobWaiters = new Map();
-const userGenerateGateReservations = new Map();
-const userGenerateGateWaiters = new Map();
-let userGenerateGateLock = Promise.resolve();
-let storedImageRemovalQueue = [];
-let storedImageRemovalRunning = false;
-let imageCacheTrimTimer = null;
 const directGenerateTimeoutMs = Number(process.env.DIRECT_GENERATE_TIMEOUT_MS || 60_000);
-const userGenerateConcurrency = positiveIntegerEnv('USER_GENERATE_CONCURRENCY', 5, 1);
-const userGenerateGatePollMs = positiveIntegerEnv('USER_GENERATE_GATE_POLL_MS', 1000, 250);
-const imageCleanupBatchSize = positiveIntegerEnv('IMAGE_CLEANUP_BATCH_SIZE', 50, 1);
-const imageCleanupConcurrency = positiveIntegerEnv('IMAGE_CLEANUP_CONCURRENCY', 2, 1);
-const imageCleanupBatchDelayMs = positiveIntegerEnv('IMAGE_CLEANUP_BATCH_DELAY_MS', 100, 0);
-const imageCacheTrimDelayMs = positiveIntegerEnv('IMAGE_CACHE_TRIM_DELAY_MS', 60_000, 0);
-const startupImageCleanupDelayMs = positiveIntegerEnv('IMAGE_CLEANUP_STARTUP_DELAY_MS', 300_000, 0);
 const openAiChatTimeoutMs = Number(process.env.OPENAI_CHAT_TIMEOUT_MS || 10 * 60_000);
 const openAiQueuePollMs = 650;
 const openAiFixedSteps = 28;
@@ -73,9 +60,7 @@ await mkdir(imageDir, { recursive: true });
 await migrateInlineImages();
 await ensureAccountRouteIds();
 await applyRuntimeSettings();
-setTimeout(() => {
-  cleanupImageStorage().catch((error) => console.error('Failed to cleanup image storage:', error));
-}, startupImageCleanupDelayMs);
+await cleanupImageStorage().catch((error) => console.error('Failed to cleanup image storage:', error));
 
 const server = http.createServer(async (req, res) => {
   try {
@@ -101,12 +86,11 @@ server.listen(port, host, () => {
 
 async function applyRuntimeSettings() {
   const publicBaseUrl = normalizePublicBaseUrl(process.env.PUBLIC_BASE_URL || '');
-  await store.updateSettings((settings) => {
-    if (publicBaseUrl && !settings.publicBaseUrl) settings.publicBaseUrl = publicBaseUrl;
-    if (!settings.defaultArtist || settings.defaultArtist === legacyDefaultArtist) {
-      settings.defaultArtist = defaultArtist2_5D;
+  await store.update((db) => {
+    if (publicBaseUrl && !db.settings.publicBaseUrl) db.settings.publicBaseUrl = publicBaseUrl;
+    if (!db.settings.defaultArtist || db.settings.defaultArtist === legacyDefaultArtist) {
+      db.settings.defaultArtist = defaultArtist2_5D;
     }
-    return settings;
   });
 }
 
@@ -167,19 +151,24 @@ async function route(req, res) {
   if (method === 'PUT' && url.pathname === '/api/settings') {
     assertAdmin(req, url);
     const body = await readJson(req);
-    const settings = await store.updateSettings((currentSettings) => ({
-      ...currentSettings,
-      ...body,
-      costPerImage: 1,
-      publicBaseUrl: normalizePublicBaseUrl(body.publicBaseUrl ?? currentSettings.publicBaseUrl ?? ''),
-      maxCacheImages: clamp(Number(body.maxCacheImages ?? currentSettings.maxCacheImages ?? 500), 0, MAX_CACHE_IMAGES_LIMIT),
-      accountConcurrency: 1,
-      defaults: {
-        ...(currentSettings.defaults || {}),
-        ...(body.defaults || {})
-      }
-    }));
-    scheduleImageCacheTrim();
+    let trimmedImages = [];
+    const settings = await store.update((db) => {
+      db.settings = {
+        ...db.settings,
+        ...body,
+        costPerImage: 1,
+        publicBaseUrl: normalizePublicBaseUrl(body.publicBaseUrl ?? db.settings.publicBaseUrl ?? ''),
+        maxCacheImages: clamp(Number(body.maxCacheImages ?? db.settings.maxCacheImages ?? 500), 0, MAX_CACHE_IMAGES_LIMIT),
+        accountConcurrency: 1,
+        defaults: {
+          ...(db.settings.defaults || {}),
+          ...(body.defaults || {})
+        }
+      };
+      trimmedImages = trimImageCacheRecords(db);
+      return db.settings;
+    });
+    await removeStoredImages(trimmedImages);
     scheduleQueueDrain();
     sendJson(res, 200, settings);
     return;
@@ -424,7 +413,7 @@ async function route(req, res) {
   if (method === 'POST' && url.pathname === '/api/jobs') {
     const body = await readJson(req);
     const token = String(body.token || tokenFrom(req, url) || '');
-    const job = await createGatedJob(token, body);
+    const job = await createJob(token, body);
     scheduleQueueDrain();
     const snapshot = await store.findJobContext(job.id);
     sendJson(res, 202, publicJob(snapshot?.job || job, snapshot));
@@ -493,12 +482,10 @@ async function handleDirectGenerate(url, res) {
     }
   }
 
-  const releaseGateReservation = await acquireUserGenerateGate(token);
   const deadline = Date.now() + directGenerateTimeoutMs;
   let directJob = null;
   try {
     directJob = await createDirectJob(token, request, cacheKey, { deadlineAt: new Date(deadline).toISOString() });
-    releaseGateReservation();
     scheduleQueueDrain();
     const result = await waitForJobResult(directJob.id, deadline);
     if (!result) {
@@ -513,7 +500,6 @@ async function handleDirectGenerate(url, res) {
       'x-balance': String(result.balance ?? '')
     });
   } catch (error) {
-    releaseGateReservation();
     if (directJob) {
       if (isInsufficientBalanceError(error)) {
         await removeJob(directJob.id);
@@ -539,7 +525,7 @@ async function handleOpenAiChatCompletion(req, res) {
   const body = await readJson(req);
   const settings = await store.readSettings();
   const parsed = parseOpenAiImageRequest(body, settings);
-  const job = await createGatedJob(token, parsed.request);
+  const job = await createJob(token, parsed.request);
   scheduleQueueDrain();
 
   if (body.stream === true) {
@@ -1301,7 +1287,7 @@ async function clearImageCache(body) {
 
     return { deleted: deletedIds.size, remaining: db.images.length };
   });
-  scheduleStoredImageRemoval(deletedImages);
+  await removeStoredImages(deletedImages);
   return result;
 }
 
@@ -1314,19 +1300,6 @@ async function clearRequestLogs() {
       remaining: db.jobs.length
     };
   }, { flush: true });
-}
-
-function scheduleImageCacheTrim(delay = imageCacheTrimDelayMs) {
-  if (imageCacheTrimTimer) clearTimeout(imageCacheTrimTimer);
-  imageCacheTrimTimer = setTimeout(() => {
-    imageCacheTrimTimer = null;
-    trimImageCacheInBackground().catch((error) => console.error('Failed to trim image cache:', error));
-  }, delay);
-}
-
-async function trimImageCacheInBackground() {
-  const trimmedImages = await store.update((db) => trimImageCacheRecords(db)) || [];
-  scheduleStoredImageRemoval(trimmedImages);
 }
 
 async function cleanupImageStorage() {
@@ -1352,13 +1325,13 @@ async function cleanupImageStorage() {
     .map((entry) => path.join(imageDir, entry.name))
     .filter((file) => !referencedFiles.has(path.resolve(file)));
 
-  await runWithConcurrency(orphanFiles, imageCleanupConcurrency, async (file) => {
+  await Promise.all(orphanFiles.map(async (file) => {
     try {
       await rm(file, { force: true });
     } catch (error) {
       console.error(`Failed to delete orphan cached image ${path.basename(file)}:`, error);
     }
-  });
+  }));
 
   if (trimmedImages.length || orphanFiles.length) {
     console.log(`Image cache cleanup removed ${trimmedImages.length} expired records and ${orphanFiles.length} orphan files.`);
@@ -1438,7 +1411,7 @@ async function importPackage(body) {
       images: db.images.length
     };
   });
-  scheduleStoredImageRemoval(trimmedImages);
+  await removeStoredImages(trimmedImages);
   return result;
 }
 
@@ -1453,15 +1426,6 @@ async function updateAccount(id, body) {
     account.updatedAt = new Date().toISOString();
     return account;
   });
-}
-
-async function createGatedJob(token, body) {
-  const releaseGateReservation = await acquireUserGenerateGate(token);
-  try {
-    return await createJob(token, body);
-  } finally {
-    releaseGateReservation();
-  }
 }
 
 async function createJob(token, body) {
@@ -1595,43 +1559,34 @@ async function markDirectJobRunning(jobId, reservation) {
 
 async function markDirectJobFailed(jobId, message) {
   const detail = errorDetailMessage(message);
-  const token = await store.update((db) => {
+  await store.update((db) => {
     const job = db.jobs.find((item) => item.id === jobId);
     if (!job) return;
-    const userToken = job.userToken;
     job.status = 'failed';
     job.error = publicErrorMessage(detail);
     job.errorDetail = detail;
     job.updatedAt = new Date().toISOString();
-    return userToken;
   });
-  if (token) notifyUserGenerateGate(token);
   notifyJobWaiters(jobId, { error: publicErrorMessage(detail) });
 }
 
 async function removeJob(jobId) {
-  const token = await store.update((db) => {
-    const job = db.jobs.find((item) => item.id === jobId);
+  await store.update((db) => {
     db.jobs = db.jobs.filter((job) => job.id !== jobId);
-    return job?.userToken || '';
   });
-  if (token) notifyUserGenerateGate(token);
 }
 
 async function timeoutDirectJob(jobId) {
-  const token = await store.update((db) => {
+  await store.update((db) => {
     const job = db.jobs.find((item) => item.id === jobId);
     if (!job || ['done', 'failed'].includes(job.status)) return;
     if (job.status !== 'queued') return;
-    const userToken = job.userToken;
     refundJob(db, job, '连接超时');
     job.status = 'failed';
     job.error = '连接超时';
     job.errorDetail = 'direct generate timeout';
     job.updatedAt = new Date().toISOString();
-    return userToken;
   });
-  if (token) notifyUserGenerateGate(token);
 }
 
 function waitForJobResult(jobId, deadline) {
@@ -1662,90 +1617,6 @@ function removeJobWaiter(jobId, waiter) {
   if (!waiters) return;
   waiters.delete(waiter);
   if (!waiters.size) jobWaiters.delete(jobId);
-}
-
-async function acquireUserGenerateGate(token) {
-  const key = String(token || '').trim();
-  if (!key) return () => {};
-
-  while (true) {
-    const release = await tryReserveUserGenerateGate(key);
-    if (release) return release;
-    await waitForUserGenerateGate(key);
-  }
-}
-
-async function tryReserveUserGenerateGate(token) {
-  return withUserGenerateGateLock(async () => {
-    const db = await store.readCollections(['jobs']);
-    const active = activeUserJobCount(db.jobs || [], token) + userGenerateGateReservationCount(token);
-    if (active >= userGenerateConcurrency) return null;
-
-    addUserGenerateGateReservation(token);
-    let released = false;
-    return () => {
-      if (released) return;
-      released = true;
-      releaseUserGenerateGateReservation(token);
-    };
-  });
-}
-
-async function withUserGenerateGateLock(fn) {
-  const previous = userGenerateGateLock;
-  let unlock = () => {};
-  userGenerateGateLock = new Promise((resolve) => {
-    unlock = resolve;
-  });
-  await previous.catch(() => {});
-  try {
-    return await fn();
-  } finally {
-    unlock();
-  }
-}
-
-function addUserGenerateGateReservation(token) {
-  userGenerateGateReservations.set(token, userGenerateGateReservationCount(token) + 1);
-}
-
-function releaseUserGenerateGateReservation(token) {
-  const next = userGenerateGateReservationCount(token) - 1;
-  if (next > 0) {
-    userGenerateGateReservations.set(token, next);
-  } else {
-    userGenerateGateReservations.delete(token);
-  }
-  notifyUserGenerateGate(token);
-}
-
-function userGenerateGateReservationCount(token) {
-  return Number(userGenerateGateReservations.get(token) || 0);
-}
-
-function waitForUserGenerateGate(token) {
-  return new Promise((resolve) => {
-    let done = null;
-    const timer = setTimeout(() => done?.(), userGenerateGatePollMs);
-    done = () => {
-      clearTimeout(timer);
-      const waiters = userGenerateGateWaiters.get(token);
-      if (waiters) {
-        waiters.delete(done);
-        if (!waiters.size) userGenerateGateWaiters.delete(token);
-      }
-      resolve();
-    };
-    if (!userGenerateGateWaiters.has(token)) userGenerateGateWaiters.set(token, new Set());
-    userGenerateGateWaiters.get(token).add(done);
-  });
-}
-
-function notifyUserGenerateGate(token) {
-  const waiters = userGenerateGateWaiters.get(token);
-  if (!waiters) return;
-  userGenerateGateWaiters.delete(token);
-  waiters.forEach((done) => done());
 }
 
 async function runJob(jobId) {
@@ -2033,7 +1904,6 @@ async function completeGeneration(reservation, request, image, meta = {}) {
   }
   await removeStoredImages(trimmedImages);
   scheduleQueueDrain();
-  notifyUserGenerateGate(reservation.token);
   if (meta.jobId) notifyJobWaiters(meta.jobId, { saved: savedImage, image, balance: savedImage.balance });
   return savedImage;
 }
@@ -2072,7 +1942,6 @@ async function failGeneration(reservation, error) {
     });
   });
   scheduleQueueDrain();
-  notifyUserGenerateGate(reservation.token);
   if (reservation.job?.id) notifyJobWaiters(reservation.job.id, { error: message });
 }
 
@@ -2374,52 +2243,14 @@ async function readStoredImage(image) {
 }
 
 async function removeStoredImages(images) {
-  await removeStoredImageBatch(normalizeStoredImageRemovalItems(images));
-}
-
-function scheduleStoredImageRemoval(images) {
-  const items = normalizeStoredImageRemovalItems(images);
-  if (!items.length) return;
-  storedImageRemovalQueue.push(...items);
-  if (storedImageRemovalRunning) return;
-  setTimeout(() => {
-    processStoredImageRemovalQueue().catch((error) => console.error('Failed to cleanup cached images:', error));
-  }, 0);
-}
-
-async function processStoredImageRemovalQueue() {
-  if (storedImageRemovalRunning) return;
-  storedImageRemovalRunning = true;
-  try {
-    while (storedImageRemovalQueue.length) {
-      const batch = storedImageRemovalQueue.splice(0, imageCleanupBatchSize);
-      await removeStoredImageBatch(batch);
-      await sleep(imageCleanupBatchDelayMs);
-    }
-  } finally {
-    storedImageRemovalRunning = false;
-    if (storedImageRemovalQueue.length) {
-      setTimeout(() => {
-        processStoredImageRemovalQueue().catch((error) => console.error('Failed to cleanup cached images:', error));
-      }, 0);
-    }
-  }
-}
-
-function normalizeStoredImageRemovalItems(images) {
-  return (Array.isArray(images) ? images : [])
-    .filter((image) => image?.file)
-    .map((image) => ({ id: image.id || '', file: image.file }));
-}
-
-async function removeStoredImageBatch(images) {
-  await runWithConcurrency(images, imageCleanupConcurrency, async (image) => {
+  await Promise.all(images.map(async (image) => {
+    if (!image.file) return;
     try {
       await rm(imageFilePath(image.file), { force: true });
     } catch (error) {
       console.error(`Failed to delete cached image ${image.id}:`, error);
     }
-  });
+  }));
 }
 
 function imageStorageName(id, mimeType = '') {
@@ -2509,10 +2340,6 @@ function jobDurationMs(job) {
 
 function activeJobCount(jobs) {
   return jobs.filter((job) => ['queued', 'running'].includes(job.status)).length;
-}
-
-function activeUserJobCount(jobs, token) {
-  return jobs.filter((job) => job.userToken === token && ['queued', 'running'].includes(job.status)).length;
 }
 
 function isExpiredJob(job) {
@@ -2928,7 +2755,6 @@ function sendImage(res, statusCode, mimeType, buffer, extraHeaders = {}) {
     'content-type': mimeType,
     'cache-control': 'public, max-age=31536000, immutable',
     'content-length': buffer.length,
-    ...corsHeaders(),
     ...extraHeaders
   });
   res.end(buffer);
@@ -3014,28 +2840,9 @@ function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
 }
 
-function positiveIntegerEnv(name, fallback, min = 1) {
-  const value = Number(process.env[name]);
-  if (!Number.isFinite(value)) return fallback;
-  return Math.max(min, Math.floor(value));
-}
-
 function numberOrNull(value) {
   const number = Number(value);
   return Number.isFinite(number) ? number : null;
-}
-
-async function runWithConcurrency(items, concurrency, worker) {
-  const list = Array.isArray(items) ? items : [];
-  const workers = Math.min(Math.max(1, concurrency), list.length);
-  let index = 0;
-  await Promise.all(Array.from({ length: workers }, async () => {
-    while (index < list.length) {
-      const item = list[index];
-      index += 1;
-      await worker(item);
-    }
-  }));
 }
 
 function sleep(ms) {
