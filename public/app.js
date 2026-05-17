@@ -52,7 +52,7 @@ const maxUrlSteps = 28;
 const defaultSteps = 28;
 const jobPollIntervalMs = 450;
 const queueStepIntervalMs = 75;
-const queueCompleteStepIntervalMs = 20;
+const queueCompleteStepIntervalMs = 10;
 const artistPresets = {
   '2.5d': {
     label: '2.5D唯美风',
