@@ -234,6 +234,7 @@ async function route(req, res) {
       imageCount: db.imageCount ?? db.images.length,
       imageTotal: db.imageCount ?? db.images.length,
       cacheImageCount: db.imageCount ?? db.images.length,
+      requestStats1m: requestStatsSince(db.jobs, 60 * 1000),
       jobStats1h: jobStatsSince(db.jobs, 60 * 60 * 1000),
       usageHourlyDays: hourlyUsageStatsByDay(db.jobs),
       errorLogs: errorLogs(db.jobs, db, 100),
@@ -2676,6 +2677,15 @@ function jobStatsSince(jobs, rangeMs) {
     if (job.status === 'failed') stats.failed += 1;
     return stats;
   }, { done: 0, failed: 0 }));
+}
+
+function requestStatsSince(jobs, rangeMs) {
+  const since = Date.now() - rangeMs;
+  const total = jobs.reduce((sum, job) => {
+    const createdAt = Date.parse(job.createdAt || '');
+    return createdAt && createdAt >= since ? sum + 1 : sum;
+  }, 0);
+  return { total };
 }
 
 function accountStatsSince(accountId, jobs, rangeMs) {
