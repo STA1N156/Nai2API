@@ -2530,10 +2530,7 @@ function stableQueueProgress(job, jobs) {
   const now = Date.now();
   const activeJobs = (Array.isArray(jobs) ? jobs : []).filter((item) => isQueueActiveJob(item, now));
   if (!isQueueActiveJob(job, now)) return { progress: 0, total: 0 };
-  const total = Math.max(1, Math.min(
-    Number(job.queueTotal || 0) || activeJobs.length || 1,
-    activeJobs.length || 1
-  ));
+  const total = Math.max(1, Number(job.queueTotal || 0) || activeJobs.length || 1);
   const createdAt = Date.parse(job.createdAt || '') || 0;
   const activeAhead = activeJobs.filter((item) => {
     if (item.id === job.id) return false;
@@ -2541,7 +2538,7 @@ function stableQueueProgress(job, jobs) {
     return itemTime <= createdAt;
   }).length;
   return {
-    progress: Math.max(1, Math.min(total, activeAhead + 1)),
+    progress: Math.max(1, Math.min(total, total - activeAhead)),
     total
   };
 }

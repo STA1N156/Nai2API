@@ -1,8 +1,10 @@
-FROM node:20-alpine
+FROM node:20-bookworm-slim
 
 WORKDIR /app
 
-COPY package.json ./
+COPY package*.json ./
+RUN npm ci --omit=dev
+
 COPY server ./server
 COPY public ./public
 

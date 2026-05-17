@@ -267,14 +267,14 @@ GET    /api/jobs/:id
 
 ## 数据存储
 
-Nai2API 使用 JSON 元数据 + 图片文件的方式存储，默认路径：
+Nai2API 使用 SQLite 元数据 + 图片文件的方式存储，默认路径：
 
 ```text
-/data/library.json
+/data/library.sqlite
 /data/images/
 ```
 
-`library.json` 包含：
+`library.sqlite` 包含：
 
 - 系统设置
 - 用户密钥和余额
@@ -284,7 +284,9 @@ Nai2API 使用 JSON 元数据 + 图片文件的方式存储，默认路径：
 - 图片缓存元数据
 - 操作流水
 
-真实图片文件存放在 `/data/images/`。这样高并发生成时不会把图片 base64 全部写进一个巨大的 JSON 文件，部署在 Zeabur 这类平台时更稳定。
+真实图片文件存放在 `/data/images/`。旧版本的 `/data/library.json` 会在第一次启动时自动导入到 `/data/library.sqlite`；迁移成功后，旧的 `library.json` / `library.json.bak` 会被删除来腾出空间。
+
+SQLite 会按记录写入数据，不再每次改余额、任务或图片缓存时重写整个 `library.json`，高并发生成时更稳。
 
 Docker Compose 已经挂载：
 
@@ -367,7 +369,7 @@ Volume ID: data
 Mount Directory: /data
 ```
 
-这一步很重要。Nai2API 的数据库文件在 `/data/library.json`，图片缓存文件在 `/data/images/`，不挂载 Volume 的话，服务重启或重新部署后数据可能回到初始状态。
+这一步很重要。Nai2API 的数据库文件在 `/data/library.sqlite`，图片缓存文件在 `/data/images/`，不挂载 Volume 的话，服务重启或重新部署后数据可能回到初始状态。
 
 注意：Zeabur 官方文档提示，挂载 Volume 后服务会变成有状态服务，重启时不能使用零停机切换，会有短暂中断；另外，挂载时目标目录会被清空，所以如果里面已有重要数据，需要先导出或备份。
 
@@ -398,7 +400,7 @@ Mount Directory: /data
 
 1. 停止本地服务，确保 `data/` 不再写入。
 2. 备份本地整个 `data/` 目录。
-3. 通过 Zeabur 文件管理或其他服务器文件方式上传到 `/data/library.json` 和 `/data/images/`。
+3. 通过 Zeabur 文件管理或其他服务器文件方式上传到 `/data/library.sqlite` 和 `/data/images/`。如果你手里是旧版 `/data/library.json`，也可以上传它，服务第一次启动会自动导入。
 4. 重启服务。
 
 ### 7. 上线后检查
@@ -427,7 +429,7 @@ https://你的域名/api/health
 ## 安全建议
 
 - 生产环境一定要修改 `ADMIN_TOKEN`。
-- 不要把 `.env`、`data/library.json`、NovelAI token 提交到公开仓库。
+- 不要把 `.env`、`data/library.sqlite`、`data/library.json`、NovelAI token 提交到公开仓库。
 - Zeabur 上把敏感配置放在 Variables，不写进代码。
 - 定期导出迁移包，或备份整个 `/data` 目录。
 - `MOCK_WHEN_NO_ACCOUNT=false`，避免线上没有账号时仍返回 mock 图。

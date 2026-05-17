@@ -450,12 +450,9 @@ function updateQueueView(job = {}) {
   if (!state.queueView) {
     state.queueView = { position: 1, target, count: total, completing: false, fastForward: target > 1 };
   } else {
-    state.queueView.count = total;
-    state.queueView.target = target;
-    if (state.queueView.position > target || state.queueView.position > total) {
-      state.queueView.position = target;
-    }
-    state.queueView.fastForward = state.queueView.position < target;
+    state.queueView.count = Math.max(Number(state.queueView.count || 0), total);
+    state.queueView.target = Math.max(Number(state.queueView.target || 0), target);
+    state.queueView.fastForward = state.queueView.position < state.queueView.target;
   }
   ensureQueueViewTimer();
   return state.queueView;
