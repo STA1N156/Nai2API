@@ -1268,18 +1268,33 @@ async function api(path, options = {}) {
   const headers = {};
   if (options.body) headers['content-type'] = 'application/json';
   if (options.admin) headers['x-admin-token'] = state.adminToken;
-  const response = await fetch(path, {
-    method: options.method || 'GET',
-    headers,
-    body: options.body ? JSON.stringify(options.body) : undefined
-  });
-  const payload = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    const error = new Error(payload.error || `HTTP ${response.status}`);
-    error.status = response.status;
-    throw error;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), Number(options.timeoutMs || 20000));
+  try {
+    const response = await fetch(path, {
+      method: options.method || 'GET',
+      headers,
+      body: options.body ? JSON.stringify(options.body) : undefined,
+      signal: controller.signal
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      const error = new Error(payload.error || `HTTP ${response.status}`);
+      error.status = response.status;
+      throw error;
+    }
+    return payload;
+  } catch (error) {
+    throw normalizeNetworkError(error);
+  } finally {
+    clearTimeout(timer);
   }
-  return payload;
+}
+
+function normalizeNetworkError(error) {
+  if (error?.name === 'AbortError') return new Error('连接后台超时，请刷新后重试');
+  if (/Failed to fetch|NetworkError/i.test(String(error?.message || ''))) return new Error('连接不到后台服务，请检查部署状态');
+  return error;
 }
 
 function normalizeErrorMessage(error) {

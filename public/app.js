@@ -118,7 +118,11 @@ const snippetParamOrder = [
   'noise_schedule'
 ];
 
-await boot();
+await boot().catch((error) => {
+  console.error(error);
+  renderFrameNotice('连接服务超时，请刷新重试', true);
+  showToast(normalizeFetchError(error), true);
+});
 
 async function boot() {
   populateArtistPresetOptions();
@@ -739,19 +743,34 @@ function generationCost() {
 }
 
 async function api(path, options = {}) {
-  const response = await fetch(path, {
-    method: options.method || 'GET',
-    headers: options.body ? { 'content-type': 'application/json' } : undefined,
-    body: options.body ? JSON.stringify(options.body) : undefined
-  });
-  const text = await response.text();
-  const payload = text ? safeJson(text) : {};
-  if (!response.ok) {
-    const error = new Error(payload.error || text || `HTTP ${response.status}`);
-    error.status = response.status;
-    throw error;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), Number(options.timeoutMs || 15000));
+  try {
+    const response = await fetch(path, {
+      method: options.method || 'GET',
+      headers: options.body ? { 'content-type': 'application/json' } : undefined,
+      body: options.body ? JSON.stringify(options.body) : undefined,
+      signal: controller.signal
+    });
+    const text = await response.text();
+    const payload = text ? safeJson(text) : {};
+    if (!response.ok) {
+      const error = new Error(payload.error || text || `HTTP ${response.status}`);
+      error.status = response.status;
+      throw error;
+    }
+    return payload;
+  } catch (error) {
+    throw normalizeFetchError(error);
+  } finally {
+    clearTimeout(timer);
   }
-  return payload;
+}
+
+function normalizeFetchError(error) {
+  if (error?.name === 'AbortError') return new Error('连接服务超时，请稍后重试');
+  if (/Failed to fetch|NetworkError/i.test(String(error?.message || ''))) return new Error('连接不到服务，请检查部署状态');
+  return error;
 }
 
 function safeJson(text) {

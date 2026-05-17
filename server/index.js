@@ -67,6 +67,7 @@ await applyRuntimeSettings();
 await cleanupImageStorage().catch((error) => console.error('Failed to cleanup image storage:', error));
 
 const server = http.createServer(async (req, res) => {
+  attachRequestRuntimeLog(req, res);
   try {
     await route(req, res);
   } catch (error) {
@@ -3327,6 +3328,40 @@ function runtimeRequestLog(label, startedAt, detail = {}) {
     .map(([key, value]) => `${key}=${value}`)
     .join(' ');
   console.log(`[runtime] ${label}: total=${duration}ms${parts ? ` ${parts}` : ''}`);
+}
+
+function attachRequestRuntimeLog(req, res) {
+  const method = req.method || 'GET';
+  const pathname = requestPathname(req);
+  if (!shouldLogRuntimeRequest(method, pathname)) return;
+  const startedAt = Date.now();
+  console.log(`[runtime] request start ${method} ${pathname}`);
+  let logged = false;
+  const finish = (event) => {
+    if (logged) return;
+    logged = true;
+    const status = Number(res.statusCode || 0);
+    console.log(`[runtime] request ${event} ${method} ${pathname}: status=${status} duration=${Date.now() - startedAt}ms`);
+  };
+  res.once('finish', () => finish('finish'));
+  res.once('close', () => finish('close'));
+}
+
+function requestPathname(req) {
+  try {
+    return new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`).pathname;
+  } catch {
+    return String(req.url || '');
+  }
+}
+
+function shouldLogRuntimeRequest(method, pathname) {
+  if (method === 'OPTIONS') return false;
+  if (pathname === '/' || pathname === '/admin' || pathname === '/admin.html') return true;
+  if (pathname.endsWith('.js') || pathname.endsWith('.css')) return true;
+  if (pathname === '/api/health' || pathname === '/api/settings') return true;
+  if (pathname.startsWith('/api/admin/')) return true;
+  return false;
 }
 
 function installRuntimeSafetyHandlers() {
