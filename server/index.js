@@ -18,6 +18,7 @@ let queueDrainTimer = null;
 let queueDraining = false;
 let queueDrainRequested = false;
 const jobWaiters = new Map();
+const runningJobControls = new Map();
 const directGenerateTimeoutMs = Number(process.env.DIRECT_GENERATE_TIMEOUT_MS || 60_000);
 const openAiChatTimeoutMs = Number(process.env.OPENAI_CHAT_TIMEOUT_MS || 10 * 60_000);
 const openAiQueuePollMs = 650;
@@ -335,6 +336,15 @@ async function route(req, res) {
     return;
   }
 
+  if (method === 'POST' && url.pathname === '/api/admin/accounts/proxies') {
+    assertAdmin(req, url);
+    const body = await readJson(req);
+    const result = await applyAccountProxies(body);
+    scheduleQueueDrain();
+    sendJson(res, 200, result);
+    return;
+  }
+
   if (method === 'DELETE' && url.pathname === '/api/admin/accounts') {
     assertAdmin(req, url);
     const body = await readJson(req);
@@ -489,7 +499,7 @@ async function handleDirectGenerate(url, res) {
     scheduleQueueDrain();
     const result = await waitForJobResult(directJob.id, deadline);
     if (!result) {
-      await timeoutDirectJob(directJob.id);
+      await timeoutJob(directJob.id);
       sendTimeoutImage(res);
       return;
     }
@@ -525,18 +535,21 @@ async function handleOpenAiChatCompletion(req, res) {
   const body = await readJson(req);
   const settings = await store.readSettings();
   const parsed = parseOpenAiImageRequest(body, settings);
-  const job = await createJob(token, parsed.request);
+  const deadline = Date.now() + openAiChatTimeoutMs;
+  const job = await createJob(token, parsed.request, { deadlineAt: new Date(deadline).toISOString() });
   scheduleQueueDrain();
 
   if (body.stream === true) {
-    await streamOpenAiImageJob(req, res, job, parsed.model);
+    await streamOpenAiImageJob(req, res, job, parsed.model, deadline);
     return;
   }
 
-  const deadline = Date.now() + openAiChatTimeoutMs;
   const result = await waitForJobResult(job.id, deadline);
-  if (!result) throw httpError(504, '连接超时');
-  if (result.error) throw httpError(500, result.error);
+  if (!result) {
+    await timeoutJob(job.id);
+    throw httpError(504, 'direct generate timeout');
+  }
+  if (result.error) throw httpError(isTimeoutResultMessage(result.error) ? 504 : 500, result.error);
 
   sendJson(res, 200, openAiChatCompletionResponse({
     model: parsed.model,
@@ -686,14 +699,12 @@ function appendFieldValue(current, value) {
   return `${current}\n${text}`;
 }
 
-async function streamOpenAiImageJob(req, res, job, model) {
+async function streamOpenAiImageJob(req, res, job, model, deadline = Date.now() + openAiChatTimeoutMs) {
   sendOpenAiStreamHeaders(res);
   const streamId = `chatcmpl-${job.id}`;
   writeOpenAiChunk(res, { id: streamId, model, content: '<think>\n任务已提交，正在进入队列\n' });
   let lastLine = '';
   let reachedRunning = false;
-  const deadline = Date.now() + openAiChatTimeoutMs;
-
   while (Date.now() < deadline) {
     const snapshot = await publicJobSnapshot(job.id);
     if (!snapshot) {
@@ -727,6 +738,7 @@ async function streamOpenAiImageJob(req, res, job, model) {
   }
 
   writeOpenAiChunk(res, { id: streamId, model, content: '连接超时\n</think>\n连接超时\n' });
+  await timeoutJob(job.id);
   finishOpenAiStream(res, streamId, model);
 }
 
@@ -950,6 +962,7 @@ async function addAccount(body) {
       routeId: nextAccountRouteId(db.accounts),
       name: String(body.name || `NovelAI ${db.accounts.length + 1}`).slice(0, 80),
       token,
+      proxyUrl: normalizeAccountProxyUrl(body.proxyUrl || body.socksProxy || body.proxy || ''),
       enabled: body.enabled !== false,
       weight: clamp(Number(body.weight || 1), 1, 100),
       inFlight: 0,
@@ -983,6 +996,7 @@ async function importAccounts(body) {
       routeId: Number(account.routeId || 0),
       name: String(account.name || `NovelAI imported ${index + 1}`).slice(0, 80),
       token: String(account.token || '').trim(),
+      proxyUrl: normalizeAccountProxyUrl(account.proxyUrl || account.socksProxy || account.proxy || ''),
       enabled: account.enabled !== false,
       weight: clamp(Number(account.weight || 1), 1, 100),
       inFlight: 0,
@@ -1021,6 +1035,34 @@ async function importAccounts(body) {
       note: `${mode} account import`
     });
     return db.accounts;
+  });
+}
+
+async function applyAccountProxies(body) {
+  const proxies = parseProxyLines(body.proxies || body.proxyText || body.text || body.proxy || '');
+  if (!proxies.length) throw httpError(400, 'no SOCKS5 proxies found.');
+  return store.update((db) => {
+    const ids = new Set(collectValues(body.ids || body.accounts));
+    const accounts = ids.size ? db.accounts.filter((account) => ids.has(account.id)) : db.accounts;
+    if (!accounts.length) throw httpError(ids.size ? 404 : 400, ids.size ? 'no matching accounts found.' : 'no accounts found.');
+    const now = new Date().toISOString();
+    const applied = Math.min(accounts.length, proxies.length);
+    for (let index = 0; index < applied; index += 1) {
+      accounts[index].proxyUrl = proxies[index];
+      accounts[index].updatedAt = now;
+    }
+    db.ledger.unshift({
+      id: createId('log'),
+      type: 'apply-account-proxies',
+      amount: applied,
+      at: now,
+      note: `Applied ${applied} SOCKS5 proxy setting(s)`
+    });
+    return {
+      applied,
+      proxies: proxies.length,
+      accounts: accounts.slice(0, applied)
+    };
   });
 }
 
@@ -1097,7 +1139,8 @@ async function refreshAccountQuotas(body) {
     const accounts = ids.size ? db.accounts.filter((account) => ids.has(account.id)) : db.accounts;
     return accounts.map((account) => ({
       id: account.id,
-      token: account.token
+      token: account.token,
+      proxyUrl: account.proxyUrl || ''
     }));
   });
   if (!targets.length) throw httpError(ids.size ? 404 : 400, ids.size ? 'no matching accounts found.' : 'no accounts found.');
@@ -1106,7 +1149,7 @@ async function refreshAccountQuotas(body) {
   const results = [];
   for (const target of targets) {
     try {
-      const quota = await fetchNovelAiAccountQuotaWithTimeout(target.token);
+      const quota = await fetchNovelAiAccountQuotaWithTimeout(target.token, target.proxyUrl);
       results.push(accountQuotaResult(target.id, quota, now));
     } catch (error) {
       results.push(accountQuotaErrorResult(target.id, error, now));
@@ -1139,7 +1182,7 @@ async function testAccount(id) {
   const now = new Date().toISOString();
   let result;
   try {
-    const quota = await fetchNovelAiAccountQuotaWithTimeout(target.token);
+    const quota = await fetchNovelAiAccountQuotaWithTimeout(target.token, target.proxyUrl);
     result = accountQuotaResult(target.id, quota, now);
   } catch (error) {
     result = accountQuotaErrorResult(target.id, error, now);
@@ -1198,6 +1241,7 @@ function applyAccountQuotaResult(account, result, now) {
   account.quotaTier = result.quotaTier;
   account.quotaCheckedAt = result.quotaCheckedAt;
   account.quotaError = result.quotaError;
+  if (result.ok) account.cooldownUntil = '';
   account.updatedAt = now;
 }
 
@@ -1237,11 +1281,14 @@ function accountTestMessage(result, availability) {
   return `测试通过：账号当前可用（${quotaText}）`;
 }
 
-async function fetchNovelAiAccountQuotaWithTimeout(token) {
+async function fetchNovelAiAccountQuotaWithTimeout(token, proxyUrl = '') {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 8000);
   try {
-    return await fetchNovelAiAccountQuota(token, process.env, { signal: controller.signal });
+    return await fetchNovelAiAccountQuota(token, process.env, {
+      signal: controller.signal,
+      proxyUrl
+    });
   } finally {
     clearTimeout(timer);
   }
@@ -1421,6 +1468,9 @@ async function updateAccount(id, body) {
     if (!account) throw httpError(404, 'account not found.');
     if (body.name !== undefined) account.name = String(body.name).slice(0, 80);
     if (body.token !== undefined && body.token) account.token = String(body.token).trim();
+    if (body.proxyUrl !== undefined || body.socksProxy !== undefined || body.proxy !== undefined) {
+      account.proxyUrl = normalizeAccountProxyUrl(body.proxyUrl || body.socksProxy || body.proxy || '');
+    }
     if (body.enabled !== undefined) account.enabled = Boolean(body.enabled);
     if (body.weight !== undefined) account.weight = clamp(Number(body.weight), 1, 100);
     account.updatedAt = new Date().toISOString();
@@ -1428,7 +1478,7 @@ async function updateAccount(id, body) {
   });
 }
 
-async function createJob(token, body) {
+async function createJob(token, body, options = {}) {
   return store.update((db) => {
     const user = getUserOrThrow(db, token);
     const request = normalizeNovelAiRequest(body, db.settings, { maxSteps: DIRECT_URL_MAX_STEPS });
@@ -1473,6 +1523,7 @@ async function createJob(token, body) {
       queueTotal,
       cost,
       accountCost,
+      deadlineAt: options.deadlineAt || '',
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
       imageId: '',
@@ -1576,17 +1627,37 @@ async function removeJob(jobId) {
   });
 }
 
-async function timeoutDirectJob(jobId) {
+async function timeoutJob(jobId) {
+  const control = runningJobControls.get(jobId);
+  if (control) {
+    abortRunningJob(jobId, 'direct generate timeout');
+    await control.done;
+    return;
+  }
+  await cancelQueuedOrRunningJob(jobId, 'direct generate timeout', 'job timed out before completion');
+}
+
+async function cancelQueuedOrRunningJob(jobId, message, detail = message) {
+  let changed = false;
+  const publicMessage = publicErrorMessage(message);
   await store.update((db) => {
     const job = db.jobs.find((item) => item.id === jobId);
     if (!job || ['done', 'failed'].includes(job.status)) return;
-    if (job.status !== 'queued') return;
-    refundJob(db, job, '连接超时');
+    const account = job.accountId ? db.accounts.find((item) => item.id === job.accountId) : null;
+    if (account) {
+      account.inFlight = Math.max(0, Number(account.inFlight || 0) - 1);
+      account.updatedAt = new Date().toISOString();
+    }
+    refundJob(db, job, publicMessage);
     job.status = 'failed';
-    job.error = '连接超时';
-    job.errorDetail = 'direct generate timeout';
+    job.error = publicMessage;
+    job.errorDetail = detail;
     job.updatedAt = new Date().toISOString();
+    changed = true;
   });
+  if (!changed) return;
+  scheduleQueueDrain();
+  notifyJobWaiters(jobId, { error: message });
 }
 
 function waitForJobResult(jobId, deadline) {
@@ -1610,6 +1681,10 @@ function notifyJobWaiters(jobId, payload) {
     clearTimeout(waiter.timer);
     waiter.resolve(payload);
   });
+}
+
+function isTimeoutResultMessage(message) {
+  return /direct generate timeout|job timed out|aborted|abort|timeout/i.test(String(message || ''));
 }
 
 function removeJobWaiter(jobId, waiter) {
@@ -1669,16 +1744,85 @@ async function reserveQueuedJob(jobId) {
 
 async function runReservedJob(reservation) {
   if (!reservation || reservation.skip || reservation.queued) return;
+  const control = createRunningJobControl(reservation.job);
   try {
-    const image = await generateWithAccountRetry(reservation, reservation.job.request);
+    const image = await generateWithAccountRetry(reservation, reservation.job.request, {
+      signal: control.controller.signal,
+      deadline: jobDeadlineTimestamp(reservation.job)
+    });
+    if (control.controller.signal.aborted) throw control.controller.signal.reason || new Error(control.reason || 'direct generate timeout');
     await completeGeneration(reservation, reservation.job.request, image, { jobId: reservation.job.id });
   } catch (error) {
+    if (control.controller.signal.aborted || isAbortError(error)) {
+      await cancelReservedJob(reservation, error);
+      return;
+    }
     if (isNovelAiCapacityError(error)) {
       await requeueReservedJob(reservation, error);
       return;
     }
     await failGeneration(reservation, error);
+  } finally {
+    finishRunningJobControl(reservation.job?.id, control);
   }
+}
+
+function createRunningJobControl(job = {}) {
+  const controller = new AbortController();
+  let resolveDone = () => {};
+  const control = {
+    controller,
+    done: new Promise((resolve) => {
+      resolveDone = resolve;
+    }),
+    resolveDone,
+    reason: '',
+    timer: null
+  };
+  const jobId = job?.id || '';
+  if (!jobId) return control;
+  const delay = runningJobTimeoutDelay(job);
+  control.timer = setTimeout(() => abortRunningJob(jobId, 'direct generate timeout'), delay);
+  runningJobControls.set(jobId, control);
+  return control;
+}
+
+function finishRunningJobControl(jobId, control) {
+  if (!control) return;
+  if (control.timer) clearTimeout(control.timer);
+  if (jobId && runningJobControls.get(jobId) === control) runningJobControls.delete(jobId);
+  control.resolveDone();
+}
+
+function abortRunningJob(jobId, reason = 'direct generate timeout') {
+  const control = runningJobControls.get(jobId);
+  if (!control) return false;
+  control.reason = reason;
+  if (!control.controller.signal.aborted) control.controller.abort(new Error(reason));
+  return true;
+}
+
+function runningJobTimeoutDelay(job = {}) {
+  const deadline = jobDeadlineTimestamp(job);
+  const delays = [novelAiGenerateTimeoutMs()];
+  if (deadline) delays.push(Math.max(1, deadline - Date.now()));
+  return Math.max(1, Math.min(...delays));
+}
+
+function jobDeadlineTimestamp(job = {}) {
+  const deadline = Date.parse(job.deadlineAt || '');
+  return Number.isFinite(deadline) && deadline > 0 ? deadline : 0;
+}
+
+function novelAiGenerateTimeoutMs() {
+  const configured = Number(process.env.NOVELAI_GENERATE_TIMEOUT_MS || 0);
+  if (Number.isFinite(configured) && configured > 0) return Math.max(1000, Math.floor(configured));
+  return Math.max(1, accountInflightTimeoutMs() - 1000);
+}
+
+function accountInflightTimeoutMs() {
+  const configured = Number(process.env.ACCOUNT_INFLIGHT_TIMEOUT_MS || 10 * 60 * 1000);
+  return Number.isFinite(configured) && configured > 0 ? Math.max(1000, Math.floor(configured)) : 10 * 60 * 1000;
 }
 
 async function generateWithAccountRetry(reservation, request, options = {}) {
@@ -1687,13 +1831,14 @@ async function generateWithAccountRetry(reservation, request, options = {}) {
   let current = reservation;
 
   while (true) {
+    if (options.signal?.aborted) throw options.signal.reason || new Error('direct generate timeout');
     if (current.account?.id) tried.add(current.account.id);
     try {
       const image = await generateNovelAiImage(request, current.account, process.env, { signal: options.signal });
       reservation.account = current.account;
       return image;
     } catch (error) {
-      if (isAbortError(error)) throw error;
+      if (options.signal?.aborted || isAbortError(error)) throw error;
       if (!firstError) firstError = error;
       const next = await retryReservationWithNextAccount(current, error, tried, options);
       if (!next) {
@@ -1735,6 +1880,7 @@ async function retryReservationWithNextAccount(reservation, error, tried, option
       const job = db.jobs.find((item) => item.id === reservation.job.id);
       if (job) {
         job.status = 'running';
+        job.accountId = account.id;
         job.error = '';
         job.errorDetail = '';
         job.updatedAt = new Date().toISOString();
@@ -1906,6 +2052,31 @@ async function completeGeneration(reservation, request, image, meta = {}) {
   scheduleQueueDrain();
   if (meta.jobId) notifyJobWaiters(meta.jobId, { saved: savedImage, image, balance: savedImage.balance });
   return savedImage;
+}
+
+async function cancelReservedJob(reservation, error) {
+  const detail = errorDetailMessage(error);
+  const waiterMessage = error?.message || detail || 'direct generate timeout';
+  const message = publicErrorMessage(waiterMessage);
+  let changed = false;
+  await store.update((db) => {
+    const account = reservation.account ? db.accounts.find((item) => item.id === reservation.account.id) : null;
+    if (account) {
+      account.inFlight = Math.max(0, Number(account.inFlight || 0) - 1);
+      account.updatedAt = new Date().toISOString();
+    }
+    const job = reservation.job?.id ? db.jobs.find((item) => item.id === reservation.job.id) : null;
+    if (!job || ['done', 'failed'].includes(job.status)) return;
+    refundJob(db, job, message);
+    job.status = 'failed';
+    job.error = message;
+    job.errorDetail = detail || 'job aborted';
+    job.updatedAt = new Date().toISOString();
+    changed = true;
+  });
+  if (!changed) return;
+  scheduleQueueDrain();
+  if (reservation.job?.id) notifyJobWaiters(reservation.job.id, { error: waiterMessage });
 }
 
 async function failGeneration(reservation, error) {
@@ -2082,7 +2253,7 @@ function hasAccountWithEnoughQuota(accounts, cost = 1) {
 }
 
 function resetStaleAccountLoads(accounts) {
-  const staleAfterMs = Number(process.env.ACCOUNT_INFLIGHT_TIMEOUT_MS || 10 * 60 * 1000);
+  const staleAfterMs = accountInflightTimeoutMs();
   const now = Date.now();
   accounts.forEach((account) => {
     if (account.cooldownUntil && Date.parse(account.cooldownUntil) <= now) account.cooldownUntil = '';
@@ -2175,6 +2346,8 @@ function publicAccount(account, options = {}) {
     routeId: account.routeId || 0,
     name: account.name,
     token: options.revealToken ? account.token : maskToken(account.token),
+    proxyUrl: options.revealToken ? account.proxyUrl || '' : maskProxyUrl(account.proxyUrl || ''),
+    hasProxy: Boolean(account.proxyUrl),
     enabled: account.enabled !== false,
     weight: account.weight || 1,
     inFlight: account.inFlight || 0,
@@ -2198,6 +2371,7 @@ function exportAccount(account) {
     routeId: account.routeId || 0,
     name: account.name,
     token: account.token,
+    proxyUrl: account.proxyUrl || '',
     enabled: account.enabled !== false,
     weight: account.weight || 1,
     total: account.total || 0,
@@ -2672,13 +2846,74 @@ function parseImportedAccounts(body) {
     .map((line, index) => line.trim())
     .filter(Boolean)
     .map((line, index) => {
-      const [name, token, weight] = line.includes(',') ? line.split(',').map((part) => part.trim()) : ['', line, ''];
+      const parts = line.includes(',') ? line.split(',').map((part) => part.trim()) : ['', line, '', ''];
+      const [name, token, third, fourth] = parts;
+      const proxyUrl = looksLikeProxyUrl(third) ? third : '';
+      const weight = proxyUrl ? fourth : third;
       return {
         name: name || `NovelAI imported ${index + 1}`,
         token: token || line,
+        proxyUrl,
         weight: weight ? Number(weight) : 1
       };
     });
+}
+
+function normalizeAccountProxyUrl(value = '') {
+  const text = String(value || '').trim();
+  if (!text) return '';
+  const rawProxy = parseHostPortUserPassProxy(text);
+  if (rawProxy) return rawProxy;
+  const withScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(text) ? text : `socks5://${text}`;
+  let url;
+  try {
+    url = new URL(withScheme.replace(/^sock5:\/\//i, 'socks5://'));
+  } catch {
+    throw httpError(400, 'invalid SOCKS5 proxy URL.');
+  }
+  if (!['socks5:', 'socks5h:'].includes(url.protocol)) {
+    throw httpError(400, 'only socks5:// and socks5h:// proxies are supported.');
+  }
+  if (!url.hostname) throw httpError(400, 'SOCKS5 proxy host is required.');
+  if (!url.port) url.port = '1080';
+  return url.toString();
+}
+
+function parseProxyLines(value = '') {
+  return String(value || '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => normalizeAccountProxyUrl(line));
+}
+
+function parseHostPortUserPassProxy(value = '') {
+  const parts = String(value || '').trim().split(':');
+  if (parts.length !== 4) return '';
+  const [host, port, username, password] = parts.map((part) => part.trim());
+  if (!host || !port || !username || !password || !/^\d{1,5}$/.test(port)) return '';
+  const url = new URL(`socks5://${host}:${port}`);
+  url.username = username;
+  url.password = password;
+  return url.toString();
+}
+
+function looksLikeProxyUrl(value = '') {
+  const text = String(value || '').trim();
+  return Boolean(text && (/^(sock5|socks5h?):\/\//i.test(text) || /^[^:@\s]+:\d{2,5}$/i.test(text) || /^[^:\s]+:\d{2,5}:[^:\s]+:.+/.test(text)));
+}
+
+function maskProxyUrl(value = '') {
+  const text = String(value || '').trim();
+  if (!text) return '';
+  try {
+    const url = new URL(text);
+    if (url.password) url.password = '******';
+    if (url.username) url.username = `${url.username.slice(0, 2)}***`;
+    return url.toString();
+  } catch {
+    return text.replace(/:\/\/([^:@]+):([^@]+)@/, '://$1:******@');
+  }
 }
 
 function mergeById(current, incoming) {

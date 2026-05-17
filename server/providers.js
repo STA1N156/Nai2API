@@ -1,3 +1,5 @@
+import net from 'node:net';
+import tls from 'node:tls';
 import zlib from 'node:zlib';
 
 export const MAX_STEPS = 50;
@@ -74,7 +76,7 @@ export async function generateNovelAiImage(request, account, env, options = {}) 
   }
 
   const baseUrl = (env.NOVELAI_API_URL || 'https://image.novelai.net').replace(/\/$/, '');
-  const response = await fetch(`${baseUrl}/ai/generate-image`, {
+  const response = await novelAiFetch(`${baseUrl}/ai/generate-image`, {
     method: 'POST',
     signal: options.signal,
     headers: {
@@ -91,7 +93,7 @@ export async function generateNovelAiImage(request, account, env, options = {}) 
       model: request.model,
       parameters: buildNovelAiParameters(request)
     })
-  });
+  }, accountProxyUrl(account));
 
   const contentType = response.headers.get('content-type') || '';
   const buffer = Buffer.from(await response.arrayBuffer());
@@ -121,7 +123,7 @@ export async function generateNovelAiImage(request, account, env, options = {}) 
 export async function fetchNovelAiAccountQuota(token, env = {}, options = {}) {
   if (!token) throw new Error('NovelAI account token is required.');
   const baseUrl = (env.NOVELAI_ACCOUNT_API_URL || 'https://api.novelai.net').replace(/\/$/, '');
-  const response = await fetch(`${baseUrl}/user/data`, {
+  const response = await novelAiFetch(`${baseUrl}/user/data`, {
     method: 'GET',
     signal: options.signal,
     headers: {
@@ -131,7 +133,7 @@ export async function fetchNovelAiAccountQuota(token, env = {}, options = {}) {
       referer: 'https://novelai.net/',
       'user-agent': 'Mozilla/5.0 Nai2API/1.0'
     }
-  });
+  }, normalizeSocksProxyUrl(options.proxyUrl || ''));
 
   const text = await response.text();
   if (!response.ok) {
@@ -162,6 +164,341 @@ export async function fetchNovelAiAccountQuota(token, env = {}, options = {}) {
     tier: subscription.tier ?? subscription.subscriptionTier ?? payload.tier ?? null,
     raw: payload
   };
+}
+
+async function novelAiFetch(url, options = {}, proxyUrl = '') {
+  const normalizedProxy = normalizeSocksProxyUrl(proxyUrl);
+  if (!normalizedProxy) return fetch(url, options);
+  return socksFetch(url, options, normalizedProxy);
+}
+
+function accountProxyUrl(account = {}) {
+  return normalizeSocksProxyUrl(account.proxyUrl || account.socksProxy || account.proxy || '');
+}
+
+function normalizeSocksProxyUrl(value = '') {
+  const text = String(value || '').trim();
+  if (!text) return '';
+  const rawProxy = parseHostPortUserPassProxy(text);
+  if (rawProxy) return rawProxy;
+  const withScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(text) ? text : `socks5://${text}`;
+  const normalized = withScheme.replace(/^sock5:\/\//i, 'socks5://');
+  let url;
+  try {
+    url = new URL(normalized);
+  } catch {
+    throw new Error('Invalid SOCKS5 proxy URL.');
+  }
+  if (!['socks5:', 'socks5h:'].includes(url.protocol)) {
+    throw new Error('Only socks5:// and socks5h:// proxies are supported.');
+  }
+  if (!url.hostname) throw new Error('SOCKS5 proxy host is required.');
+  if (!url.port) url.port = '1080';
+  return url.toString();
+}
+
+function parseHostPortUserPassProxy(value = '') {
+  const parts = String(value || '').trim().split(':');
+  if (parts.length !== 4) return '';
+  const [host, port, username, password] = parts.map((part) => part.trim());
+  if (!host || !port || !username || !password || !/^\d{1,5}$/.test(port)) return '';
+  const url = new URL(`socks5://${host}:${port}`);
+  url.username = username;
+  url.password = password;
+  return url.toString();
+}
+
+async function socksFetch(url, options = {}, proxyUrl = '') {
+  const target = new URL(url);
+  if (target.protocol !== 'https:') throw new Error('SOCKS5 proxy requests only support HTTPS targets.');
+  const proxy = new URL(proxyUrl);
+  const port = Number(target.port || 443);
+  const tunnel = await connectSocks5(proxy, target.hostname, port, options.signal);
+  const socket = await connectTls(tunnel, target.hostname, options.signal);
+  try {
+    const request = buildHttpRequest(target, options);
+    const response = await writeAndReadHttpResponse(socket, request, options.signal);
+    return response;
+  } catch (error) {
+    socket.destroy();
+    throw error;
+  }
+}
+
+async function connectSocks5(proxy, targetHost, targetPort, signal) {
+  const socket = net.connect({
+    host: proxy.hostname,
+    port: Number(proxy.port || 1080)
+  });
+  const abort = () => socket.destroy(abortError(signal?.reason));
+  if (signal?.aborted) abort();
+  signal?.addEventListener('abort', abort, { once: true });
+
+  try {
+    await waitForSocket(socket, 'connect', signal);
+    const username = decodeURIComponent(proxy.username || '');
+    const password = decodeURIComponent(proxy.password || '');
+    const methods = username || password ? [0x00, 0x02] : [0x00];
+    socket.write(Buffer.from([0x05, methods.length, ...methods]));
+
+    const greeting = await readExact(socket, 2, signal);
+    if (greeting[0] !== 0x05 || greeting[1] === 0xff) throw new Error('SOCKS5 proxy rejected authentication methods.');
+    if (greeting[1] === 0x02) await authenticateSocks5(socket, username, password, signal);
+    if (greeting[1] !== 0x00 && greeting[1] !== 0x02) throw new Error(`SOCKS5 proxy selected unsupported auth method ${greeting[1]}.`);
+
+    socket.write(buildSocks5ConnectRequest(targetHost, targetPort));
+    const header = await readExact(socket, 4, signal);
+    if (header[0] !== 0x05) throw new Error('Invalid SOCKS5 proxy response.');
+    if (header[1] !== 0x00) throw new Error(`SOCKS5 proxy connect failed with code ${header[1]}.`);
+    const addressLength = socks5AddressLength(header[3], socket, signal);
+    await addressLength;
+    signal?.removeEventListener('abort', abort);
+    return socket;
+  } catch (error) {
+    signal?.removeEventListener('abort', abort);
+    socket.destroy();
+    throw error;
+  }
+}
+
+async function authenticateSocks5(socket, username, password, signal) {
+  const user = Buffer.from(username, 'utf8');
+  const pass = Buffer.from(password, 'utf8');
+  if (user.length > 255 || pass.length > 255) throw new Error('SOCKS5 proxy username/password is too long.');
+  socket.write(Buffer.concat([
+    Buffer.from([0x01, user.length]),
+    user,
+    Buffer.from([pass.length]),
+    pass
+  ]));
+  const response = await readExact(socket, 2, signal);
+  if (response[1] !== 0x00) throw new Error('SOCKS5 proxy authentication failed.');
+}
+
+function buildSocks5ConnectRequest(host, port) {
+  const hostBuffer = Buffer.from(host, 'utf8');
+  if (hostBuffer.length > 255) throw new Error('Target host is too long for SOCKS5.');
+  return Buffer.concat([
+    Buffer.from([0x05, 0x01, 0x00, 0x03, hostBuffer.length]),
+    hostBuffer,
+    Buffer.from([(port >> 8) & 0xff, port & 0xff])
+  ]);
+}
+
+async function socks5AddressLength(type, socket, signal) {
+  if (type === 0x01) {
+    await readExact(socket, 4 + 2, signal);
+    return;
+  }
+  if (type === 0x03) {
+    const length = await readExact(socket, 1, signal);
+    await readExact(socket, length[0] + 2, signal);
+    return;
+  }
+  if (type === 0x04) {
+    await readExact(socket, 16 + 2, signal);
+    return;
+  }
+  throw new Error(`Unsupported SOCKS5 address type ${type}.`);
+}
+
+async function connectTls(tunnel, host, signal) {
+  const socket = tls.connect({
+    socket: tunnel,
+    servername: host,
+    ALPNProtocols: ['http/1.1']
+  });
+  await waitForSocket(socket, 'secureConnect', signal);
+  return socket;
+}
+
+function buildHttpRequest(target, options = {}) {
+  const method = String(options.method || 'GET').toUpperCase();
+  const body = options.body === undefined || options.body === null ? Buffer.alloc(0) : Buffer.from(String(options.body));
+  const headers = new Map();
+  Object.entries(options.headers || {}).forEach(([key, value]) => {
+    if (value !== undefined && value !== null) headers.set(key.toLowerCase(), String(value));
+  });
+  headers.set('host', target.host);
+  headers.set('connection', 'close');
+  if (body.length && !headers.has('content-length')) headers.set('content-length', String(body.length));
+
+  const path = `${target.pathname || '/'}${target.search || ''}`;
+  const headerLines = [`${method} ${path} HTTP/1.1`];
+  headers.forEach((value, key) => headerLines.push(`${key}: ${value}`));
+  return Buffer.concat([
+    Buffer.from(`${headerLines.join('\r\n')}\r\n\r\n`, 'utf8'),
+    body
+  ]);
+}
+
+function writeAndReadHttpResponse(socket, request, signal) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    const abort = () => rejectAndClose(abortError(signal?.reason));
+    const cleanup = () => {
+      signal?.removeEventListener('abort', abort);
+      socket.off('data', onData);
+      socket.off('end', onEnd);
+      socket.off('error', onError);
+    };
+    const rejectAndClose = (error) => {
+      cleanup();
+      socket.destroy();
+      reject(error);
+    };
+    const onData = (chunk) => chunks.push(chunk);
+    const onEnd = () => {
+      cleanup();
+      try {
+        resolve(parseHttpResponse(Buffer.concat(chunks)));
+      } catch (error) {
+        reject(error);
+      }
+    };
+    const onError = (error) => rejectAndClose(error);
+
+    if (signal?.aborted) return abort();
+    signal?.addEventListener('abort', abort, { once: true });
+    socket.on('data', onData);
+    socket.once('end', onEnd);
+    socket.once('error', onError);
+    socket.end(request);
+  });
+}
+
+function parseHttpResponse(buffer) {
+  const headerEnd = buffer.indexOf('\r\n\r\n');
+  if (headerEnd < 0) throw new Error('Invalid HTTP response from NovelAI.');
+  const headerText = buffer.slice(0, headerEnd).toString('latin1');
+  const [statusLine, ...headerLines] = headerText.split('\r\n');
+  const status = Number(statusLine.match(/^HTTP\/\d(?:\.\d)?\s+(\d+)/)?.[1] || 0);
+  if (!status) throw new Error('Invalid HTTP status from NovelAI.');
+  const headers = new Map();
+  headerLines.forEach((line) => {
+    const index = line.indexOf(':');
+    if (index <= 0) return;
+    const key = line.slice(0, index).trim().toLowerCase();
+    const value = line.slice(index + 1).trim();
+    headers.set(key, headers.has(key) ? `${headers.get(key)}, ${value}` : value);
+  });
+
+  let body = buffer.slice(headerEnd + 4);
+  if (/chunked/i.test(headers.get('transfer-encoding') || '')) body = decodeChunkedBody(body);
+  const contentLength = Number(headers.get('content-length') || 0);
+  if (contentLength > 0 && body.length > contentLength) body = body.slice(0, contentLength);
+
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    headers: {
+      get(name) {
+        return headers.get(String(name || '').toLowerCase()) || '';
+      }
+    },
+    async arrayBuffer() {
+      return body;
+    },
+    async text() {
+      return body.toString('utf8');
+    }
+  };
+}
+
+function decodeChunkedBody(buffer) {
+  const chunks = [];
+  let offset = 0;
+  while (offset < buffer.length) {
+    const lineEnd = buffer.indexOf('\r\n', offset);
+    if (lineEnd < 0) throw new Error('Invalid chunked response from NovelAI.');
+    const sizeText = buffer.slice(offset, lineEnd).toString('latin1').split(';')[0].trim();
+    const size = Number.parseInt(sizeText, 16);
+    if (!Number.isFinite(size)) throw new Error('Invalid chunk size from NovelAI.');
+    offset = lineEnd + 2;
+    if (size === 0) break;
+    chunks.push(buffer.slice(offset, offset + size));
+    offset += size + 2;
+  }
+  return Buffer.concat(chunks);
+}
+
+function waitForSocket(socket, event, signal) {
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      signal?.removeEventListener('abort', onAbort);
+      socket.off(event, onReady);
+      socket.off('error', onError);
+    };
+    const onReady = () => {
+      cleanup();
+      resolve();
+    };
+    const onError = (error) => {
+      cleanup();
+      reject(error);
+    };
+    const onAbort = () => {
+      cleanup();
+      socket.destroy();
+      reject(abortError(signal?.reason));
+    };
+    if (signal?.aborted) return onAbort();
+    signal?.addEventListener('abort', onAbort, { once: true });
+    socket.once(event, onReady);
+    socket.once('error', onError);
+  });
+}
+
+function readExact(socket, length, signal) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let total = 0;
+    const cleanup = () => {
+      signal?.removeEventListener('abort', onAbort);
+      socket.off('readable', onReadable);
+      socket.off('end', onEnd);
+      socket.off('error', onError);
+    };
+    const finish = () => {
+      cleanup();
+      resolve(Buffer.concat(chunks, length));
+    };
+    const onReadable = () => {
+      let chunk;
+      while (total < length && (chunk = socket.read(length - total)) !== null) {
+        chunks.push(chunk);
+        total += chunk.length;
+      }
+      if (total >= length) finish();
+    };
+    const onEnd = () => {
+      cleanup();
+      reject(new Error('SOCKS5 proxy closed the connection early.'));
+    };
+    const onError = (error) => {
+      cleanup();
+      reject(error);
+    };
+    const onAbort = () => {
+      cleanup();
+      socket.destroy();
+      reject(abortError(signal?.reason));
+    };
+
+    if (signal?.aborted) return onAbort();
+    signal?.addEventListener('abort', onAbort, { once: true });
+    socket.on('readable', onReadable);
+    socket.once('end', onEnd);
+    socket.once('error', onError);
+    onReadable();
+  });
+}
+
+function abortError(reason) {
+  if (reason instanceof Error) return reason;
+  const error = new Error('This operation was aborted');
+  error.name = 'AbortError';
+  return error;
 }
 
 function buildNovelAiParameters(request) {

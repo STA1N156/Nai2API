@@ -129,17 +129,28 @@
               Persistent API Token
               <textarea id="accountToken" class="codebox" rows="3" placeholder="pst-..."></textarea>
             </label>
+            <label>
+              SOCKS5 Proxy
+              <input id="accountProxy" placeholder="socks5://user:pass@127.0.0.1:1080" />
+            </label>
             <div class="button-row">
               <button id="addAccountBtn" class="primary">加入账号池</button>
               <button id="exportAccountsBtn" class="secondary">导出账号</button>
             </div>
             <label>
               批量导入 token
-              <textarea id="accountImportText" class="codebox" rows="4" placeholder="每行一个 token，也支持：备注,token,权重"></textarea>
+              <textarea id="accountImportText" class="codebox" rows="4" placeholder="每行一个 token，也支持：备注,token,proxy,权重"></textarea>
             </label>
             <div class="button-row">
               <button id="importAccountsBtn" class="secondary">追加导入</button>
               <button id="replaceAccountsBtn" class="ghost">覆盖导入</button>
+            </div>
+            <label>
+              SOCKS5 Proxy List
+              <textarea id="accountProxyImportText" class="codebox" rows="5" placeholder="45.41.173.217:6584:STA1N156:156456aa"></textarea>
+            </label>
+            <div class="button-row">
+              <button id="applyAccountProxiesBtn" class="secondary">按顺序应用代理</button>
             </div>
           </section>
 

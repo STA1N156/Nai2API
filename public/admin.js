@@ -49,11 +49,14 @@ const ids = [
   'saveSettingsBtn',
   'accountName',
   'accountToken',
+  'accountProxy',
   'addAccountBtn',
   'exportAccountsBtn',
   'accountImportText',
   'importAccountsBtn',
   'replaceAccountsBtn',
+  'accountProxyImportText',
+  'applyAccountProxiesBtn',
   'exportPackageBtn',
   'packageFile',
   'packageImportText',
@@ -121,6 +124,7 @@ function bindEvents() {
   el.exportAccountsBtn.addEventListener('click', exportAccounts);
   el.importAccountsBtn.addEventListener('click', () => importAccounts('append'));
   el.replaceAccountsBtn.addEventListener('click', () => importAccounts('replace'));
+  el.applyAccountProxiesBtn.addEventListener('click', applyAccountProxies);
   el.exportPackageBtn.addEventListener('click', exportPackage);
   el.packageFile.addEventListener('change', loadPackageFile);
   el.importPackageMergeBtn.addEventListener('click', () => importPackage('merge'));
@@ -280,10 +284,12 @@ async function addAccount() {
       admin: true,
       body: {
         name: el.accountName.value.trim(),
-        token: el.accountToken.value.trim()
+        token: el.accountToken.value.trim(),
+        proxyUrl: el.accountProxy.value.trim()
       }
     });
     el.accountToken.value = '';
+    el.accountProxy.value = '';
     showToast('账号已加入池');
     await refreshAdmin();
   } catch (error) {
@@ -295,7 +301,7 @@ async function exportAccounts() {
   try {
     const data = await api('/api/admin/accounts/export', { admin: true });
     downloadJson(`novelai-accounts-${dateStamp()}.json`, data);
-    el.accountImportText.value = data.accounts.map((account) => account.token).join('\n');
+    el.accountImportText.value = data.accounts.map((account) => [account.name || '', account.token, account.proxyUrl || '', account.weight || 1].join(',')).join('\n');
     showToast('账号 token 已导出');
   } catch (error) {
     showToast(normalizeErrorMessage(error), true);
@@ -313,6 +319,22 @@ async function importAccounts(mode) {
       body: { mode, tokens }
     });
     showToast(`账号池现在有 ${data.accounts.length} 个账号`);
+    await refreshAdmin();
+  } catch (error) {
+    showToast(normalizeErrorMessage(error), true);
+  }
+}
+
+async function applyAccountProxies() {
+  try {
+    const proxies = el.accountProxyImportText.value.trim();
+    if (!proxies) return showToast('请先粘贴 SOCKS5 代理', true);
+    const data = await api('/api/admin/accounts/proxies', {
+      method: 'POST',
+      admin: true,
+      body: { proxies }
+    });
+    showToast(`已给 ${data.applied} 个账号应用代理`);
     await refreshAdmin();
   } catch (error) {
     showToast(normalizeErrorMessage(error), true);
@@ -1025,6 +1047,7 @@ function renderAccount(account) {
   const statusClass = account.enabled ? 'ok' : 'muted';
   const lastUsed = account.lastUsedAt ? `最近使用 ${formatDate(account.lastUsedAt)}` : '尚未使用';
   const stats1h = account.stats1h || { done: 0, failed: 0, total: 0, successRate: 0 };
+  const proxyText = account.proxyUrl ? `SOCKS5 ${account.proxyUrl}` : 'SOCKS5 -';
   const quotaText = account.quotaError
     ? '点数查询失败'
     : account.quotaPoints === null || account.quotaPoints === undefined
@@ -1038,6 +1061,7 @@ function renderAccount(account) {
         <span class="status-badge ${statusClass}">${status}</span>
       </div>
       <span class="token-text">${escapeHtml(account.token)}</span>
+      <span class="token-text">${escapeHtml(proxyText)}</span>
       <span>${lastUsed}</span>
     </div>
     <div class="row-stats">
