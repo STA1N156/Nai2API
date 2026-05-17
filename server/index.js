@@ -57,11 +57,13 @@ const openAiSizeTiers = {
 const insufficientBalanceMessage = '密钥额度不足，无法生成图片。';
 
 await store.init();
+await cleanupStaleActiveJobs('startup');
 await mkdir(imageDir, { recursive: true });
 await migrateInlineImages();
 await ensureAccountRouteIds();
 await applyRuntimeSettings();
 await cleanupImageStorage().catch((error) => console.error('Failed to cleanup image storage:', error));
+scheduleQueueDrain();
 
 const server = http.createServer(async (req, res) => {
   try {
@@ -1350,6 +1352,38 @@ async function clearRequestLogs() {
   }, { flush: true });
 }
 
+async function cleanupStaleActiveJobs(reason = 'stale active job cleanup') {
+  const result = await store.update((db) => {
+    const now = Date.now();
+    const failedJobIds = [];
+    const message = publicErrorMessage('direct generate timeout');
+    const jobs = Array.isArray(db.jobs) ? db.jobs : [];
+    jobs.forEach((job) => {
+      if (!isStaleActiveJob(job, now)) return;
+      const detail = staleActiveJobDetail(job, now);
+      const account = job.accountId ? db.accounts.find((item) => item.id === job.accountId) : null;
+      if (account) {
+        account.inFlight = Math.max(0, Number(account.inFlight || 0) - 1);
+        account.updatedAt = new Date().toISOString();
+      }
+      refundJob(db, job, message);
+      job.status = 'failed';
+      job.error = message;
+      job.errorDetail = `${reason}: ${detail}`;
+      job.updatedAt = new Date().toISOString();
+      failedJobIds.push(job.id);
+    });
+    return {
+      changed: failedJobIds.length,
+      jobIds: failedJobIds
+    };
+  }, { flush: true });
+
+  if (!result?.changed) return result;
+  result.jobIds.forEach((jobId) => notifyJobWaiters(jobId, { error: 'direct generate timeout' }));
+  return result;
+}
+
 async function cleanupImageStorage() {
   const trimmedImages = await store.update((db) => trimImageCacheRecords(db), { flush: true }) || [];
   await removeStoredImages(trimmedImages);
@@ -1480,6 +1514,7 @@ async function updateAccount(id, body) {
 }
 
 async function createJob(token, body, options = {}) {
+  await cleanupStaleActiveJobs('create job');
   return store.update((db) => {
     const user = getUserOrThrow(db, token);
     const request = normalizeNovelAiRequest(body, db.settings, { maxSteps: DIRECT_URL_MAX_STEPS });
@@ -1551,6 +1586,7 @@ async function ensureAccountRouteIds() {
 }
 
 async function createDirectJob(token, request, cacheKey, options = {}) {
+  if (options.status !== 'done') await cleanupStaleActiveJobs('create direct job');
   return store.update((db) => {
     const user = getUserOrThrow(db, token);
     const cost = Number(options.cost ?? generationCost(request));
@@ -1711,11 +1747,12 @@ async function reserveQueuedJob(jobId) {
     if (job.status !== 'queued') return { skip: true };
     const accountCost = jobAccountCost(job);
     job.accountCost = accountCost;
-    if (isExpiredJob(job)) {
+    if (isStaleActiveJob(job)) {
+      const detail = staleActiveJobDetail(job);
       refundJob(db, job, '连接超时');
       job.status = 'failed';
       job.error = '连接超时';
-      job.errorDetail = 'job deadline expired before account reservation';
+      job.errorDetail = detail;
       job.updatedAt = new Date().toISOString();
       return { skip: true };
     }
@@ -2490,16 +2527,21 @@ function publicJob(job, db = null) {
 }
 
 function stableQueueProgress(job, jobs) {
-  const total = Math.max(1, Number(job.queueTotal || 0));
+  const now = Date.now();
+  const activeJobs = (Array.isArray(jobs) ? jobs : []).filter((item) => isQueueActiveJob(item, now));
+  if (!isQueueActiveJob(job, now)) return { progress: 0, total: 0 };
+  const total = Math.max(1, Math.min(
+    Number(job.queueTotal || 0) || activeJobs.length || 1,
+    activeJobs.length || 1
+  ));
   const createdAt = Date.parse(job.createdAt || '') || 0;
-  const activeAhead = jobs.filter((item) => {
+  const activeAhead = activeJobs.filter((item) => {
     if (item.id === job.id) return false;
-    if (!['queued', 'running'].includes(item.status)) return false;
     const itemTime = Date.parse(item.createdAt || '') || 0;
     return itemTime <= createdAt;
   }).length;
   return {
-    progress: Math.max(1, Math.min(total, total - activeAhead)),
+    progress: Math.max(1, Math.min(total, activeAhead + 1)),
     total
   };
 }
@@ -2514,12 +2556,51 @@ function jobDurationMs(job) {
 }
 
 function activeJobCount(jobs) {
-  return jobs.filter((job) => ['queued', 'running'].includes(job.status)).length;
+  const now = Date.now();
+  return jobs.filter((job) => isQueueActiveJob(job, now)).length;
+}
+
+function isQueueActiveJob(job, now = Date.now()) {
+  if (!job || !['queued', 'running'].includes(job.status)) return false;
+  return !isStaleActiveJob(job, now);
+}
+
+function isStaleActiveJob(job, now = Date.now()) {
+  if (!job || !['queued', 'running'].includes(job.status)) return false;
+  if (isExpiredJobAt(job, now)) return true;
+  const updatedAt = Date.parse(job.updatedAt || job.createdAt || '');
+  if (!Number.isFinite(updatedAt) || updatedAt <= 0) return false;
+  if (job.status === 'running') return now - updatedAt > staleRunningJobMs();
+  if (job.status === 'queued' && !jobDeadlineTimestamp(job)) return now - updatedAt > staleQueuedJobMs();
+  return false;
+}
+
+function staleActiveJobDetail(job, now = Date.now()) {
+  if (isExpiredJobAt(job, now)) return 'job deadline expired';
+  return `${job.status || 'active'} job exceeded stale timeout`;
 }
 
 function isExpiredJob(job) {
+  return isExpiredJobAt(job);
+}
+
+function isExpiredJobAt(job, now = Date.now()) {
   const deadline = Date.parse(job.deadlineAt || '');
-  return Number.isFinite(deadline) && deadline > 0 && Date.now() >= deadline;
+  return Number.isFinite(deadline) && deadline > 0 && now >= deadline;
+}
+
+function staleQueuedJobMs() {
+  return configuredTimeoutMs('STALE_QUEUED_JOB_MS', configuredTimeoutMs('STALE_ACTIVE_JOB_MS', 30 * 60 * 1000));
+}
+
+function staleRunningJobMs() {
+  return configuredTimeoutMs('STALE_RUNNING_JOB_MS', accountInflightTimeoutMs() + 60 * 1000);
+}
+
+function configuredTimeoutMs(name, fallback) {
+  const configured = Number(process.env[name] || 0);
+  if (Number.isFinite(configured) && configured > 0) return Math.max(60_000, Math.floor(configured));
+  return Math.max(60_000, Math.floor(Number(fallback) || 60_000));
 }
 
 function refundJob(db, job, note) {

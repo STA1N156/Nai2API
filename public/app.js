@@ -447,8 +447,11 @@ function updateQueueView(job = {}) {
   if (!state.queueView) {
     state.queueView = { position: target, target, count: total, completing: false };
   } else {
-    state.queueView.count = Math.max(state.queueView.count, total);
-    state.queueView.target = Math.max(state.queueView.target, target);
+    state.queueView.count = total;
+    state.queueView.target = target;
+    if (state.queueView.position > target || state.queueView.position > total) {
+      state.queueView.position = target;
+    }
   }
   ensureQueueViewTimer();
   return state.queueView;
@@ -479,26 +482,8 @@ function setArtistInputLocked(isLocked) {
 }
 
 function finishQueueView(job = {}) {
-  if (!state.queueView) return false;
-  const total = Math.max(
-    Number(state.queueView.count || 0),
-    Number(job.queuedCount || 0),
-    Number(job.queuePosition || 0)
-  );
-  if (total <= 1 || state.queueView.position >= total) {
-    clearQueueView();
-    return false;
-  }
-  state.queueView.count = total;
-  state.queueView.target = total;
-  state.queueView.completing = true;
-  if (state.queueViewTimer) {
-    clearInterval(state.queueViewTimer);
-    state.queueViewTimer = null;
-  }
-  ensureQueueViewTimer();
-  renderQueueText();
-  return true;
+  clearQueueView();
+  return false;
 }
 
 function ensureQueueViewTimer() {

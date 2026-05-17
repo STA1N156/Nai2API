@@ -274,22 +274,75 @@ function imageResolutionTier(image) {
 
 function jobQueueProgress(job, jobs) {
   if (job.status === 'running' && Number(job.queueTotal || 0) > 1) {
-    const total = Number(job.queueTotal || 0);
+    const total = Math.min(Number(job.queueTotal || 0), activeJobCount(jobs));
     return { progress: total, total };
   }
-  if (job.status !== 'queued') return { progress: 0, total: 0 };
-  const total = Math.max(1, Number(job.queueTotal || 0));
+  const now = Date.now();
+  if (!isQueueActiveJob(job, now)) return { progress: 0, total: 0 };
+  const activeJobs = (Array.isArray(jobs) ? jobs : []).filter((item) => isQueueActiveJob(item, now));
+  const total = Math.max(1, Math.min(
+    Number(job.queueTotal || 0) || activeJobs.length || 1,
+    activeJobs.length || 1
+  ));
   const createdAt = Date.parse(job.createdAt || '') || 0;
-  const activeAhead = jobs.filter((item) => {
+  const activeAhead = activeJobs.filter((item) => {
     if (item.id === job.id) return false;
-    if (!['queued', 'running'].includes(item.status)) return false;
     const itemTime = Date.parse(item.createdAt || '') || 0;
     return itemTime <= createdAt;
   }).length;
   return {
-    progress: Math.max(1, Math.min(total, total - activeAhead)),
+    progress: Math.max(1, Math.min(total, activeAhead + 1)),
     total
   };
+}
+
+function activeJobCount(jobs) {
+  const now = Date.now();
+  return (Array.isArray(jobs) ? jobs : []).filter((job) => isQueueActiveJob(job, now)).length;
+}
+
+function isQueueActiveJob(job, now = Date.now()) {
+  if (!job || !['queued', 'running'].includes(job.status)) return false;
+  return !isStaleActiveJob(job, now);
+}
+
+function isStaleActiveJob(job, now = Date.now()) {
+  if (!job || !['queued', 'running'].includes(job.status)) return false;
+  if (isExpiredJob(job, now)) return true;
+  const updatedAt = Date.parse(job.updatedAt || job.createdAt || '');
+  if (!Number.isFinite(updatedAt) || updatedAt <= 0) return false;
+  if (job.status === 'running') return now - updatedAt > staleRunningJobMs();
+  if (job.status === 'queued' && !jobDeadlineTimestamp(job)) return now - updatedAt > staleQueuedJobMs();
+  return false;
+}
+
+function isExpiredJob(job, now = Date.now()) {
+  const deadline = jobDeadlineTimestamp(job);
+  return deadline > 0 && now >= deadline;
+}
+
+function jobDeadlineTimestamp(job = {}) {
+  const deadline = Date.parse(job.deadlineAt || '');
+  return Number.isFinite(deadline) && deadline > 0 ? deadline : 0;
+}
+
+function staleQueuedJobMs() {
+  return configuredTimeoutMs('STALE_QUEUED_JOB_MS', configuredTimeoutMs('STALE_ACTIVE_JOB_MS', 30 * 60 * 1000));
+}
+
+function staleRunningJobMs() {
+  return configuredTimeoutMs('STALE_RUNNING_JOB_MS', accountInflightTimeoutMs() + 60 * 1000);
+}
+
+function accountInflightTimeoutMs() {
+  const configured = Number(process.env.ACCOUNT_INFLIGHT_TIMEOUT_MS || 10 * 60 * 1000);
+  return Number.isFinite(configured) && configured > 0 ? Math.max(1000, Math.floor(configured)) : 10 * 60 * 1000;
+}
+
+function configuredTimeoutMs(name, fallback) {
+  const configured = Number(process.env[name] || 0);
+  if (Number.isFinite(configured) && configured > 0) return Math.max(60_000, Math.floor(configured));
+  return Math.max(60_000, Math.floor(Number(fallback) || 60_000));
 }
 
 function cloneDb(db) {
