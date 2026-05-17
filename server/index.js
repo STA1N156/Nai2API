@@ -226,15 +226,18 @@ async function route(req, res) {
   if (method === 'GET' && url.pathname === '/api/admin/summary') {
     const startedAt = Date.now();
     assertAdmin(req, url);
+    const readStartedAt = Date.now();
     const db = await store.readAdminSummary();
+    const readMs = Date.now() - readStartedAt;
     resetStaleAccountLoads(db.accounts);
     const revealTokens = url.searchParams.get('revealTokens') === '1';
     const statsJobs = db.statsJobs || db.jobs || [];
     const errorLogJobs = db.errorJobs || statsJobs;
     const queueJobs = db.queueJobs || statsJobs;
+    const computeStartedAt = Date.now();
     const accountStats1h = accountStatsMapSince(statsJobs, 60 * 60 * 1000);
     const queueDb = { ...db, jobs: queueJobs };
-    sendJson(res, 200, {
+    const payload = {
       settings: db.settings,
       cards: db.cards.map(publicCard),
       users: db.users.map(publicUser),
@@ -252,8 +255,21 @@ async function route(req, res) {
       errorLogs: errorLogs(errorLogJobs, db, 100),
       jobs: db.jobs.slice(0, 50).map((job) => publicJob(job, queueDb)),
       ledger: db.ledger.slice(0, 80)
+    };
+    const computeMs = Date.now() - computeStartedAt;
+    const sendStartedAt = Date.now();
+    sendJson(res, 200, payload);
+    const sendMs = Date.now() - sendStartedAt;
+    runtimeRequestLog('admin summary', startedAt, {
+      readMs,
+      computeMs,
+      sendMs,
+      users: db.users.length,
+      accounts: db.accounts.length,
+      statsJobs: statsJobs.length,
+      recentJobs: db.jobs.length,
+      images: db.imageCount ?? db.images.length
     });
-    runtimeSlowLog('admin summary', startedAt, `users=${db.users.length} accounts=${db.accounts.length} statsJobs=${statsJobs.length} recentJobs=${db.jobs.length}`);
     return;
   }
 
@@ -312,7 +328,10 @@ async function route(req, res) {
     const offset = clamp(Number(url.searchParams.get('offset') || 0), 0, Number.MAX_SAFE_INTEGER);
     const q = String(url.searchParams.get('q') || '').trim().toLowerCase();
     const tier = String(url.searchParams.get('tier') || '').trim();
+    const queryStartedAt = Date.now();
     const page = await store.readImagePage({ limit, offset, q, tier });
+    const queryMs = Date.now() - queryStartedAt;
+    const sendStartedAt = Date.now();
     sendJson(res, 200, {
       images: page.images.map(publicImage),
       total: page.total,
@@ -321,7 +340,15 @@ async function route(req, res) {
       limit: page.limit,
       maxCacheImages: page.maxCacheImages
     });
-    runtimeSlowLog('admin images page', startedAt, `matched=${page.matched} total=${page.total} limit=${page.limit} offset=${page.offset}`);
+    const sendMs = Date.now() - sendStartedAt;
+    runtimeRequestLog('admin images page', startedAt, {
+      queryMs,
+      sendMs,
+      matched: page.matched,
+      total: page.total,
+      limit: page.limit,
+      offset: page.offset
+    });
     return;
   }
 
@@ -2114,13 +2141,13 @@ async function cancelReservedJob(reservation, error) {
   const message = publicErrorMessage(waiterMessage);
   let changed = false;
   await store.update((db) => {
+    const job = reservation.job?.id ? db.jobs.find((item) => item.id === reservation.job.id) : null;
+    if (!job || ['done', 'failed'].includes(job.status)) return;
     const account = reservation.account ? db.accounts.find((item) => item.id === reservation.account.id) : null;
     if (account) {
       account.inFlight = Math.max(0, Number(account.inFlight || 0) - 1);
       account.updatedAt = new Date().toISOString();
     }
-    const job = reservation.job?.id ? db.jobs.find((item) => item.id === reservation.job.id) : null;
-    if (!job || ['done', 'failed'].includes(job.status)) return;
     refundJob(db, job, message);
     job.status = 'failed';
     job.error = message;
@@ -3214,6 +3241,14 @@ function runtimeSlowLog(label, startedAt, detail = '') {
   const duration = Date.now() - startedAt;
   if (duration < 500) return;
   console.log(`[runtime] slow ${label}: ${duration}ms${detail ? ` (${detail})` : ''}`);
+}
+
+function runtimeRequestLog(label, startedAt, detail = {}) {
+  const duration = Date.now() - startedAt;
+  const parts = Object.entries(detail)
+    .map(([key, value]) => `${key}=${value}`)
+    .join(' ');
+  console.log(`[runtime] ${label}: total=${duration}ms${parts ? ` ${parts}` : ''}`);
 }
 
 function httpError(statusCode, message) {

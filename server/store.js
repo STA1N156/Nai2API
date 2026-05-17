@@ -244,7 +244,7 @@ export class JsonStore {
       users: this.selectItems('users'),
       accounts: this.selectItems('accounts'),
       jobs: this.selectItems('jobs', 'ORDER BY order_value DESC LIMIT 50'),
-      statsJobs: this.selectItems('jobs', `
+      statsJobs: this.selectJobStatRows(`
         WHERE COALESCE(created_at, '') >= @cutoff
           OR COALESCE(updated_at, '') >= @cutoff
           OR status IN ('queued', 'running')
@@ -320,6 +320,26 @@ export class JsonStore {
     if (!table) return [];
     const rows = this.sqlite.prepare(`SELECT data FROM ${table} ${clause}`).all(params);
     return rows.map((row) => safeJson(row.data, null)).filter(Boolean);
+  }
+
+  selectJobStatRows(clause = 'ORDER BY order_value DESC', params = {}) {
+    const rows = this.sqlite.prepare(`
+      SELECT
+        id,
+        status,
+        account_id AS accountId,
+        created_at AS createdAt,
+        updated_at AS updatedAt
+      FROM jobs
+      ${clause}
+    `).all(params);
+    return rows.map((row) => ({
+      id: row.id || '',
+      status: row.status || '',
+      accountId: row.accountId || '',
+      createdAt: row.createdAt || '',
+      updatedAt: row.updatedAt || ''
+    }));
   }
 
   openSqlite() {

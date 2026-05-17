@@ -220,7 +220,7 @@ async function socksFetch(url, options = {}, proxyUrl = '') {
     const response = await writeAndReadHttpResponse(socket, request, options.signal);
     return response;
   } catch (error) {
-    socket.destroy();
+    destroySocketQuietly(socket);
     throw error;
   }
 }
@@ -230,7 +230,7 @@ async function connectSocks5(proxy, targetHost, targetPort, signal) {
     host: proxy.hostname,
     port: Number(proxy.port || 1080)
   });
-  const abort = () => socket.destroy(abortError(signal?.reason));
+  const abort = () => destroySocketQuietly(socket);
   if (signal?.aborted) abort();
   signal?.addEventListener('abort', abort, { once: true });
 
@@ -256,7 +256,7 @@ async function connectSocks5(proxy, targetHost, targetPort, signal) {
     return socket;
   } catch (error) {
     signal?.removeEventListener('abort', abort);
-    socket.destroy();
+    destroySocketQuietly(socket);
     throw error;
   }
 }
@@ -344,7 +344,7 @@ function writeAndReadHttpResponse(socket, request, signal) {
     };
     const rejectAndClose = (error) => {
       cleanup();
-      socket.destroy();
+      destroySocketQuietly(socket);
       reject(error);
     };
     const onData = (chunk) => chunks.push(chunk);
@@ -444,7 +444,7 @@ function waitForSocket(socket, event, signal) {
     };
     const onAbort = () => {
       cleanup();
-      socket.destroy();
+      destroySocketQuietly(socket);
       reject(abortError(signal?.reason));
     };
     if (signal?.aborted) return onAbort();
@@ -486,7 +486,7 @@ function readExact(socket, length, signal) {
     };
     const onAbort = () => {
       cleanup();
-      socket.destroy();
+      destroySocketQuietly(socket);
       reject(abortError(signal?.reason));
     };
 
@@ -505,6 +505,14 @@ function abortError(reason) {
   error.name = 'AbortError';
   return error;
 }
+
+function destroySocketQuietly(socket) {
+  if (!socket || socket.destroyed) return;
+  socket.once('error', noop);
+  socket.destroy();
+}
+
+function noop() {}
 
 function buildNovelAiParameters(request) {
   if (isV4Model(request.model)) {
