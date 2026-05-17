@@ -52,7 +52,7 @@ const maxUrlSteps = 28;
 const defaultSteps = 28;
 const jobPollIntervalMs = 450;
 const queueStepIntervalMs = 75;
-const queueCompleteStepIntervalMs = 10;
+const queueCompleteStepIntervalMs = 15;
 const artistPresets = {
   '2.5d': {
     label: '2.5D唯美风',
@@ -482,8 +482,26 @@ function setArtistInputLocked(isLocked) {
 }
 
 function finishQueueView(job = {}) {
-  clearQueueView();
-  return false;
+  if (!state.queueView) return false;
+  const total = Math.max(
+    Number(state.queueView.count || 0),
+    Number(job.queuedCount || 0),
+    Number(job.queuePosition || 0)
+  );
+  if (total <= 1 || state.queueView.position >= total) {
+    clearQueueView();
+    return false;
+  }
+  state.queueView.count = total;
+  state.queueView.target = total;
+  state.queueView.completing = true;
+  if (state.queueViewTimer) {
+    clearInterval(state.queueViewTimer);
+    state.queueViewTimer = null;
+  }
+  ensureQueueViewTimer();
+  renderQueueText();
+  return true;
 }
 
 function ensureQueueViewTimer() {
