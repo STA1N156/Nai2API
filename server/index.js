@@ -56,14 +56,15 @@ const openAiSizeTiers = {
 };
 const insufficientBalanceMessage = '密钥额度不足，无法生成图片。';
 
+installRuntimeSafetyHandlers();
 await store.init();
+await cleanupInterruptedStartupJobs();
 await cleanupStaleActiveJobs('startup');
 await mkdir(imageDir, { recursive: true });
 await migrateInlineImages();
 await ensureAccountRouteIds();
 await applyRuntimeSettings();
 await cleanupImageStorage().catch((error) => console.error('Failed to cleanup image storage:', error));
-scheduleQueueDrain();
 
 const server = http.createServer(async (req, res) => {
   try {
@@ -84,7 +85,9 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(port, host, () => {
   console.log(`Nai2API listening on http://${host}:${port}`);
-  scheduleQueueDrain();
+  logStartupQueueState().catch((error) => console.error('[runtime] failed to inspect startup queue:', error)).finally(() => {
+    scheduleQueueDrain();
+  });
 });
 
 async function applyRuntimeSettings() {
@@ -579,7 +582,10 @@ async function handleOpenAiChatCompletion(req, res) {
   const settings = await store.readSettings();
   const parsed = parseOpenAiImageRequest(body, settings);
   const deadline = Date.now() + openAiChatTimeoutMs;
-  const job = await createJob(token, parsed.request, { deadlineAt: new Date(deadline).toISOString() });
+  const job = await createJob(token, parsed.request, {
+    deadlineAt: new Date(deadline).toISOString(),
+    source: 'openai'
+  });
   scheduleQueueDrain();
 
   if (body.stream === true) {
@@ -1424,6 +1430,76 @@ async function cleanupStaleActiveJobs(reason = 'stale active job cleanup') {
   return result;
 }
 
+async function cleanupInterruptedStartupJobs() {
+  const startedAt = Date.now();
+  const result = await store.update((db) => {
+    const now = Date.now();
+    const updatedAt = new Date(now).toISOString();
+    const message = publicErrorMessage('direct generate timeout');
+    const jobs = Array.isArray(db.jobs) ? db.jobs : [];
+    const failedJobIds = [];
+    let running = 0;
+    let direct = 0;
+    let openai = 0;
+    let expired = 0;
+
+    jobs.forEach((job) => {
+      if (!['queued', 'running'].includes(job.status)) return;
+      const isRunning = job.status === 'running';
+      const isDirect = job.source === 'direct';
+      const isOpenAi = job.source === 'openai';
+      const isExpired = isExpiredJobAt(job, now);
+      if (!isRunning && !isDirect && !isOpenAi && !isExpired) return;
+
+      if (isRunning) running += 1;
+      if (isDirect) direct += 1;
+      if (isOpenAi) openai += 1;
+      if (isExpired) expired += 1;
+
+      const account = job.accountId ? db.accounts.find((item) => item.id === job.accountId) : null;
+      if (account) {
+        account.inFlight = Math.max(0, Number(account.inFlight || 0) - 1);
+        account.updatedAt = updatedAt;
+      }
+      refundJob(db, job, message);
+      job.status = 'failed';
+      job.error = message;
+      job.errorDetail = isDirect || isOpenAi
+        ? 'startup: request-bound job was interrupted by server restart'
+        : isRunning
+          ? 'startup: running job was interrupted by server restart'
+          : 'startup: job deadline expired before restart completed';
+      job.updatedAt = updatedAt;
+      failedJobIds.push(job.id);
+    });
+
+    return {
+      changed: failedJobIds.length,
+      running,
+      direct,
+      openai,
+      expired,
+      queuedRemaining: jobs.filter((job) => job.status === 'queued').length,
+      runningRemaining: jobs.filter((job) => job.status === 'running').length,
+      jobIds: failedJobIds
+    };
+  });
+
+  console.log(`[runtime] startup interrupted job cleanup completed in ${Date.now() - startedAt}ms: changed=${result.changed} running=${result.running} direct=${result.direct} openai=${result.openai} expired=${result.expired} queuedRemaining=${result.queuedRemaining} runningRemaining=${result.runningRemaining}`);
+  if (result.changed) result.jobIds.forEach((jobId) => notifyJobWaiters(jobId, { error: 'direct generate timeout' }));
+  return result;
+}
+
+async function logStartupQueueState() {
+  const db = await store.readCollections(['jobs']);
+  const jobs = Array.isArray(db.jobs) ? db.jobs : [];
+  const queued = jobs.filter((job) => job.status === 'queued').length;
+  const running = jobs.filter((job) => job.status === 'running').length;
+  const directQueued = jobs.filter((job) => job.status === 'queued' && job.source === 'direct').length;
+  const openAiQueued = jobs.filter((job) => job.status === 'queued' && job.source === 'openai').length;
+  console.log(`[runtime] startup queue resume state: queued=${queued} running=${running} directQueued=${directQueued} openaiQueued=${openAiQueued}`);
+}
+
 async function cleanupImageStorage() {
   const startedAt = Date.now();
   const trimmedImages = await store.update((db) => trimImageCacheRecords(db), { flush: true }) || [];
@@ -1569,6 +1645,7 @@ async function createJob(token, body, options = {}) {
         const now = new Date().toISOString();
         const job = {
           id: createId('job'),
+          source: options.source || 'web',
           userToken: token,
           status: 'done',
           request,
@@ -1595,6 +1672,7 @@ async function createJob(token, body, options = {}) {
     user.updatedAt = new Date().toISOString();
     const job = {
       id: createId('job'),
+      source: options.source || 'web',
       userToken: token,
       status: 'queued',
       request,
@@ -3249,6 +3327,34 @@ function runtimeRequestLog(label, startedAt, detail = {}) {
     .map(([key, value]) => `${key}=${value}`)
     .join(' ');
   console.log(`[runtime] ${label}: total=${duration}ms${parts ? ` ${parts}` : ''}`);
+}
+
+function installRuntimeSafetyHandlers() {
+  if (installRuntimeSafetyHandlers.installed) return;
+  installRuntimeSafetyHandlers.installed = true;
+  process.on('uncaughtException', (error) => {
+    if (isRecoverableRuntimeAbort(error)) {
+      console.error(`[runtime] recovered from async abort/socket error: ${error?.message || error}`);
+      return;
+    }
+    console.error('[runtime] uncaught exception:', error);
+    process.exit(1);
+  });
+  process.on('unhandledRejection', (reason) => {
+    const error = reason instanceof Error ? reason : new Error(String(reason));
+    if (isRecoverableRuntimeAbort(error)) {
+      console.error(`[runtime] recovered from async abort/socket rejection: ${error.message}`);
+      return;
+    }
+    console.error('[runtime] unhandled rejection:', reason);
+    process.exit(1);
+  });
+}
+
+function isRecoverableRuntimeAbort(error) {
+  const text = String(error?.stack || error?.message || error || '');
+  return isAbortError(error)
+    || /direct generate timeout|This operation was aborted|ECONNRESET|ERR_STREAM_DESTROYED|socket hang up/i.test(text);
 }
 
 function httpError(statusCode, message) {
