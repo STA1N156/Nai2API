@@ -50,9 +50,9 @@ const el = Object.fromEntries(ids.map((id) => [id, document.querySelector(`#${id
 const maxSteps = 28;
 const maxUrlSteps = 28;
 const defaultSteps = 28;
-const jobPollIntervalMs = 650;
-const queueStepIntervalMs = 140;
-const queueCompleteStepIntervalMs = 40;
+const jobPollIntervalMs = 450;
+const queueStepIntervalMs = 75;
+const queueCompleteStepIntervalMs = 20;
 const artistPresets = {
   '2.5d': {
     label: '2.5D唯美风',
