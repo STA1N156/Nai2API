@@ -98,6 +98,8 @@ async function applyRuntimeSettings() {
 }
 
 async function migrateInlineImages() {
+  const startedAt = Date.now();
+  let migrated = 0;
   await store.update(async (db) => {
     for (const image of db.images) {
       if (!image.base64 || image.file) continue;
@@ -106,11 +108,13 @@ async function migrateInlineImages() {
         await writeFile(path.join(dataDir, imageFile), Buffer.from(image.base64, 'base64'));
         image.file = imageFile;
         delete image.base64;
+        migrated += 1;
       } catch (error) {
         console.error(`Failed to migrate cached image ${image.id}:`, error);
       }
     }
   });
+  if (migrated) console.log(`[runtime] migrated ${migrated} inline image(s) in ${Date.now() - startedAt}ms`);
 }
 
 async function route(req, res) {
@@ -220,11 +224,16 @@ async function route(req, res) {
   }
 
   if (method === 'GET' && url.pathname === '/api/admin/summary') {
+    const startedAt = Date.now();
     assertAdmin(req, url);
     const db = await store.readAdminSummary();
     resetStaleAccountLoads(db.accounts);
     const revealTokens = url.searchParams.get('revealTokens') === '1';
-    const accountStats1h = accountStatsMapSince(db.jobs, 60 * 60 * 1000);
+    const statsJobs = db.statsJobs || db.jobs || [];
+    const errorLogJobs = db.errorJobs || statsJobs;
+    const queueJobs = db.queueJobs || statsJobs;
+    const accountStats1h = accountStatsMapSince(statsJobs, 60 * 60 * 1000);
+    const queueDb = { ...db, jobs: queueJobs };
     sendJson(res, 200, {
       settings: db.settings,
       cards: db.cards.map(publicCard),
@@ -237,13 +246,14 @@ async function route(req, res) {
       imageCount: db.imageCount ?? db.images.length,
       imageTotal: db.imageCount ?? db.images.length,
       cacheImageCount: db.imageCount ?? db.images.length,
-      requestStats1m: requestStatsSince(db.jobs, 60 * 1000),
-      jobStats1h: jobStatsSince(db.jobs, 60 * 60 * 1000),
-      usageHourlyDays: hourlyUsageStatsByDay(db.jobs),
-      errorLogs: errorLogs(db.jobs, db, 100),
-      jobs: db.jobs.slice(0, 50).map((job) => publicJob(job, db)),
+      requestStats1m: requestStatsSince(statsJobs, 60 * 1000),
+      jobStats1h: jobStatsSince(statsJobs, 60 * 60 * 1000),
+      usageHourlyDays: hourlyUsageStatsByDay(statsJobs),
+      errorLogs: errorLogs(errorLogJobs, db, 100),
+      jobs: db.jobs.slice(0, 50).map((job) => publicJob(job, queueDb)),
       ledger: db.ledger.slice(0, 80)
     });
+    runtimeSlowLog('admin summary', startedAt, `users=${db.users.length} accounts=${db.accounts.length} statsJobs=${statsJobs.length} recentJobs=${db.jobs.length}`);
     return;
   }
 
@@ -296,6 +306,7 @@ async function route(req, res) {
   }
 
   if (method === 'GET' && url.pathname === '/api/admin/images') {
+    const startedAt = Date.now();
     assertAdmin(req, url);
     const limit = clamp(Number(url.searchParams.get('limit') || 60), 1, 200);
     const offset = clamp(Number(url.searchParams.get('offset') || 0), 0, Number.MAX_SAFE_INTEGER);
@@ -310,6 +321,7 @@ async function route(req, res) {
       limit: page.limit,
       maxCacheImages: page.maxCacheImages
     });
+    runtimeSlowLog('admin images page', startedAt, `matched=${page.matched} total=${page.total} limit=${page.limit} offset=${page.offset}`);
     return;
   }
 
@@ -1386,6 +1398,7 @@ async function cleanupStaleActiveJobs(reason = 'stale active job cleanup') {
 }
 
 async function cleanupImageStorage() {
+  const startedAt = Date.now();
   const trimmedImages = await store.update((db) => trimImageCacheRecords(db), { flush: true }) || [];
   await removeStoredImages(trimmedImages);
 
@@ -1417,7 +1430,9 @@ async function cleanupImageStorage() {
   }));
 
   if (trimmedImages.length || orphanFiles.length) {
-    console.log(`Image cache cleanup removed ${trimmedImages.length} expired records and ${orphanFiles.length} orphan files.`);
+    console.log(`[runtime] image cache cleanup removed ${trimmedImages.length} expired records and ${orphanFiles.length} orphan files in ${Date.now() - startedAt}ms`);
+  } else {
+    runtimeSlowLog('image cache cleanup', startedAt, 'removed=0');
   }
 }
 
@@ -3193,6 +3208,12 @@ function numberOrNull(value) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function runtimeSlowLog(label, startedAt, detail = '') {
+  const duration = Date.now() - startedAt;
+  if (duration < 500) return;
+  console.log(`[runtime] slow ${label}: ${duration}ms${detail ? ` (${detail})` : ''}`);
 }
 
 function httpError(statusCode, message) {

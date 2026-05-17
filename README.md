@@ -286,7 +286,9 @@ Nai2API 使用 SQLite 元数据 + 图片文件的方式存储，默认路径：
 
 真实图片文件存放在 `/data/images/`。旧版本的 `/data/library.json` 会在第一次启动时自动导入到 `/data/library.sqlite`；迁移成功后，旧的 `library.json` / `library.json.bak` 会被删除来腾出空间。
 
-SQLite 会按记录写入数据，不再每次改余额、任务或图片缓存时重写整个 `library.json`，高并发生成时更稳。
+SQLite 会按记录写入数据，不再每次改余额、任务或图片缓存时重写整个 `library.json`，高并发生成时更稳。数据库内部会把用户、账号、任务、图片、流水等拆到独立表里；图片缓存列表会直接用 SQLite 分页和筛选，不再扫描全部图片记录。
+
+启动时会打印带 `[runtime]` 前缀的关键日志，包括 SQLite 打开、建表、旧 JSON 读取、迁移写入、旧 JSON 删除、旧版 SQLite 泛用表升级等耗时；后台总览和图片分页如果超过 500ms，也会打印慢日志，方便定位卡点。
 
 Docker Compose 已经挂载：
 
