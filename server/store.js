@@ -292,9 +292,10 @@ export class JsonStore {
     this.queue = this.queue.catch(() => {}).then(async () => {
       await this.ensureLoaded();
       const result = await mutator(this.db);
-      if (shouldPersistUpdate(result, options)) {
-        const scope = persistenceScope(options);
-        trimDb(this.db, { collections: scope.full ? null : scope.collections });
+      const persistOptions = resolvePersistenceOptions(options, result, this.db);
+      if (shouldPersistUpdate(result, persistOptions)) {
+        const scope = persistenceScope(persistOptions);
+        if (!scope.hasDirtyRows) trimDb(this.db, { collections: scope.full ? null : scope.collections });
         this.persistIncremental(this.db, scope);
       }
       return cloneValue(result);
@@ -568,6 +569,12 @@ export class JsonStore {
     const startedAt = Date.now();
     const scope = persistenceScope(options);
     if (!scope.full && !scope.includeSettings && !scope.collections.length) return;
+    if (scope.hasDirtyRows) {
+      const fullCollections = scope.collections.filter((collection) => !scope.dirtyRows[collection]?.size);
+      if (fullCollections.length) trimDb(db, { collections: fullCollections });
+      this.persistDirtyRows(db, scope, startedAt);
+      return;
+    }
     const safeDb = trimDb(normalizeDb(db), { collections: scope.full ? null : scope.collections });
     const snapshot = buildSnapshotState(safeDb, this.orderKeys, {
       collections: scope.full ? null : scope.collections,
@@ -607,6 +614,112 @@ export class JsonStore {
         return scope.includeSettings && array.indexOf(item) === index;
       }).join(',');
       runtimeLog(`SQLite incremental persist slow: ${duration}ms scope=${scopeText || 'none'} upserts=${changes.upserts.length} deletes=${changes.deletes.length} settings=${changes.settingsChanged ? 1 : 0}`);
+    }
+  }
+
+  persistDirtyRows(db, scope, startedAt = Date.now()) {
+    const changes = {
+      settingsChanged: false,
+      deletes: [],
+      upserts: []
+    };
+    const fullCollections = [];
+
+    if (scope.includeSettings) {
+      const nextSettings = JSON.stringify(db.settings);
+      changes.settingsChanged = this.settingsState !== nextSettings;
+      if (changes.settingsChanged) changes.nextSettings = nextSettings;
+    }
+
+    for (const collection of scope.collections) {
+      const dirtyIds = scope.dirtyRows[collection];
+      if (!dirtyIds || !dirtyIds.size) {
+        fullCollections.push(collection);
+        continue;
+      }
+      const previousRows = this.rowState[collection] || new Map();
+      const previousOrders = this.orderKeys[collection] || new Map();
+      const items = Array.isArray(db[collection]) ? db[collection] : [];
+      for (const id of dirtyIds) {
+        const index = items.findIndex((item) => String(item?.id || '') === id);
+        if (index < 0) {
+          if (previousRows.has(id)) changes.deletes.push({ collection, id });
+          continue;
+        }
+        const item = items[index];
+        ensureItemIds(collection, [item]);
+        const data = JSON.stringify(item);
+        const order = dirtyRowOrder(items, index, previousOrders);
+        const row = {
+          data,
+          order,
+          sql: sqlRecord(collection, item, order, data)
+        };
+        const old = previousRows.get(id);
+        if (!old || old.data !== row.data || old.order !== row.order) {
+          changes.upserts.push({ collection, id, data: row.data, order: row.order, sql: row.sql });
+        }
+      }
+    }
+
+    if (fullCollections.length) {
+      const snapshot = buildSnapshotState(db, this.orderKeys, {
+        collections: fullCollections,
+        includeSettings: false,
+        baseRowState: this.rowState,
+        baseOrderKeys: this.orderKeys
+      });
+      const fullChanges = collectPersistenceChanges({
+        previousSettings: this.settingsState,
+        previousRows: this.rowState,
+        nextSettings: snapshot.settingsData,
+        nextRows: snapshot.rowState,
+        includeSettings: false,
+        collections: fullCollections
+      });
+      changes.deletes.push(...fullChanges.deletes);
+      changes.upserts.push(...fullChanges.upserts);
+    }
+
+    if (!changes.settingsChanged && !changes.deletes.length && !changes.upserts.length) return;
+
+    const applyChanges = this.sqlite.transaction(() => {
+      if (changes.settingsChanged) this.statements.replaceSettings.run('settings', changes.nextSettings);
+      for (const change of changes.deletes) {
+        this.statements.deleteRecord[change.collection].run(change.id);
+      }
+      for (const change of changes.upserts) {
+        this.statements.upsertRecord[change.collection].run(change.sql);
+      }
+    });
+    applyChanges();
+
+    if (changes.settingsChanged) this.settingsState = changes.nextSettings;
+    for (const change of changes.deletes) {
+      this.rowState[change.collection]?.delete(change.id);
+      this.orderKeys[change.collection]?.delete(change.id);
+    }
+    for (const change of changes.upserts) {
+      this.rowState[change.collection]?.set(change.id, { data: change.data, order: change.order });
+      this.orderKeys[change.collection]?.set(change.id, change.order);
+    }
+
+    if (fullCollections.length) {
+      const snapshot = buildSnapshotState(db, this.orderKeys, {
+        collections: fullCollections,
+        includeSettings: false,
+        baseRowState: this.rowState,
+        baseOrderKeys: this.orderKeys
+      });
+      for (const collection of fullCollections) {
+        this.rowState[collection] = snapshot.rowState[collection];
+        this.orderKeys[collection] = snapshot.orderKeys[collection];
+      }
+    }
+
+    const duration = Date.now() - startedAt;
+    if (duration >= 500) {
+      runtimeLog(`SQLite dirty-row persist slow: ${duration}ms scope=${scope.collections.join(',') || 'none'} upserts=${changes.upserts.length} deletes=${changes.deletes.length} settings=${changes.settingsChanged ? 1 : 0}`);
     }
   }
 
@@ -662,6 +775,7 @@ function buildSnapshotState(db, previousOrderKeys, options = {}) {
   for (const collection of targetCollections) {
     const items = Array.isArray(db[collection]) ? db[collection] : [];
     ensureItemIds(collection, items);
+    rowState[collection] = new Map();
     const orders = options.dense
       ? denseOrderValues(items)
       : assignOrderValues(items, previousOrderKeys[collection] || new Map());
@@ -710,17 +824,29 @@ function shouldPersistUpdate(result, options = {}) {
   return true;
 }
 
+function resolvePersistenceOptions(options = {}, result, db) {
+  const resolved = { ...options };
+  for (const key of ['dirtyRows', 'rows', 'changedRows']) {
+    if (typeof resolved[key] === 'function') resolved[key] = resolved[key](result, db);
+  }
+  return resolved;
+}
+
 function persistenceScope(options = {}) {
-  if (options.full === true) return { full: true, includeSettings: true, collections };
-  const raw = options.collections ?? options.changedCollections;
-  if (raw === undefined || raw === null) return { full: true, includeSettings: true, collections };
+  if (options.full === true) return { full: true, includeSettings: true, collections, dirtyRows: {}, hasDirtyRows: false };
+  const dirtyRows = normalizeDirtyRows(options.dirtyRows ?? options.rows ?? options.changedRows);
+  const dirtyCollections = Object.keys(dirtyRows);
+  const raw = options.collections ?? options.changedCollections ?? (dirtyCollections.length ? dirtyCollections : undefined);
+  if (raw === undefined || raw === null) return { full: true, includeSettings: true, collections, dirtyRows: {}, hasDirtyRows: false };
   const values = Array.isArray(raw) ? raw : [raw];
   const includeSettings = values.includes('settings') || options.includeSettings === true;
-  const targetCollections = normalizeCollectionList(values);
+  const targetCollections = normalizeCollectionList([...values, ...dirtyCollections]);
   return {
     full: false,
     includeSettings,
-    collections: targetCollections || []
+    collections: targetCollections || [],
+    dirtyRows,
+    hasDirtyRows: dirtyCollections.length > 0
   };
 }
 
@@ -736,6 +862,27 @@ function normalizeCollectionList(value) {
     selected.push(collection);
   }
   return selected.length ? selected : null;
+}
+
+function normalizeDirtyRows(value) {
+  const dirtyRows = {};
+  if (!value) return dirtyRows;
+  const entries = value instanceof Map ? value.entries() : Object.entries(value);
+  for (const [rawCollection, rawIds] of entries) {
+    const collection = String(rawCollection || '');
+    if (!collections.includes(collection)) continue;
+    const ids = rawIds instanceof Set
+      ? [...rawIds]
+      : Array.isArray(rawIds)
+        ? rawIds
+        : [rawIds];
+    const selected = ids
+      .map((id) => String(id || '').trim())
+      .filter(Boolean);
+    if (!selected.length) continue;
+    dirtyRows[collection] = new Set([...(dirtyRows[collection] || []), ...selected]);
+  }
+  return dirtyRows;
 }
 
 function cloneCollectionMaps(source = {}) {
@@ -886,6 +1033,29 @@ function assignOrderValues(items, previousOrders) {
     }
   }
   return orders;
+}
+
+function dirtyRowOrder(items, index, previousOrders) {
+  const id = String(items[index]?.id || '');
+  if (previousOrders.has(id)) return Number(previousOrders.get(id));
+
+  let before = null;
+  for (let cursor = index - 1; cursor >= 0; cursor -= 1) {
+    const previousId = String(items[cursor]?.id || '');
+    if (!previousOrders.has(previousId)) continue;
+    before = Number(previousOrders.get(previousId));
+    break;
+  }
+
+  let after = null;
+  for (let cursor = index + 1; cursor < items.length; cursor += 1) {
+    const nextId = String(items[cursor]?.id || '');
+    if (!previousOrders.has(nextId)) continue;
+    after = Number(previousOrders.get(nextId));
+    break;
+  }
+
+  return orderValuesForRun(1, before, after)[0];
 }
 
 function existingOrderSequenceIsStable(items, previousOrders) {

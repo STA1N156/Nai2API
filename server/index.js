@@ -1436,6 +1436,7 @@ async function cleanupStaleActiveJobs(reason = 'stale active job cleanup') {
     };
   }, {
     collections: ['jobs', 'accounts', 'users', 'ledger'],
+    dirtyRows: (result) => ({ jobs: result?.jobIds || [] }),
     shouldPersist: (result) => Number(result?.changed || 0) > 0
   });
 
@@ -1499,6 +1500,7 @@ async function cleanupInterruptedStartupJobs() {
     };
   }, {
     collections: ['jobs', 'accounts', 'users', 'ledger'],
+    dirtyRows: (result) => ({ jobs: result?.jobIds || [] }),
     shouldPersist: (result) => Number(result?.changed || 0) > 0
   });
 
@@ -1652,6 +1654,18 @@ async function updateAccount(id, body) {
   }, { collections: ['accounts'] });
 }
 
+function dirtyJobRows(jobId) {
+  return jobId ? { jobs: [jobId] } : {};
+}
+
+function dirtyResultJobRows(result) {
+  return dirtyJobRows(result?.job?.id || result?.jobId);
+}
+
+function dirtyReservationJobRows(reservation) {
+  return dirtyJobRows(reservation?.job?.id);
+}
+
 async function createJob(token, body, options = {}) {
   await cleanupStaleActiveJobs('create job');
   return store.update((db) => {
@@ -1717,7 +1731,10 @@ async function createJob(token, body, options = {}) {
       at: new Date().toISOString()
     });
     return job;
-  }, { collections: ['users', 'jobs', 'ledger'] });
+  }, {
+    collections: ['users', 'jobs', 'ledger'],
+    dirtyRows: (job) => dirtyJobRows(job?.id)
+  });
 }
 
 async function ensureAccountRouteIds() {
@@ -1769,7 +1786,10 @@ async function createDirectJob(token, request, cacheKey, options = {}) {
       });
     }
     return job;
-  }, { collections: ['users', 'jobs', 'ledger'] });
+  }, {
+    collections: ['users', 'jobs', 'ledger'],
+    dirtyRows: (job) => dirtyJobRows(job?.id)
+  });
 }
 
 async function markDirectJobRunning(jobId, reservation) {
@@ -1783,7 +1803,7 @@ async function markDirectJobRunning(jobId, reservation) {
     job.error = '';
     job.errorDetail = '';
     job.updatedAt = new Date().toISOString();
-  }, { collections: ['jobs'] });
+  }, { collections: ['jobs'], dirtyRows: dirtyJobRows(jobId) });
 }
 
 async function markDirectJobFailed(jobId, message) {
@@ -1795,14 +1815,14 @@ async function markDirectJobFailed(jobId, message) {
     job.error = publicErrorMessage(detail);
     job.errorDetail = detail;
     job.updatedAt = new Date().toISOString();
-  }, { collections: ['jobs'] });
+  }, { collections: ['jobs'], dirtyRows: dirtyJobRows(jobId) });
   notifyJobWaiters(jobId, { error: publicErrorMessage(detail) });
 }
 
 async function removeJob(jobId) {
   await store.update((db) => {
     db.jobs = db.jobs.filter((job) => job.id !== jobId);
-  }, { collections: ['jobs'] });
+  }, { collections: ['jobs'], dirtyRows: dirtyJobRows(jobId) });
 }
 
 async function timeoutJob(jobId) {
@@ -1834,6 +1854,7 @@ async function cancelQueuedOrRunningJob(jobId, message, detail = message) {
     changed = true;
   }, {
     collections: ['jobs', 'accounts', 'users', 'ledger'],
+    dirtyRows: dirtyJobRows(jobId),
     shouldPersist: () => changed
   });
   if (!changed) return;
@@ -1888,7 +1909,7 @@ async function reserveQueuedJob(jobId) {
   return store.update((db) => {
     const job = db.jobs.find((item) => item.id === jobId);
     if (!job) throw new Error('job not found.');
-    if (job.status !== 'queued') return { skip: true };
+    if (job.status !== 'queued') return { skip: true, changed: false };
     const accountCost = jobAccountCost(job);
     job.accountCost = accountCost;
     if (isStaleActiveJob(job)) {
@@ -1898,7 +1919,7 @@ async function reserveQueuedJob(jobId) {
       job.error = '连接超时';
       job.errorDetail = detail;
       job.updatedAt = new Date().toISOString();
-      return { skip: true };
+      return { skip: true, jobId: job.id };
     }
     const account = selectAccount(db.accounts, db.settings, { cost: accountCost });
     if (!account && hasEnabledAccounts(db.accounts)) {
@@ -1908,10 +1929,10 @@ async function reserveQueuedJob(jobId) {
         job.error = 'NovelAI账号点数不足';
         job.errorDetail = `No NovelAI account has enough quota for accountCost=${accountCost}`;
         job.updatedAt = new Date().toISOString();
-        return { skip: true };
+        return { skip: true, jobId: job.id };
       }
       job.updatedAt = new Date().toISOString();
-      return { queued: true };
+      return { queued: true, jobId: job.id };
     }
     if (account) {
       account.inFlight = Number(account.inFlight || 0) + 1;
@@ -1921,7 +1942,11 @@ async function reserveQueuedJob(jobId) {
     job.accountId = account?.id || '';
     job.updatedAt = new Date().toISOString();
     return { job, account: account ? { ...account } : null, token: job.userToken, cost: job.cost, accountCost, cacheKey: job.cacheKey || '' };
-  }, { collections: ['jobs', 'accounts', 'users', 'ledger'] });
+  }, {
+    collections: ['jobs', 'accounts', 'users', 'ledger'],
+    dirtyRows: dirtyResultJobRows,
+    shouldPersist: (result) => result?.changed !== false
+  });
 }
 
 async function runReservedJob(reservation) {
@@ -2075,7 +2100,7 @@ async function retryReservationWithNextAccount(reservation, error, tried, option
       account: { ...account },
       job: reservation.job ? { ...reservation.job, accountId: account.id } : reservation.job
     };
-  }, { collections: ['accounts', 'jobs'] });
+  }, { collections: ['accounts', 'jobs'], dirtyRows: dirtyReservationJobRows(reservation) });
 }
 
 async function requeueReservedJob(reservation, error) {
@@ -2099,7 +2124,7 @@ async function requeueReservedJob(reservation, error) {
       job.updatedAt = new Date().toISOString();
     }
     delay = Math.max(250, nextAccountReadyDelay(db.accounts, db.settings) || delay);
-  }, { collections: ['accounts', 'jobs'] });
+  }, { collections: ['accounts', 'jobs'], dirtyRows: dirtyReservationJobRows(reservation) });
   scheduleQueueDrain(delay);
 }
 
@@ -2225,7 +2250,15 @@ async function completeGeneration(reservation, request, image, meta = {}) {
       trimmedImages = trimImageCacheRecords(db);
 
       return { ...saved, balance: user.balance };
-    }, { collections: ['users', 'accounts', 'images', 'jobs'] });
+    }, {
+      collections: ['users', 'accounts', 'images', 'jobs'],
+      dirtyRows: (saved) => trimmedImages.length
+        ? {}
+        : {
+            images: saved?.id ? [saved.id] : [],
+            jobs: meta.jobId ? [meta.jobId] : []
+          }
+    });
   } catch (error) {
     await removeStoredImages([{ id: imageId, file: imageFile }]);
     throw error;
@@ -2257,6 +2290,7 @@ async function cancelReservedJob(reservation, error) {
     changed = true;
   }, {
     collections: ['jobs', 'accounts', 'users', 'ledger'],
+    dirtyRows: dirtyReservationJobRows(reservation),
     shouldPersist: () => changed
   });
   if (!changed) return;
@@ -2296,7 +2330,10 @@ async function failGeneration(reservation, error) {
       at: new Date().toISOString(),
       note: message
     });
-  }, { collections: ['users', 'accounts', 'jobs', 'ledger'] });
+  }, {
+    collections: ['users', 'accounts', 'jobs', 'ledger'],
+    dirtyRows: dirtyReservationJobRows(reservation)
+  });
   scheduleQueueDrain();
   if (reservation.job?.id) notifyJobWaiters(reservation.job.id, { error: message });
 }
@@ -2395,7 +2432,7 @@ async function drainQueuedJobs() {
           .map((job) => job.id),
         delay: 0
       };
-    }, { collections: ['accounts'] });
+    }, { collections: ['accounts'], persist: false });
     const jobIds = drainPlan.jobIds || [];
     if (!jobIds.length && drainPlan.delay > 0) queueDrainRequested = true;
     const reservations = await Promise.all(jobIds.map((id) => reserveQueuedJob(id).catch((error) => ({ error }))));
