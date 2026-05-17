@@ -98,13 +98,13 @@ async function applyRuntimeSettings() {
     if (!db.settings.defaultArtist || db.settings.defaultArtist === legacyDefaultArtist) {
       db.settings.defaultArtist = defaultArtist2_5D;
     }
-  });
+  }, { collections: ['settings'] });
 }
 
 async function migrateInlineImages() {
   const startedAt = Date.now();
   let migrated = 0;
-  await store.update(async (db) => {
+  migrated = await store.update(async (db) => {
     for (const image of db.images) {
       if (!image.base64 || image.file) continue;
       const imageFile = imageStorageName(image.id, image.mimeType);
@@ -117,7 +117,8 @@ async function migrateInlineImages() {
         console.error(`Failed to migrate cached image ${image.id}:`, error);
       }
     }
-  });
+    return migrated;
+  }, { collections: ['images'], shouldPersist: (count) => Number(count || 0) > 0 });
   if (migrated) console.log(`[runtime] migrated ${migrated} inline image(s) in ${Date.now() - startedAt}ms`);
 }
 
@@ -127,6 +128,15 @@ async function route(req, res) {
 
   if (method === 'OPTIONS') {
     sendCorsPreflight(res);
+    return;
+  }
+
+  if (method === 'HEAD') {
+    if (url.pathname === '/api/health') {
+      sendHead(res, 200, { 'content-type': 'application/json; charset=utf-8' });
+      return;
+    }
+    await serveStatic(url.pathname, res, { head: true });
     return;
   }
 
@@ -178,7 +188,7 @@ async function route(req, res) {
       };
       trimmedImages = trimImageCacheRecords(db);
       return db.settings;
-    });
+    }, { collections: ['settings', 'images', 'jobs'] });
     await removeStoredImages(trimmedImages);
     scheduleQueueDrain();
     sendJson(res, 200, settings);
@@ -902,7 +912,7 @@ async function redeemCard(cardCode) {
       note: `Redeemed card ${card.code}`
     });
     return publicUser(user);
-  });
+  }, { collections: ['cards', 'users', 'ledger'] });
 }
 
 async function createCards(body) {
@@ -920,7 +930,7 @@ async function createCards(body) {
 
   await store.update((db) => {
     db.cards.unshift(...cards);
-  });
+  }, { collections: ['cards'] });
   return cards;
 }
 
@@ -951,7 +961,7 @@ async function createUsers(body) {
         note
       });
     });
-  });
+  }, { collections: ['users', 'ledger'] });
   return users;
 }
 
@@ -977,7 +987,7 @@ async function adjustUsers(body) {
       });
     });
     return users;
-  });
+  }, { collections: ['users', 'ledger'] });
 }
 
 async function deleteUsers(body) {
@@ -1000,7 +1010,7 @@ async function deleteUsers(body) {
       note: `Deleted ${users.length} user token(s)`
     });
     return { deleted: users.length };
-  });
+  }, { collections: ['users', 'cards', 'ledger'] });
 }
 
 async function addAccount(body) {
@@ -1031,7 +1041,7 @@ async function addAccount(body) {
     };
     db.accounts.unshift(account);
     return account;
-  });
+  }, { collections: ['accounts'] });
 }
 
 async function importAccounts(body) {
@@ -1085,7 +1095,7 @@ async function importAccounts(body) {
       note: `${mode} account import`
     });
     return db.accounts;
-  });
+  }, { collections: ['accounts', 'ledger'] });
 }
 
 async function applyAccountProxies(body) {
@@ -1113,7 +1123,7 @@ async function applyAccountProxies(body) {
       proxies: proxies.length,
       accounts: accounts.slice(0, applied)
     };
-  });
+  }, { collections: ['accounts', 'ledger'] });
 }
 
 async function deleteAccounts(body) {
@@ -1131,7 +1141,7 @@ async function deleteAccounts(body) {
       note: `Deleted ${deleted} NovelAI account(s)`
     });
     return { deleted };
-  });
+  }, { collections: ['accounts', 'ledger'] });
 }
 
 async function updateAccounts(body) {
@@ -1154,7 +1164,7 @@ async function updateAccounts(body) {
       note: body.enabled === undefined ? `Updated ${accounts.length} account(s)` : `${body.enabled ? 'Enabled' : 'Disabled'} ${accounts.length} account(s)`
     });
     return accounts;
-  });
+  }, { collections: ['accounts', 'ledger'] });
 }
 
 async function resetAccountStats(body) {
@@ -1180,7 +1190,7 @@ async function resetAccountStats(body) {
       note: `Reset monitoring stats for ${accounts.length} NovelAI account(s)`
     });
     return { reset: accounts.length };
-  });
+  }, { collections: ['accounts', 'ledger'] });
 }
 
 async function refreshAccountQuotas(body) {
@@ -1214,7 +1224,7 @@ async function refreshAccountQuotas(body) {
       applyAccountQuotaResult(account, result, now);
     });
     return db.accounts.filter((account) => resultMap.has(account.id));
-  });
+  }, { collections: ['accounts'] });
 
   return {
     checked: results.length,
@@ -1243,7 +1253,7 @@ async function testAccount(id) {
     if (!item) throw httpError(404, 'account not found.');
     applyAccountQuotaResult(item, result, now);
     return item;
-  });
+  }, { collections: ['accounts'] });
   const availability = accountAvailability(account, db.settings);
   const ok = Boolean(result.ok);
   const available = ok && availability.available;
@@ -1383,7 +1393,7 @@ async function clearImageCache(body) {
     });
 
     return { deleted: deletedIds.size, remaining: db.images.length };
-  });
+  }, { collections: ['images', 'jobs', 'ledger'] });
   await removeStoredImages(deletedImages);
   return result;
 }
@@ -1396,7 +1406,7 @@ async function clearRequestLogs() {
       removed: before - db.jobs.length,
       remaining: db.jobs.length
     };
-  }, { flush: true });
+  }, { collections: ['jobs'] });
 }
 
 async function cleanupStaleActiveJobs(reason = 'stale active job cleanup') {
@@ -1424,6 +1434,9 @@ async function cleanupStaleActiveJobs(reason = 'stale active job cleanup') {
       changed: failedJobIds.length,
       jobIds: failedJobIds
     };
+  }, {
+    collections: ['jobs', 'accounts', 'users', 'ledger'],
+    shouldPersist: (result) => Number(result?.changed || 0) > 0
   });
 
   if (!result?.changed) return result;
@@ -1484,6 +1497,9 @@ async function cleanupInterruptedStartupJobs() {
       runningRemaining: jobs.filter((job) => job.status === 'running').length,
       jobIds: failedJobIds
     };
+  }, {
+    collections: ['jobs', 'accounts', 'users', 'ledger'],
+    shouldPersist: (result) => Number(result?.changed || 0) > 0
   });
 
   console.log(`[runtime] startup interrupted job cleanup completed in ${Date.now() - startedAt}ms: changed=${result.changed} running=${result.running} direct=${result.direct} openai=${result.openai} expired=${result.expired} queuedRemaining=${result.queuedRemaining} runningRemaining=${result.runningRemaining}`);
@@ -1503,7 +1519,10 @@ async function logStartupQueueState() {
 
 async function cleanupImageStorage() {
   const startedAt = Date.now();
-  const trimmedImages = await store.update((db) => trimImageCacheRecords(db), { flush: true }) || [];
+  const trimmedImages = await store.update((db) => trimImageCacheRecords(db), {
+    collections: ['settings', 'images', 'jobs'],
+    shouldPersist: (images) => Array.isArray(images) && images.length > 0
+  }) || [];
   await removeStoredImages(trimmedImages);
 
   const db = await store.readCollections(['images']);
@@ -1612,7 +1631,7 @@ async function importPackage(body) {
       accounts: db.accounts.length,
       images: db.images.length
     };
-  });
+  }, { collections: ['settings', 'cards', 'users', 'accounts', 'images', 'jobs'] });
   await removeStoredImages(trimmedImages);
   return result;
 }
@@ -1630,7 +1649,7 @@ async function updateAccount(id, body) {
     if (body.weight !== undefined) account.weight = clamp(Number(body.weight), 1, 100);
     account.updatedAt = new Date().toISOString();
     return account;
-  });
+  }, { collections: ['accounts'] });
 }
 
 async function createJob(token, body, options = {}) {
@@ -1698,13 +1717,13 @@ async function createJob(token, body, options = {}) {
       at: new Date().toISOString()
     });
     return job;
-  });
+  }, { collections: ['users', 'jobs', 'ledger'] });
 }
 
 async function ensureAccountRouteIds() {
   await store.update((db) => {
     assignAccountRouteIds(db.accounts);
-  });
+  }, { collections: ['accounts'] });
 }
 
 async function createDirectJob(token, request, cacheKey, options = {}) {
@@ -1750,7 +1769,7 @@ async function createDirectJob(token, request, cacheKey, options = {}) {
       });
     }
     return job;
-  });
+  }, { collections: ['users', 'jobs', 'ledger'] });
 }
 
 async function markDirectJobRunning(jobId, reservation) {
@@ -1764,7 +1783,7 @@ async function markDirectJobRunning(jobId, reservation) {
     job.error = '';
     job.errorDetail = '';
     job.updatedAt = new Date().toISOString();
-  });
+  }, { collections: ['jobs'] });
 }
 
 async function markDirectJobFailed(jobId, message) {
@@ -1776,14 +1795,14 @@ async function markDirectJobFailed(jobId, message) {
     job.error = publicErrorMessage(detail);
     job.errorDetail = detail;
     job.updatedAt = new Date().toISOString();
-  });
+  }, { collections: ['jobs'] });
   notifyJobWaiters(jobId, { error: publicErrorMessage(detail) });
 }
 
 async function removeJob(jobId) {
   await store.update((db) => {
     db.jobs = db.jobs.filter((job) => job.id !== jobId);
-  });
+  }, { collections: ['jobs'] });
 }
 
 async function timeoutJob(jobId) {
@@ -1813,6 +1832,9 @@ async function cancelQueuedOrRunningJob(jobId, message, detail = message) {
     job.errorDetail = detail;
     job.updatedAt = new Date().toISOString();
     changed = true;
+  }, {
+    collections: ['jobs', 'accounts', 'users', 'ledger'],
+    shouldPersist: () => changed
   });
   if (!changed) return;
   scheduleQueueDrain();
@@ -1899,7 +1921,7 @@ async function reserveQueuedJob(jobId) {
     job.accountId = account?.id || '';
     job.updatedAt = new Date().toISOString();
     return { job, account: account ? { ...account } : null, token: job.userToken, cost: job.cost, accountCost, cacheKey: job.cacheKey || '' };
-  });
+  }, { collections: ['jobs', 'accounts', 'users', 'ledger'] });
 }
 
 async function runReservedJob(reservation) {
@@ -2053,7 +2075,7 @@ async function retryReservationWithNextAccount(reservation, error, tried, option
       account: { ...account },
       job: reservation.job ? { ...reservation.job, accountId: account.id } : reservation.job
     };
-  });
+  }, { collections: ['accounts', 'jobs'] });
 }
 
 async function requeueReservedJob(reservation, error) {
@@ -2077,7 +2099,7 @@ async function requeueReservedJob(reservation, error) {
       job.updatedAt = new Date().toISOString();
     }
     delay = Math.max(250, nextAccountReadyDelay(db.accounts, db.settings) || delay);
-  });
+  }, { collections: ['accounts', 'jobs'] });
   scheduleQueueDrain(delay);
 }
 
@@ -2107,7 +2129,7 @@ async function reserveCreditAndAccount(token, request, cacheKey) {
       at: new Date().toISOString()
     });
     return { token, account: account ? { ...account } : null, cost, accountCost, cacheKey };
-  });
+  }, { collections: ['users', 'accounts', 'ledger'] });
 }
 
 async function reserveCreditAndAccountWhenAvailable(token, request, cacheKey, deadline) {
@@ -2145,7 +2167,7 @@ async function tryReserveCreditAndAccount(token, request, cacheKey) {
       at: new Date().toISOString()
     });
     return { busy: false, reservation: { token, account: account ? { ...account } : null, cost, accountCost, cacheKey } };
-  });
+  }, { collections: ['users', 'accounts', 'ledger'], shouldPersist: (result) => !result?.busy });
 }
 
 async function completeGeneration(reservation, request, image, meta = {}) {
@@ -2203,7 +2225,7 @@ async function completeGeneration(reservation, request, image, meta = {}) {
       trimmedImages = trimImageCacheRecords(db);
 
       return { ...saved, balance: user.balance };
-    });
+    }, { collections: ['users', 'accounts', 'images', 'jobs'] });
   } catch (error) {
     await removeStoredImages([{ id: imageId, file: imageFile }]);
     throw error;
@@ -2233,6 +2255,9 @@ async function cancelReservedJob(reservation, error) {
     job.errorDetail = detail || 'job aborted';
     job.updatedAt = new Date().toISOString();
     changed = true;
+  }, {
+    collections: ['jobs', 'accounts', 'users', 'ledger'],
+    shouldPersist: () => changed
   });
   if (!changed) return;
   scheduleQueueDrain();
@@ -2271,7 +2296,7 @@ async function failGeneration(reservation, error) {
       at: new Date().toISOString(),
       note: message
     });
-  });
+  }, { collections: ['users', 'accounts', 'jobs', 'ledger'] });
   scheduleQueueDrain();
   if (reservation.job?.id) notifyJobWaiters(reservation.job.id, { error: message });
 }
@@ -2370,7 +2395,7 @@ async function drainQueuedJobs() {
           .map((job) => job.id),
         delay: 0
       };
-    });
+    }, { collections: ['accounts'] });
     const jobIds = drainPlan.jobIds || [];
     if (!jobIds.length && drainPlan.delay > 0) queueDrainRequested = true;
     const reservations = await Promise.all(jobIds.map((id) => reserveQueuedJob(id).catch((error) => ({ error }))));
@@ -3163,8 +3188,12 @@ function collectValues(value) {
   return [String(value).trim()].filter(Boolean);
 }
 
-async function serveStatic(urlPath, res) {
-  const pathname = urlPath === '/' ? '/index.html' : urlPath === '/admin' ? '/admin.html' : decodeURIComponent(urlPath);
+async function serveStatic(urlPath, res, options = {}) {
+  const pathname = urlPath === '/'
+    ? '/index.html'
+    : urlPath === '/admin' || urlPath === '/admin/'
+      ? '/admin.html'
+      : decodeURIComponent(urlPath);
   const filePath = path.resolve(publicDir, `.${pathname}`);
   if (!filePath.startsWith(publicDir)) throw httpError(403, 'forbidden.');
 
@@ -3172,16 +3201,18 @@ async function serveStatic(urlPath, res) {
     const content = await readFile(filePath);
     res.writeHead(200, {
       'content-type': contentType(filePath),
-      'cache-control': 'no-store'
+      'cache-control': 'no-store',
+      'content-length': content.length
     });
-    res.end(content);
+    res.end(options.head ? undefined : content);
   } catch {
     const content = await readFile(path.join(publicDir, 'index.html'));
     res.writeHead(200, {
       'content-type': 'text/html; charset=utf-8',
-      'cache-control': 'no-store'
+      'cache-control': 'no-store',
+      'content-length': content.length
     });
-    res.end(content);
+    res.end(options.head ? undefined : content);
   }
 }
 
@@ -3197,12 +3228,14 @@ async function readJson(req) {
 }
 
 function sendJson(res, statusCode, payload) {
+  const body = JSON.stringify(payload);
   res.writeHead(statusCode, {
     'content-type': 'application/json; charset=utf-8',
     'cache-control': 'no-store',
+    'content-length': Buffer.byteLength(body),
     ...corsHeaders()
   });
-  res.end(JSON.stringify(payload));
+  res.end(body);
 }
 
 function sendOpenAiError(res, statusCode, message, type = 'invalid_request_error') {
@@ -3250,6 +3283,15 @@ function sendCorsPreflight(res) {
   res.writeHead(204, {
     ...corsHeaders(),
     'access-control-max-age': '86400'
+  });
+  res.end();
+}
+
+function sendHead(res, statusCode, headers = {}) {
+  res.writeHead(statusCode, {
+    'cache-control': 'no-store',
+    ...corsHeaders(),
+    ...headers
   });
   res.end();
 }
@@ -3335,7 +3377,8 @@ function attachRequestRuntimeLog(req, res) {
   const pathname = requestPathname(req);
   if (!shouldLogRuntimeRequest(method, pathname)) return;
   const startedAt = Date.now();
-  console.log(`[runtime] request start ${method} ${pathname}`);
+  const agent = shortUserAgent(req.headers['user-agent']);
+  console.log(`[runtime] request start ${method} ${pathname}${agent ? ` agent=${agent}` : ''}`);
   let logged = false;
   const finish = (event) => {
     if (logged) return;
@@ -3362,6 +3405,12 @@ function shouldLogRuntimeRequest(method, pathname) {
   if (pathname === '/api/health' || pathname === '/api/settings') return true;
   if (pathname.startsWith('/api/admin/')) return true;
   return false;
+}
+
+function shortUserAgent(value = '') {
+  return String(value || '')
+    .replace(/\s+/g, '_')
+    .slice(0, 80);
 }
 
 function installRuntimeSafetyHandlers() {

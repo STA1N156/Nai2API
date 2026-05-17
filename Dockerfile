@@ -25,4 +25,4 @@ ENV DATA_DIR=/data
 
 EXPOSE 8080
 
-CMD ["npm", "start"]
+CMD ["node", "server/index.js"]

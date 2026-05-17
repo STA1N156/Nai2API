@@ -125,8 +125,8 @@ export class JsonStore {
     this.db.accounts.forEach((account) => {
       account.inFlight = 0;
     });
-    trimDb(this.db);
-    this.persistIncremental(this.db);
+    trimDb(this.db, { collections: ['accounts'] });
+    this.persistIncremental(this.db, { collections: ['accounts'] });
     runtimeLog(`SQLite store init completed in ${Date.now() - startedAt}ms: ${formatDbCounts(this.db)}`);
   }
 
@@ -288,12 +288,15 @@ export class JsonStore {
     this.db = safeDb;
   }
 
-  async update(mutator) {
+  async update(mutator, options = {}) {
     this.queue = this.queue.catch(() => {}).then(async () => {
       await this.ensureLoaded();
       const result = await mutator(this.db);
-      trimDb(this.db);
-      this.persistIncremental(this.db);
+      if (shouldPersistUpdate(result, options)) {
+        const scope = persistenceScope(options);
+        trimDb(this.db, { collections: scope.full ? null : scope.collections });
+        this.persistIncremental(this.db, scope);
+      }
       return cloneValue(result);
     });
     return this.queue;
@@ -561,14 +564,24 @@ export class JsonStore {
     runtimeLog(`SQLite full replace wrote ${formatDbCounts(safeDb)} in ${Date.now() - startedAt}ms`);
   }
 
-  persistIncremental(db) {
-    const safeDb = trimDb(normalizeDb(db));
-    const snapshot = buildSnapshotState(safeDb, this.orderKeys);
+  persistIncremental(db, options = {}) {
+    const startedAt = Date.now();
+    const scope = persistenceScope(options);
+    if (!scope.full && !scope.includeSettings && !scope.collections.length) return;
+    const safeDb = trimDb(normalizeDb(db), { collections: scope.full ? null : scope.collections });
+    const snapshot = buildSnapshotState(safeDb, this.orderKeys, {
+      collections: scope.full ? null : scope.collections,
+      includeSettings: scope.includeSettings,
+      baseRowState: scope.full ? null : this.rowState,
+      baseOrderKeys: scope.full ? null : this.orderKeys
+    });
     const changes = collectPersistenceChanges({
       previousSettings: this.settingsState,
       previousRows: this.rowState,
       nextSettings: snapshot.settingsData,
-      nextRows: snapshot.rowState
+      nextRows: snapshot.rowState,
+      includeSettings: scope.includeSettings,
+      collections: scope.full ? collections : scope.collections
     });
     if (!changes.settingsChanged && !changes.deletes.length && !changes.upserts.length) return;
 
@@ -582,9 +595,19 @@ export class JsonStore {
       }
     });
     applyChanges();
-    this.settingsState = snapshot.settingsData;
-    this.rowState = snapshot.rowState;
-    this.orderKeys = snapshot.orderKeys;
+    if (scope.includeSettings) this.settingsState = snapshot.settingsData;
+    for (const collection of (scope.full ? collections : scope.collections)) {
+      this.rowState[collection] = snapshot.rowState[collection];
+      this.orderKeys[collection] = snapshot.orderKeys[collection];
+    }
+    const duration = Date.now() - startedAt;
+    if (duration >= 500) {
+      const scopeText = scope.full ? 'full' : ['settings', ...scope.collections].filter((item, index, array) => {
+        if (item !== 'settings') return true;
+        return scope.includeSettings && array.indexOf(item) === index;
+      }).join(',');
+      runtimeLog(`SQLite incremental persist slow: ${duration}ms scope=${scopeText || 'none'} upserts=${changes.upserts.length} deletes=${changes.deletes.length} settings=${changes.settingsChanged ? 1 : 0}`);
+    }
   }
 
   async readLegacyOrDefault() {
@@ -628,11 +651,15 @@ export class JsonStore {
 }
 
 function buildSnapshotState(db, previousOrderKeys, options = {}) {
-  const settingsData = JSON.stringify(db.settings);
-  const rowState = emptyCollectionMaps();
-  const orderKeys = emptyCollectionMaps();
+  const settingsData = options.includeSettings === false ? '' : JSON.stringify(db.settings);
+  const hasCollectionOption = options.collections !== undefined && options.collections !== null;
+  const targetCollections = hasCollectionOption
+    ? normalizeCollectionList(options.collections) || []
+    : collections;
+  const rowState = options.baseRowState ? cloneCollectionMaps(options.baseRowState) : emptyCollectionMaps();
+  const orderKeys = options.baseOrderKeys ? cloneCollectionMaps(options.baseOrderKeys) : emptyCollectionMaps();
 
-  for (const collection of collections) {
+  for (const collection of targetCollections) {
     const items = Array.isArray(db[collection]) ? db[collection] : [];
     ensureItemIds(collection, items);
     const orders = options.dense
@@ -654,10 +681,10 @@ function buildSnapshotState(db, previousOrderKeys, options = {}) {
   return { settingsData, rowState, orderKeys };
 }
 
-function collectPersistenceChanges({ previousSettings, previousRows, nextSettings, nextRows }) {
+function collectPersistenceChanges({ previousSettings, previousRows, nextSettings, nextRows, includeSettings = true, collections: targetCollections = collections }) {
   const deletes = [];
   const upserts = [];
-  for (const collection of collections) {
+  for (const collection of targetCollections) {
     const previous = previousRows[collection] || new Map();
     const next = nextRows[collection] || new Map();
     for (const id of previous.keys()) {
@@ -671,10 +698,52 @@ function collectPersistenceChanges({ previousSettings, previousRows, nextSetting
     }
   }
   return {
-    settingsChanged: previousSettings !== nextSettings,
+    settingsChanged: includeSettings && previousSettings !== nextSettings,
     deletes,
     upserts
   };
+}
+
+function shouldPersistUpdate(result, options = {}) {
+  if (options.persist === false) return false;
+  if (typeof options.shouldPersist === 'function') return Boolean(options.shouldPersist(result));
+  return true;
+}
+
+function persistenceScope(options = {}) {
+  if (options.full === true) return { full: true, includeSettings: true, collections };
+  const raw = options.collections ?? options.changedCollections;
+  if (raw === undefined || raw === null) return { full: true, includeSettings: true, collections };
+  const values = Array.isArray(raw) ? raw : [raw];
+  const includeSettings = values.includes('settings') || options.includeSettings === true;
+  const targetCollections = normalizeCollectionList(values);
+  return {
+    full: false,
+    includeSettings,
+    collections: targetCollections || []
+  };
+}
+
+function normalizeCollectionList(value) {
+  if (value === undefined || value === null) return null;
+  const values = Array.isArray(value) ? value : [value];
+  const selected = [];
+  const seen = new Set();
+  for (const item of values) {
+    const collection = String(item || '');
+    if (!collections.includes(collection) || seen.has(collection)) continue;
+    seen.add(collection);
+    selected.push(collection);
+  }
+  return selected.length ? selected : null;
+}
+
+function cloneCollectionMaps(source = {}) {
+  const maps = emptyCollectionMaps();
+  for (const collection of collections) {
+    maps[collection] = new Map(source[collection] || []);
+  }
+  return maps;
 }
 
 function sqlRecord(collection, item, order, data) {
@@ -974,14 +1043,17 @@ function cloneValue(value) {
   return structuredClone(value);
 }
 
-function trimDb(db) {
+function trimDb(db, options = {}) {
+  const hasCollectionOption = options.collections !== undefined && options.collections !== null;
+  const targetCollections = hasCollectionOption ? normalizeCollectionList(options.collections) || [] : null;
+  const shouldTrim = (collection) => !hasCollectionOption || targetCollections.includes(collection);
   const maxCacheImages = clampNumber(db.settings.maxCacheImages, 0, MAX_CACHE_IMAGES_LIMIT);
   db.settings.costPerImage = 1;
   db.settings.maxCacheImages = maxCacheImages;
   db.settings.accountConcurrency = 1;
-  db.jobs = trimJobs(db.jobs);
-  db.images = db.images.slice(0, maxCacheImages);
-  db.ledger = db.ledger.slice(0, 1000);
+  if (shouldTrim('jobs')) db.jobs = trimJobs(db.jobs);
+  if (shouldTrim('images')) db.images = db.images.slice(0, maxCacheImages);
+  if (shouldTrim('ledger')) db.ledger = db.ledger.slice(0, 1000);
   return db;
 }
 
