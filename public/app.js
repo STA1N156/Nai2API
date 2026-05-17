@@ -434,10 +434,13 @@ function resetQueueView(job = {}) {
   const total = Number(job.queuedCount || 0);
   const position = Number(job.queuePosition || 0);
   if (job.status !== 'queued' || !total || !position) return;
+  const target = Math.max(1, position);
   state.queueView = {
-    position: Math.max(1, position),
-    target: Math.max(1, position),
-    count: Math.max(1, total)
+    position: 1,
+    target,
+    count: Math.max(1, total),
+    completing: false,
+    fastForward: target > 1
   };
 }
 
@@ -445,13 +448,14 @@ function updateQueueView(job = {}) {
   const total = Math.max(1, Number(job.queuedCount || 1));
   const target = Math.max(1, Number(job.queuePosition || 1));
   if (!state.queueView) {
-    state.queueView = { position: target, target, count: total, completing: false };
+    state.queueView = { position: 1, target, count: total, completing: false, fastForward: target > 1 };
   } else {
     state.queueView.count = total;
     state.queueView.target = target;
     if (state.queueView.position > target || state.queueView.position > total) {
       state.queueView.position = target;
     }
+    state.queueView.fastForward = state.queueView.position < target;
   }
   ensureQueueViewTimer();
   return state.queueView;
@@ -514,6 +518,9 @@ function ensureQueueViewTimer() {
     if (state.queueView.position < state.queueView.target) {
       state.queueView.position += 1;
       renderQueueText();
+      if (state.queueView.position >= state.queueView.target) {
+        state.queueView.fastForward = false;
+      }
       return;
     }
     if (state.queueView.completing) {
@@ -524,7 +531,7 @@ function ensureQueueViewTimer() {
       el.jobText.textContent = '生成中';
       setLoadingStep(2);
     }
-  }, state.queueView?.completing ? queueCompleteStepIntervalMs : queueStepIntervalMs);
+  }, state.queueView?.completing || state.queueView?.fastForward ? queueCompleteStepIntervalMs : queueStepIntervalMs);
 }
 
 function renderQueueText() {
