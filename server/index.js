@@ -18,9 +18,6 @@ let queueDrainTimer = null;
 let queueDraining = false;
 let queueDrainRequested = false;
 const jobWaiters = new Map();
-const userAdmissionStates = new Map();
-const userAdmissionWaiters = new Map();
-let userAdmissionLock = Promise.resolve();
 const directGenerateTimeoutMs = Number(process.env.DIRECT_GENERATE_TIMEOUT_MS || 60_000);
 const openAiChatTimeoutMs = Number(process.env.OPENAI_CHAT_TIMEOUT_MS || 10 * 60_000);
 const openAiQueuePollMs = 650;
@@ -1432,75 +1429,67 @@ async function updateAccount(id, body) {
 }
 
 async function createJob(token, body) {
-  await waitForUserQueueAdmission(token);
-  try {
-    const job = await store.update((db) => {
-      const user = getUserOrThrow(db, token);
-      const request = normalizeNovelAiRequest(body, db.settings, { maxSteps: DIRECT_URL_MAX_STEPS });
-      const cacheKey = requestCacheKey(token, request, body.seed);
-      const nocache = isNoCache(body.nocache);
-      if (!nocache) {
-        const cached = db.images.find((image) => image.cacheKey === cacheKey && !image.mock && image.mimeType !== 'image/svg+xml');
-        if (cached) {
-          const now = new Date().toISOString();
-          const job = {
-            id: createId('job'),
-            userToken: token,
-            status: 'done',
-            request,
-            cacheKey,
-            cost: 0,
-            accountCost: 0,
-            accountId: cached.accountId || '',
-            createdAt: now,
-            updatedAt: now,
-            imageId: cached.id,
-            error: '',
-            errorDetail: ''
-          };
-          db.jobs.unshift(job);
-          return job;
-        }
+  return store.update((db) => {
+    const user = getUserOrThrow(db, token);
+    const request = normalizeNovelAiRequest(body, db.settings, { maxSteps: DIRECT_URL_MAX_STEPS });
+    const cacheKey = requestCacheKey(token, request, body.seed);
+    const nocache = isNoCache(body.nocache);
+    if (!nocache) {
+      const cached = db.images.find((image) => image.cacheKey === cacheKey && !image.mock && image.mimeType !== 'image/svg+xml');
+      if (cached) {
+        const now = new Date().toISOString();
+        const job = {
+          id: createId('job'),
+          userToken: token,
+          status: 'done',
+          request,
+          cacheKey,
+          cost: 0,
+          accountCost: 0,
+          accountId: cached.accountId || '',
+          createdAt: now,
+          updatedAt: now,
+          imageId: cached.id,
+          error: '',
+          errorDetail: ''
+        };
+        db.jobs.unshift(job);
+        return job;
       }
+    }
 
-      const cost = generationCost(request);
-      const accountCost = accountGenerationCost(request);
-      if (user.balance < cost) throw httpError(402, insufficientBalanceMessage);
-      const queueTotal = activeJobCount(db.jobs) + 1;
-      user.balance -= cost;
-      user.updatedAt = new Date().toISOString();
-      const job = {
-        id: createId('job'),
-        userToken: token,
-        status: 'queued',
-        request,
-        cacheKey,
-        queueTotal,
-        cost,
-        accountCost,
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-        imageId: '',
-        error: '',
-        errorDetail: ''
-      };
-      db.jobs.unshift(job);
-      db.ledger.unshift({
-        id: createId('log'),
-        type: 'reserve',
-        token,
-        jobId: job.id,
-        amount: -cost,
-        at: new Date().toISOString()
-      });
-      return job;
+    const cost = generationCost(request);
+    const accountCost = accountGenerationCost(request);
+    if (user.balance < cost) throw httpError(402, insufficientBalanceMessage);
+    const queueTotal = activeJobCount(db.jobs) + 1;
+    user.balance -= cost;
+    user.updatedAt = new Date().toISOString();
+    const job = {
+      id: createId('job'),
+      userToken: token,
+      status: 'queued',
+      request,
+      cacheKey,
+      queueTotal,
+      cost,
+      accountCost,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      imageId: '',
+      error: '',
+      errorDetail: ''
+    };
+    db.jobs.unshift(job);
+    db.ledger.unshift({
+      id: createId('log'),
+      type: 'reserve',
+      token,
+      jobId: job.id,
+      amount: -cost,
+      at: new Date().toISOString()
     });
-    if (job.status !== 'queued') releaseUserQueueAdmission(token);
     return job;
-  } catch (error) {
-    releaseUserQueueAdmission(token);
-    throw error;
-  }
+  });
 }
 
 async function ensureAccountRouteIds() {
@@ -1510,63 +1499,48 @@ async function ensureAccountRouteIds() {
 }
 
 async function createDirectJob(token, request, cacheKey, options = {}) {
-  const shouldWaitForAdmission = !options.status;
-  if (shouldWaitForAdmission) {
-    await waitForUserQueueAdmission(token, {
-      deadlineAt: options.deadlineAt,
-      timeoutMessage: 'direct generate timeout'
-    });
-  }
-
-  try {
-    const job = await store.update((db) => {
-      const user = getUserOrThrow(db, token);
-      const cost = Number(options.cost ?? generationCost(request));
-      const accountCost = Number(options.accountCost ?? (options.status ? 0 : accountGenerationCost(request)));
-      const shouldCharge = !options.status && cost > 0;
-      if (shouldCharge && user.balance < cost) throw httpError(402, insufficientBalanceMessage);
-      const now = new Date().toISOString();
-      if (shouldCharge) {
-        user.balance -= cost;
-        user.updatedAt = now;
-      }
-      const job = {
-        id: createId('job'),
-        source: 'direct',
-        userToken: token,
-        status: options.status || 'queued',
-        request,
-        cacheKey,
-        queueTotal: options.status === 'done' ? 1 : activeJobCount(db.jobs) + 1,
-        cost: shouldCharge ? cost : Number(options.cost || 0),
-        accountCost,
-        accountId: options.accountId || '',
-        deadlineAt: options.deadlineAt || '',
-        createdAt: now,
-        updatedAt: now,
-        imageId: options.imageId || '',
-        error: '',
-        errorDetail: ''
-      };
-      db.jobs.unshift(job);
-      if (shouldCharge) {
-        db.ledger.unshift({
-          id: createId('log'),
-          type: 'reserve',
-          token,
-          jobId: job.id,
-          amount: -cost,
-          at: now
-        });
-      }
-      return job;
-    });
-    if (shouldWaitForAdmission && job.status !== 'queued') releaseUserQueueAdmission(token);
+  return store.update((db) => {
+    const user = getUserOrThrow(db, token);
+    const cost = Number(options.cost ?? generationCost(request));
+    const accountCost = Number(options.accountCost ?? (options.status ? 0 : accountGenerationCost(request)));
+    const shouldCharge = !options.status && cost > 0;
+    if (shouldCharge && user.balance < cost) throw httpError(402, insufficientBalanceMessage);
+    const now = new Date().toISOString();
+    if (shouldCharge) {
+      user.balance -= cost;
+      user.updatedAt = now;
+    }
+    const job = {
+      id: createId('job'),
+      source: 'direct',
+      userToken: token,
+      status: options.status || 'queued',
+      request,
+      cacheKey,
+      queueTotal: options.status === 'done' ? 1 : activeJobCount(db.jobs) + 1,
+      cost: shouldCharge ? cost : Number(options.cost || 0),
+      accountCost,
+      accountId: options.accountId || '',
+      deadlineAt: options.deadlineAt || '',
+      createdAt: now,
+      updatedAt: now,
+      imageId: options.imageId || '',
+      error: '',
+      errorDetail: ''
+    };
+    db.jobs.unshift(job);
+    if (shouldCharge) {
+      db.ledger.unshift({
+        id: createId('log'),
+        type: 'reserve',
+        token,
+        jobId: job.id,
+        amount: -cost,
+        at: now
+      });
+    }
     return job;
-  } catch (error) {
-    if (shouldWaitForAdmission) releaseUserQueueAdmission(token);
-    throw error;
-  }
+  });
 }
 
 async function markDirectJobRunning(jobId, reservation) {
@@ -1585,44 +1559,34 @@ async function markDirectJobRunning(jobId, reservation) {
 
 async function markDirectJobFailed(jobId, message) {
   const detail = errorDetailMessage(message);
-  let token = '';
   await store.update((db) => {
     const job = db.jobs.find((item) => item.id === jobId);
     if (!job) return;
-    token = job.userToken || '';
     job.status = 'failed';
     job.error = publicErrorMessage(detail);
     job.errorDetail = detail;
     job.updatedAt = new Date().toISOString();
   });
-  if (token) notifyUserAdmissionWaiters(token);
   notifyJobWaiters(jobId, { error: publicErrorMessage(detail) });
 }
 
 async function removeJob(jobId) {
-  let token = '';
   await store.update((db) => {
-    const job = db.jobs.find((item) => item.id === jobId);
-    token = job?.userToken || '';
     db.jobs = db.jobs.filter((job) => job.id !== jobId);
   });
-  if (token) notifyUserAdmissionWaiters(token);
 }
 
 async function timeoutDirectJob(jobId) {
-  let token = '';
   await store.update((db) => {
     const job = db.jobs.find((item) => item.id === jobId);
     if (!job || ['done', 'failed'].includes(job.status)) return;
     if (job.status !== 'queued') return;
-    token = job.userToken || '';
     refundJob(db, job, '连接超时');
     job.status = 'failed';
     job.error = '连接超时';
     job.errorDetail = 'direct generate timeout';
     job.updatedAt = new Date().toISOString();
   });
-  if (token) notifyUserAdmissionWaiters(token);
 }
 
 function waitForJobResult(jobId, deadline) {
@@ -1653,114 +1617,6 @@ function removeJobWaiter(jobId, waiter) {
   if (!waiters) return;
   waiters.delete(waiter);
   if (!waiters.size) jobWaiters.delete(jobId);
-}
-
-async function waitForUserQueueAdmission(token, options = {}) {
-  const userToken = String(token || '').trim();
-  while (true) {
-    const admitted = await reserveUserQueueAdmission(userToken);
-    if (admitted) return;
-    await waitForUserAdmissionWake(userToken, options);
-  }
-}
-
-async function reserveUserQueueAdmission(token) {
-  return withUserAdmissionLock(async () => {
-    const db = await store.readCollections(['jobs']);
-    return reserveUserQueueAdmissionFromJobs(token, db.jobs || []);
-  });
-}
-
-function reserveUserQueueAdmissionFromJobs(token, jobs) {
-  const limit = userQueueBatchSize();
-  const active = userActiveJobCount(jobs, token);
-  const now = Date.now();
-  let state = userAdmissionStates.get(token);
-  if (!state) {
-    state = {
-      slotsRemaining: active > 0 ? Math.max(0, limit - active) : limit,
-      updatedAt: now
-    };
-  } else if (active === 0 && Number(state.slotsRemaining || 0) <= 0) {
-    state.slotsRemaining = limit;
-  } else if (active >= limit) {
-    state.slotsRemaining = 0;
-  }
-
-  if (Number(state.slotsRemaining || 0) > 0) {
-    state.slotsRemaining = Number(state.slotsRemaining || 0) - 1;
-    state.updatedAt = now;
-    userAdmissionStates.set(token, state);
-    return true;
-  }
-
-  state.updatedAt = now;
-  userAdmissionStates.set(token, state);
-  return false;
-}
-
-function releaseUserQueueAdmission(token) {
-  const userToken = String(token || '').trim();
-  if (!userToken) return;
-  withUserAdmissionLock(async () => {
-    const limit = userQueueBatchSize();
-    const state = userAdmissionStates.get(userToken) || { slotsRemaining: 0, updatedAt: Date.now() };
-    state.slotsRemaining = Math.min(limit, Number(state.slotsRemaining || 0) + 1);
-    state.updatedAt = Date.now();
-    userAdmissionStates.set(userToken, state);
-  })
-    .then(() => notifyUserAdmissionWaiters(userToken))
-    .catch((error) => console.error('Failed to release user queue admission:', error));
-}
-
-function waitForUserAdmissionWake(token, options = {}) {
-  const deadline = Date.parse(options.deadlineAt || '') || Number(options.deadline || 0);
-  const remainingMs = deadline ? deadline - Date.now() : 0;
-  if (deadline && remainingMs <= 0) {
-    throw httpError(options.timeoutStatusCode || 429, options.timeoutMessage || 'user queue admission timeout.');
-  }
-
-  return new Promise((resolve, reject) => {
-    const waiter = {
-      resolve: () => {
-        cleanup();
-        resolve();
-      },
-      reject: (error) => {
-        cleanup();
-        reject(error);
-      }
-    };
-    const cleanup = () => {
-      if (timer) clearTimeout(timer);
-      const waiters = userAdmissionWaiters.get(token);
-      if (!waiters) return;
-      waiters.delete(waiter);
-      if (!waiters.size) userAdmissionWaiters.delete(token);
-    };
-    const timer = deadline
-      ? setTimeout(() => {
-          waiter.reject(httpError(options.timeoutStatusCode || 429, options.timeoutMessage || 'user queue admission timeout.'));
-        }, Math.max(1, remainingMs))
-      : null;
-
-    if (!userAdmissionWaiters.has(token)) userAdmissionWaiters.set(token, new Set());
-    userAdmissionWaiters.get(token).add(waiter);
-  });
-}
-
-function notifyUserAdmissionWaiters(token) {
-  const userToken = String(token || '').trim();
-  const waiters = userAdmissionWaiters.get(userToken);
-  if (!waiters) return;
-  userAdmissionWaiters.delete(userToken);
-  waiters.forEach((waiter) => waiter.resolve());
-}
-
-function withUserAdmissionLock(task) {
-  const run = userAdmissionLock.catch(() => {}).then(task);
-  userAdmissionLock = run.catch(() => {});
-  return run;
 }
 
 async function runJob(jobId) {
@@ -2048,7 +1904,6 @@ async function completeGeneration(reservation, request, image, meta = {}) {
   }
   await removeStoredImages(trimmedImages);
   scheduleQueueDrain();
-  notifyUserAdmissionWaiters(reservation.token);
   if (meta.jobId) notifyJobWaiters(meta.jobId, { saved: savedImage, image, balance: savedImage.balance });
   return savedImage;
 }
@@ -2087,7 +1942,6 @@ async function failGeneration(reservation, error) {
     });
   });
   scheduleQueueDrain();
-  notifyUserAdmissionWaiters(reservation.token);
   if (reservation.job?.id) notifyJobWaiters(reservation.job.id, { error: message });
 }
 
@@ -2486,14 +2340,6 @@ function jobDurationMs(job) {
 
 function activeJobCount(jobs) {
   return jobs.filter((job) => ['queued', 'running'].includes(job.status)).length;
-}
-
-function userActiveJobCount(jobs, token) {
-  return jobs.filter((job) => job.userToken === token && ['queued', 'running'].includes(job.status)).length;
-}
-
-function userQueueBatchSize() {
-  return clamp(Number(process.env.USER_QUEUE_BATCH_SIZE || process.env.USER_ACTIVE_JOB_LIMIT || 3), 1, 1000);
 }
 
 function isExpiredJob(job) {
