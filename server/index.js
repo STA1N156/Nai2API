@@ -1377,7 +1377,7 @@ async function cleanupStaleActiveJobs(reason = 'stale active job cleanup') {
       changed: failedJobIds.length,
       jobIds: failedJobIds
     };
-  }, { flush: true });
+  });
 
   if (!result?.changed) return result;
   result.jobIds.forEach((jobId) => notifyJobWaiters(jobId, { error: 'direct generate timeout' }));
@@ -2242,7 +2242,7 @@ async function drainQueuedJobs() {
       if (slots <= 0) return { jobIds: [], delay: nextAccountReadyDelay(db.accounts, db.settings) };
       return {
         jobIds: db.jobs
-          .filter((job) => job.status === 'queued')
+          .filter((job) => job.status === 'queued' && isQueueActiveJob(job))
           .reverse()
           .slice(0, slots)
           .map((job) => job.id),
