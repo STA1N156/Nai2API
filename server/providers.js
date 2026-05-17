@@ -363,13 +363,18 @@ function writeAndReadHttpResponse(socket, request, signal) {
     socket.on('data', onData);
     socket.once('end', onEnd);
     socket.once('error', onError);
-    socket.end(request);
+    socket.write(request, (error) => {
+      if (error) rejectAndClose(error);
+    });
   });
 }
 
 function parseHttpResponse(buffer) {
   const headerEnd = buffer.indexOf('\r\n\r\n');
-  if (headerEnd < 0) throw new Error('Invalid HTTP response from NovelAI.');
+  if (headerEnd < 0) {
+    const preview = buffer.length ? buffer.slice(0, 80).toString('latin1').replace(/[^\x20-\x7e]/g, '.') : 'empty response';
+    throw new Error(`Invalid HTTP response from NovelAI via SOCKS5 proxy: ${preview}`);
+  }
   const headerText = buffer.slice(0, headerEnd).toString('latin1');
   const [statusLine, ...headerLines] = headerText.split('\r\n');
   const status = Number(statusLine.match(/^HTTP\/\d(?:\.\d)?\s+(\d+)/)?.[1] || 0);
