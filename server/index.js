@@ -89,6 +89,7 @@ server.listen(port, host, () => {
     scheduleQueueDrain();
   });
 });
+installShutdownHandlers(server);
 
 async function applyRuntimeSettings() {
   const publicBaseUrl = normalizePublicBaseUrl(process.env.PUBLIC_BASE_URL || '');
@@ -3445,6 +3446,27 @@ function installRuntimeSafetyHandlers() {
     console.error('[runtime] unhandled rejection:', reason);
     process.exit(1);
   });
+}
+
+function installShutdownHandlers(serverInstance) {
+  if (installShutdownHandlers.installed) return;
+  installShutdownHandlers.installed = true;
+  let shuttingDown = false;
+  const shutdown = (signal) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`[runtime] ${signal} received. Flushing SQLite changes before shutdown.`);
+    try {
+      store.flushSync();
+    } catch (error) {
+      console.error('[runtime] failed to flush SQLite changes during shutdown:', error);
+    }
+    const forceTimer = setTimeout(() => process.exit(0), 5000);
+    forceTimer.unref?.();
+    serverInstance.close(() => process.exit(0));
+  };
+  process.once('SIGTERM', () => shutdown('SIGTERM'));
+  process.once('SIGINT', () => shutdown('SIGINT'));
 }
 
 function isRecoverableRuntimeAbort(error) {

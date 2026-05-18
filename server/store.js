@@ -95,6 +95,8 @@ export class JsonStore {
     this.rowState = emptyCollectionMaps();
     this.orderKeys = emptyCollectionMaps();
     this.settingsState = '';
+    this.pendingPersistScope = null;
+    this.pendingPersistTimer = null;
   }
 
   async init() {
@@ -283,6 +285,7 @@ export class JsonStore {
 
   async write(db) {
     await this.ensureLoaded();
+    this.clearPendingPersist();
     const safeDb = trimDb(normalizeDb(db));
     this.replaceAll(safeDb);
     this.db = safeDb;
@@ -295,8 +298,13 @@ export class JsonStore {
       const persistOptions = resolvePersistenceOptions(options, result, this.db);
       if (shouldPersistUpdate(result, persistOptions)) {
         const scope = persistenceScope(persistOptions);
-        if (!scope.hasDirtyRows) trimDb(this.db, { collections: scope.full ? null : scope.collections });
-        this.persistIncremental(this.db, scope);
+        if (shouldDeferPersist(scope, persistOptions)) {
+          this.schedulePersist(scope);
+        } else {
+          this.flushPendingPersistSync();
+          if (!scope.hasDirtyRows) trimDb(this.db, { collections: scope.full ? null : scope.collections });
+          this.persistIncremental(this.db, scope);
+        }
       }
       return cloneValue(result);
     });
@@ -304,19 +312,49 @@ export class JsonStore {
   }
 
   scheduleFlush() {
-    return null;
+    this.schedulePersist({ full: true, includeSettings: true, collections, dirtyRows: {}, hasDirtyRows: false });
+    return this.pendingPersistTimer;
   }
 
   async flush() {
     await this.ensureLoaded();
+    this.flushPendingPersistSync();
     this.persistIncremental(this.db);
+  }
+
+  flushSync() {
+    if (!this.db) return;
+    this.flushPendingPersistSync();
   }
 
   close() {
     if (!this.sqlite) return;
+    this.flushPendingPersistSync();
     this.sqlite.close();
     this.sqlite = null;
     this.statements = null;
+  }
+
+  schedulePersist(scope) {
+    this.pendingPersistScope = mergePersistenceScopes(this.pendingPersistScope, scope);
+    if (this.pendingPersistTimer) return;
+    this.pendingPersistTimer = setTimeout(() => {
+      this.pendingPersistTimer = null;
+      this.flushPendingPersistSync();
+    }, sqliteWriteDebounceMs());
+    this.pendingPersistTimer.unref?.();
+  }
+
+  flushPendingPersistSync() {
+    if (!this.pendingPersistScope) return;
+    if (this.pendingPersistTimer) {
+      clearTimeout(this.pendingPersistTimer);
+      this.pendingPersistTimer = null;
+    }
+    const scope = this.pendingPersistScope;
+    this.pendingPersistScope = null;
+    if (!scope.hasDirtyRows) trimDb(this.db, { collections: scope.full ? null : scope.collections });
+    this.persistIncremental(this.db, scope);
   }
 
   selectItems(collection, clause = 'ORDER BY order_value DESC', params = {}) {
@@ -543,6 +581,7 @@ export class JsonStore {
   }
 
   replaceAll(db) {
+    this.clearPendingPersist();
     const safeDb = trimDb(normalizeDb(db));
     const snapshot = buildSnapshotState(safeDb, emptyCollectionMaps(), { dense: true });
     const startedAt = Date.now();
@@ -563,6 +602,14 @@ export class JsonStore {
     this.rowState = snapshot.rowState;
     this.orderKeys = snapshot.orderKeys;
     runtimeLog(`SQLite full replace wrote ${formatDbCounts(safeDb)} in ${Date.now() - startedAt}ms`);
+  }
+
+  clearPendingPersist() {
+    if (this.pendingPersistTimer) {
+      clearTimeout(this.pendingPersistTimer);
+      this.pendingPersistTimer = null;
+    }
+    this.pendingPersistScope = null;
   }
 
   persistIncremental(db, options = {}) {
@@ -608,7 +655,7 @@ export class JsonStore {
       this.orderKeys[collection] = snapshot.orderKeys[collection];
     }
     const duration = Date.now() - startedAt;
-    if (duration >= 500) {
+    if (duration >= sqliteSlowLogMs()) {
       const scopeText = scope.full ? 'full' : ['settings', ...scope.collections].filter((item, index, array) => {
         if (item !== 'settings') return true;
         return scope.includeSettings && array.indexOf(item) === index;
@@ -718,7 +765,7 @@ export class JsonStore {
     }
 
     const duration = Date.now() - startedAt;
-    if (duration >= 500) {
+    if (duration >= sqliteSlowLogMs()) {
       runtimeLog(`SQLite dirty-row persist slow: ${duration}ms scope=${scope.collections.join(',') || 'none'} upserts=${changes.upserts.length} deletes=${changes.deletes.length} settings=${changes.settingsChanged ? 1 : 0}`);
     }
   }
@@ -824,12 +871,68 @@ function shouldPersistUpdate(result, options = {}) {
   return true;
 }
 
+function shouldDeferPersist(scope, options = {}) {
+  if (!sqliteBatchWritesEnabled()) return false;
+  if (options.immediate === true || options.defer === false) return false;
+  return Boolean(scope?.hasDirtyRows && !scope.full);
+}
+
 function resolvePersistenceOptions(options = {}, result, db) {
   const resolved = { ...options };
   for (const key of ['dirtyRows', 'rows', 'changedRows']) {
     if (typeof resolved[key] === 'function') resolved[key] = resolved[key](result, db);
   }
   return resolved;
+}
+
+function mergePersistenceScopes(current, next) {
+  if (!current) return clonePersistenceScope(next);
+  if (!next) return clonePersistenceScope(current);
+  if (current.full || next.full) {
+    return { full: true, includeSettings: true, collections, dirtyRows: {}, hasDirtyRows: false };
+  }
+
+  const targetCollections = new Set([...(current.collections || []), ...(next.collections || [])]);
+  const fullCollections = new Set();
+  const dirtyRows = {};
+
+  for (const scope of [current, next]) {
+    for (const collection of scope.collections || []) {
+      const ids = scope.dirtyRows?.[collection];
+      if (!ids || !ids.size) {
+        fullCollections.add(collection);
+        delete dirtyRows[collection];
+        continue;
+      }
+      if (fullCollections.has(collection)) continue;
+      if (!dirtyRows[collection]) dirtyRows[collection] = new Set();
+      for (const id of ids) dirtyRows[collection].add(id);
+    }
+  }
+
+  return {
+    full: false,
+    includeSettings: Boolean(current.includeSettings || next.includeSettings),
+    collections: [...targetCollections].filter((collection) => collections.includes(collection)),
+    dirtyRows,
+    hasDirtyRows: Object.keys(dirtyRows).length > 0
+  };
+}
+
+function clonePersistenceScope(scope) {
+  if (!scope) return null;
+  if (scope.full) return { full: true, includeSettings: true, collections, dirtyRows: {}, hasDirtyRows: false };
+  const dirtyRows = {};
+  for (const [collection, ids] of Object.entries(scope.dirtyRows || {})) {
+    dirtyRows[collection] = new Set(ids || []);
+  }
+  return {
+    full: false,
+    includeSettings: Boolean(scope.includeSettings),
+    collections: normalizeCollectionList(scope.collections) || [],
+    dirtyRows,
+    hasDirtyRows: Object.keys(dirtyRows).length > 0
+  };
 }
 
 function persistenceScope(options = {}) {
@@ -1102,6 +1205,22 @@ function safeJson(text, fallback) {
 
 function runtimeLog(message) {
   console.log(`[runtime] ${message}`);
+}
+
+function sqliteSlowLogMs() {
+  const configured = Number(process.env.SQLITE_SLOW_LOG_MS || 500);
+  if (Number.isFinite(configured) && configured >= 0) return Math.floor(configured);
+  return 500;
+}
+
+function sqliteBatchWritesEnabled() {
+  return process.env.SQLITE_BATCH_WRITES !== 'false';
+}
+
+function sqliteWriteDebounceMs() {
+  const configured = Number(process.env.SQLITE_WRITE_DEBOUNCE_MS || 150);
+  if (Number.isFinite(configured) && configured >= 0) return Math.floor(configured);
+  return 150;
 }
 
 function formatDbCounts(db = {}) {
