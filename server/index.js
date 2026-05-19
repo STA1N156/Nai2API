@@ -188,7 +188,10 @@ async function route(req, res) {
       };
       trimmedImages = trimImageCacheRecords(db);
       return db.settings;
-    }, { collections: ['settings', 'images', 'jobs'] });
+    }, {
+      collections: ['settings'],
+      dirtyRows: () => imageCacheTrimDirtyRows(trimmedImages)
+    });
     await removeStoredImages(trimmedImages);
     scheduleQueueDrain();
     sendJson(res, 200, settings);
@@ -1524,7 +1527,8 @@ async function logStartupQueueState() {
 async function cleanupImageStorage() {
   const startedAt = Date.now();
   const trimmedImages = await store.update((db) => trimImageCacheRecords(db), {
-    collections: ['settings', 'images', 'jobs'],
+    collections: ['settings'],
+    dirtyRows: imageCacheTrimDirtyRows,
     shouldPersist: (images) => Array.isArray(images) && images.length > 0
   }) || [];
   await removeStoredImages(trimmedImages);
@@ -1574,14 +1578,31 @@ function trimImageCacheRecords(db) {
   const removedImages = db.images.slice(maxCacheImages);
   db.images = db.images.slice(0, maxCacheImages);
 
-  const removedIds = new Set(removedImages.map((image) => image.id));
+  const removedIds = new Set(removedImages.map((image) => image.id).filter(Boolean));
+  const affectedJobIds = [];
   if (removedIds.size && Array.isArray(db.jobs)) {
     db.jobs.forEach((job) => {
-      if (removedIds.has(job.imageId)) job.imageId = '';
+      if (!removedIds.has(job.imageId)) return;
+      job.imageId = '';
+      if (job.id) affectedJobIds.push(job.id);
     });
   }
 
+  removedImages.affectedJobIds = affectedJobIds;
   return removedImages;
+}
+
+function imageCacheTrimDirtyRows(trimmedImages = []) {
+  const images = uniqueIds((Array.isArray(trimmedImages) ? trimmedImages : []).map((image) => image?.id));
+  const jobs = uniqueIds(trimmedImages?.affectedJobIds || []);
+  return {
+    ...(images.length ? { images } : {}),
+    ...(jobs.length ? { jobs } : {})
+  };
+}
+
+function uniqueIds(values = []) {
+  return [...new Set(values.map((value) => String(value || '').trim()).filter(Boolean))];
 }
 
 function normalizeCacheImageLimit(value) {
@@ -1635,7 +1656,10 @@ async function importPackage(body) {
       accounts: db.accounts.length,
       images: db.images.length
     };
-  }, { collections: ['settings', 'cards', 'users', 'accounts', 'images', 'jobs'] });
+  }, {
+    collections: ['settings', 'cards', 'users', 'accounts'],
+    dirtyRows: () => imageCacheTrimDirtyRows(trimmedImages)
+  });
   await removeStoredImages(trimmedImages);
   return result;
 }
@@ -2264,13 +2288,12 @@ async function completeGeneration(reservation, request, image, meta = {}) {
 
       return { ...saved, balance: user.balance };
     }, {
-      collections: ['users', 'accounts', 'images', 'jobs'],
-      dirtyRows: (saved) => trimmedImages.length
-        ? {}
-        : {
-            images: saved?.id ? [saved.id] : [],
-            jobs: meta.jobId ? [meta.jobId] : []
-          }
+      dirtyRows: (saved) => ({
+        ...imageCacheTrimDirtyRows(trimmedImages),
+        accounts: uniqueIds([reservation.account?.id]),
+        images: uniqueIds([saved?.id, ...trimmedImages.map((item) => item?.id)]),
+        jobs: uniqueIds([meta.jobId, ...(trimmedImages.affectedJobIds || [])])
+      })
     });
   } catch (error) {
     await removeStoredImages([{ id: imageId, file: imageFile }]);
