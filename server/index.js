@@ -1439,8 +1439,7 @@ async function cleanupStaleActiveJobs(reason = 'stale active job cleanup') {
       jobIds: failedJobIds
     };
   }, {
-    collections: ['jobs', 'accounts', 'users', 'ledger'],
-    dirtyRows: (result) => ({ jobs: result?.jobIds || [] }),
+    dirtyRows: dirtyJobListRows,
     shouldPersist: (result) => Number(result?.changed || 0) > 0
   });
 
@@ -1504,8 +1503,7 @@ async function cleanupInterruptedStartupJobs() {
       jobIds: failedJobIds
     };
   }, {
-    collections: ['jobs', 'accounts', 'users', 'ledger'],
-    dirtyRows: (result) => ({ jobs: result?.jobIds || [] }),
+    dirtyRows: dirtyJobListRows,
     shouldPersist: (result) => Number(result?.changed || 0) > 0
   });
 
@@ -1691,12 +1689,64 @@ function dirtyJobRows(jobId) {
   return jobId ? { jobs: [jobId] } : {};
 }
 
-function dirtyResultJobRows(result) {
-  return dirtyJobRows(result?.job?.id || result?.jobId);
+function dirtyResultJobRows(result, db) {
+  return dirtyJobMutationRows(result, db);
 }
 
 function dirtyReservationJobRows(reservation) {
-  return dirtyJobRows(reservation?.job?.id);
+  return (result, db) => dirtyJobMutationRows({
+    job: result?.job || reservation?.job,
+    jobId: result?.job?.id || result?.jobId || reservation?.job?.id,
+    token: result?.token || reservation?.token || reservation?.job?.userToken,
+    accountIds: [reservation?.account?.id, result?.account?.id, result?.job?.accountId]
+  }, db);
+}
+
+function dirtyJobMutationRows(source = {}, db = {}) {
+  const jobId = source?.job?.id || source?.jobId || source?.id || '';
+  const job = source?.job || (jobId ? db.jobs?.find((item) => item.id === jobId) : null);
+  const token = source?.token || source?.userToken || job?.userToken || '';
+  const accountIds = uniqueIds([
+    ...(Array.isArray(source?.accountIds) ? source.accountIds : []),
+    source?.account?.id,
+    source?.accountId,
+    job?.accountId
+  ]);
+  const ledgerIds = uniqueIds([
+    source?.ledgerId,
+    ...(jobId ? (db.ledger || []).filter((entry) => entry.jobId === jobId).map((entry) => entry.id) : [])
+  ]);
+  const user = token && ledgerIds.length ? db.users?.find((item) => item.token === token) : null;
+  return {
+    ...(jobId ? { jobs: [jobId] } : {}),
+    ...(user?.id ? { users: [user.id] } : {}),
+    ...(accountIds.length ? { accounts: accountIds } : {}),
+    ...(ledgerIds.length ? { ledger: ledgerIds } : {})
+  };
+}
+
+function dirtyJobListRows(result = {}, db = {}) {
+  const rows = {};
+  for (const jobId of result?.jobIds || []) {
+    mergeDirtyRows(rows, dirtyJobMutationRows({ jobId }, db));
+  }
+  return rows;
+}
+
+function dirtyCreditReservationRows(result) {
+  const reservation = result?.reservation || result || {};
+  return {
+    ...(reservation.userId ? { users: [reservation.userId] } : {}),
+    ...(reservation.account?.id ? { accounts: [reservation.account.id] } : {}),
+    ...(reservation.ledgerId ? { ledger: [reservation.ledgerId] } : {})
+  };
+}
+
+function mergeDirtyRows(target, source = {}) {
+  Object.entries(source).forEach(([collection, ids]) => {
+    target[collection] = uniqueIds([...(target[collection] || []), ...(Array.isArray(ids) ? ids : [ids])]);
+  });
+  return target;
 }
 
 async function createJob(token, body, options = {}) {
@@ -1766,8 +1816,7 @@ async function createJob(token, body, options = {}) {
     });
     return job;
   }, {
-    collections: ['users', 'jobs', 'ledger'],
-    dirtyRows: (job) => dirtyJobRows(job?.id)
+    dirtyRows: dirtyResultJobRows
   });
 }
 
@@ -1822,8 +1871,7 @@ async function createDirectJob(token, request, cacheKey, options = {}) {
     }
     return job;
   }, {
-    collections: ['users', 'jobs', 'ledger'],
-    dirtyRows: (job) => dirtyJobRows(job?.id)
+    dirtyRows: dirtyResultJobRows
   });
 }
 
@@ -1891,8 +1939,7 @@ async function cancelQueuedOrRunningJob(jobId, message, detail = message) {
     job.completedAt = job.updatedAt;
     changed = true;
   }, {
-    collections: ['jobs', 'accounts', 'users', 'ledger'],
-    dirtyRows: dirtyJobRows(jobId),
+    dirtyRows: (_result, db) => dirtyJobMutationRows({ jobId }, db),
     shouldPersist: () => changed
   });
   if (!changed) return;
@@ -1984,7 +2031,6 @@ async function reserveQueuedJob(jobId) {
     job.updatedAt = new Date().toISOString();
     return { job, account: account ? { ...account } : null, token: job.userToken, cost: job.cost, accountCost, cacheKey: job.cacheKey || '' };
   }, {
-    collections: ['jobs', 'accounts', 'users', 'ledger'],
     dirtyRows: dirtyResultJobRows,
     shouldPersist: (result) => result?.changed !== false
   });
@@ -2142,7 +2188,7 @@ async function retryReservationWithNextAccount(reservation, error, tried, option
       account: { ...account },
       job: reservation.job ? { ...reservation.job, accountId: account.id } : reservation.job
     };
-  }, { collections: ['accounts', 'jobs'], dirtyRows: dirtyReservationJobRows(reservation) });
+  }, { dirtyRows: dirtyReservationJobRows(reservation) });
 }
 
 async function requeueReservedJob(reservation, error) {
@@ -2167,7 +2213,7 @@ async function requeueReservedJob(reservation, error) {
       job.updatedAt = new Date().toISOString();
     }
     delay = Math.max(250, nextAccountReadyDelay(db.accounts, db.settings) || delay);
-  }, { collections: ['accounts', 'jobs'], dirtyRows: dirtyReservationJobRows(reservation) });
+  }, { dirtyRows: dirtyReservationJobRows(reservation) });
   scheduleQueueDrain(delay);
 }
 
@@ -2188,16 +2234,19 @@ async function reserveCreditAndAccount(token, request, cacheKey) {
     }
     user.balance -= cost;
     user.updatedAt = new Date().toISOString();
-    db.ledger.unshift({
+    const ledger = {
       id: createId('log'),
       type: 'charge',
       token,
       accountId: account?.id || '',
       amount: -cost,
       at: new Date().toISOString()
-    });
-    return { token, account: account ? { ...account } : null, cost, accountCost, cacheKey };
-  }, { collections: ['users', 'accounts', 'ledger'] });
+    };
+    db.ledger.unshift(ledger);
+    return { token, userId: user.id, account: account ? { ...account } : null, ledgerId: ledger.id, cost, accountCost, cacheKey };
+  }, {
+    dirtyRows: dirtyCreditReservationRows
+  });
 }
 
 async function reserveCreditAndAccountWhenAvailable(token, request, cacheKey, deadline) {
@@ -2226,16 +2275,20 @@ async function tryReserveCreditAndAccount(token, request, cacheKey) {
     }
     user.balance -= cost;
     user.updatedAt = new Date().toISOString();
-    db.ledger.unshift({
+    const ledger = {
       id: createId('log'),
       type: 'charge',
       token,
       accountId: account?.id || '',
       amount: -cost,
       at: new Date().toISOString()
-    });
-    return { busy: false, reservation: { token, account: account ? { ...account } : null, cost, accountCost, cacheKey } };
-  }, { collections: ['users', 'accounts', 'ledger'], shouldPersist: (result) => !result?.busy });
+    };
+    db.ledger.unshift(ledger);
+    return { busy: false, reservation: { token, userId: user.id, account: account ? { ...account } : null, ledgerId: ledger.id, cost, accountCost, cacheKey } };
+  }, {
+    dirtyRows: dirtyCreditReservationRows,
+    shouldPersist: (result) => !result?.busy
+  });
 }
 
 async function completeGeneration(reservation, request, image, meta = {}) {
@@ -2333,7 +2386,6 @@ async function cancelReservedJob(reservation, error) {
     job.completedAt = job.updatedAt;
     changed = true;
   }, {
-    collections: ['jobs', 'accounts', 'users', 'ledger'],
     dirtyRows: dirtyReservationJobRows(reservation),
     shouldPersist: () => changed
   });
@@ -2371,12 +2423,12 @@ async function failGeneration(reservation, error) {
       id: createId('log'),
       type: 'refund',
       token: reservation.token,
+      jobId: reservation.job?.id || '',
       amount: Number(reservation.cost || 0),
       at: new Date().toISOString(),
       note: message
     });
   }, {
-    collections: ['users', 'accounts', 'jobs', 'ledger'],
     dirtyRows: dirtyReservationJobRows(reservation)
   });
   scheduleQueueDrain();
@@ -2843,6 +2895,7 @@ function refundJob(db, job, note) {
     id: createId('log'),
     type: 'refund',
     token: job.userToken,
+    jobId: job.id || '',
     amount: cost,
     at: job.refundedAt,
     note

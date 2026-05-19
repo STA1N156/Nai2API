@@ -687,8 +687,9 @@ export class JsonStore {
       const previousRows = this.rowState[collection] || new Map();
       const previousOrders = this.orderKeys[collection] || new Map();
       const items = Array.isArray(db[collection]) ? db[collection] : [];
+      const dirtyIndexes = dirtyItemIndexes(items, dirtyIds);
       for (const id of dirtyIds) {
-        const index = items.findIndex((item) => String(item?.id || '') === id);
+        const index = dirtyIndexes.get(id) ?? -1;
         if (index < 0) {
           if (previousRows.has(id)) changes.deletes.push({ collection, id });
           continue;
@@ -1161,6 +1162,18 @@ function dirtyRowOrder(items, index, previousOrders) {
   return orderValuesForRun(1, before, after)[0];
 }
 
+function dirtyItemIndexes(items, dirtyIds) {
+  const indexes = new Map();
+  let remaining = dirtyIds.size;
+  for (let index = 0; index < items.length && remaining > 0; index += 1) {
+    const id = String(items[index]?.id || '');
+    if (!dirtyIds.has(id) || indexes.has(id)) continue;
+    indexes.set(id, index);
+    remaining -= 1;
+  }
+  return indexes;
+}
+
 function existingOrderSequenceIsStable(items, previousOrders) {
   let last = Number.POSITIVE_INFINITY;
   for (const item of items) {
@@ -1218,9 +1231,9 @@ function sqliteBatchWritesEnabled() {
 }
 
 function sqliteWriteDebounceMs() {
-  const configured = Number(process.env.SQLITE_WRITE_DEBOUNCE_MS || 150);
+  const configured = Number(process.env.SQLITE_WRITE_DEBOUNCE_MS || 500);
   if (Number.isFinite(configured) && configured >= 0) return Math.floor(configured);
-  return 150;
+  return 500;
 }
 
 function formatDbCounts(db = {}) {
