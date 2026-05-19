@@ -186,7 +186,7 @@ async function route(req, res) {
           ...(body.defaults || {})
         }
       };
-      trimmedImages = trimImageCacheRecords(db);
+      trimmedImages = trimImageCacheRecords(db, { force: true });
       return db.settings;
     }, {
       collections: ['settings'],
@@ -1526,7 +1526,7 @@ async function logStartupQueueState() {
 
 async function cleanupImageStorage() {
   const startedAt = Date.now();
-  const trimmedImages = await store.update((db) => trimImageCacheRecords(db), {
+  const trimmedImages = await store.update((db) => trimImageCacheRecords(db, { force: true }), {
     collections: ['settings'],
     dirtyRows: imageCacheTrimDirtyRows,
     shouldPersist: (images) => Array.isArray(images) && images.length > 0
@@ -1567,13 +1567,16 @@ async function cleanupImageStorage() {
   }
 }
 
-function trimImageCacheRecords(db) {
+function trimImageCacheRecords(db, options = {}) {
   db.settings = db.settings || {};
   db.images = Array.isArray(db.images) ? db.images : [];
   const maxCacheImages = normalizeCacheImageLimit(db.settings.maxCacheImages);
   db.settings.maxCacheImages = maxCacheImages;
 
-  if (db.images.length <= maxCacheImages) return [];
+  const force = options.force === true || maxCacheImages <= 0;
+  const trimBuffer = force ? 0 : imageCacheTrimBuffer(maxCacheImages);
+  const trimAt = maxCacheImages + trimBuffer;
+  if (db.images.length < trimAt) return [];
 
   const removedImages = db.images.slice(maxCacheImages);
   db.images = db.images.slice(0, maxCacheImages);
@@ -1603,6 +1606,10 @@ function imageCacheTrimDirtyRows(trimmedImages = []) {
 
 function uniqueIds(values = []) {
   return [...new Set(values.map((value) => String(value || '').trim()).filter(Boolean))];
+}
+
+function imageCacheTrimBuffer(maxCacheImages) {
+  return maxCacheImages > 0 ? 100 : 0;
 }
 
 function normalizeCacheImageLimit(value) {
@@ -1649,7 +1656,7 @@ async function importPackage(body) {
     db.cards = mergeById(db.cards, incoming.cards);
     db.users = mergeById(db.users, incoming.users);
     db.accounts = mergeById(db.accounts, incoming.accounts).map((account) => ({ ...account, inFlight: 0 }));
-    trimmedImages = trimImageCacheRecords(db);
+    trimmedImages = trimImageCacheRecords(db, { force: true });
     return {
       mode,
       users: db.users.length,
