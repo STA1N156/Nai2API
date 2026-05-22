@@ -1513,13 +1513,8 @@ async function cleanupInterruptedStartupJobs() {
 }
 
 async function logStartupQueueState() {
-  const db = await store.readCollections(['jobs']);
-  const jobs = Array.isArray(db.jobs) ? db.jobs : [];
-  const queued = jobs.filter((job) => job.status === 'queued').length;
-  const running = jobs.filter((job) => job.status === 'running').length;
-  const directQueued = jobs.filter((job) => job.status === 'queued' && job.source === 'direct').length;
-  const openAiQueued = jobs.filter((job) => job.status === 'queued' && job.source === 'openai').length;
-  console.log(`[runtime] startup queue resume state: queued=${queued} running=${running} directQueued=${directQueued} openaiQueued=${openAiQueued}`);
+  const counts = await store.readQueueStateCounts();
+  console.log(`[runtime] startup queue resume state: queued=${counts.queued} running=${counts.running} directQueued=${counts.directQueued} openaiQueued=${counts.openAiQueued}`);
 }
 
 async function cleanupImageStorage() {
@@ -1531,10 +1526,8 @@ async function cleanupImageStorage() {
   }) || [];
   await removeStoredImages(trimmedImages);
 
-  const db = await store.readCollections(['images']);
-  const referencedFiles = new Set((db.images || [])
-    .map((image) => image.file)
-    .filter(Boolean)
+  const imageFiles = await store.readImageFiles();
+  const referencedFiles = new Set(imageFiles
     .map((file) => path.resolve(dataDir, file)));
 
   let entries = [];

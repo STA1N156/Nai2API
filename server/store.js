@@ -150,6 +150,30 @@ export class JsonStore {
     return snapshot;
   }
 
+  async readQueueStateCounts() {
+    await this.ensureLoaded();
+    const counts = {
+      queued: 0,
+      running: 0,
+      directQueued: 0,
+      openAiQueued: 0
+    };
+    for (const job of this.db.jobs || []) {
+      if (job.status === 'queued') {
+        counts.queued += 1;
+        if (job.source === 'direct') counts.directQueued += 1;
+        if (job.source === 'openai') counts.openAiQueued += 1;
+      }
+      if (job.status === 'running') counts.running += 1;
+    }
+    return counts;
+  }
+
+  async readImageFiles() {
+    await this.ensureLoaded();
+    return (this.db.images || []).map((image) => image.file).filter(Boolean);
+  }
+
   async findJobContext(id) {
     await this.ensureLoaded();
     const job = this.db.jobs.find((item) => item.id === id);
