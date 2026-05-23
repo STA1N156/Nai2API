@@ -102,6 +102,10 @@ async function applyRuntimeSettings() {
 }
 
 async function migrateInlineImages() {
+  if (store.hasPartialCollection('images')) {
+    console.log('[runtime] skipped inline image migration because image cache is partially loaded');
+    return;
+  }
   const startedAt = Date.now();
   let migrated = 0;
   migrated = await store.update(async (db) => {
@@ -186,12 +190,11 @@ async function route(req, res) {
           ...(body.defaults || {})
         }
       };
-      trimmedImages = trimImageCacheRecords(db, { force: true });
       return db.settings;
     }, {
-      collections: ['settings'],
-      dirtyRows: () => imageCacheTrimDirtyRows(trimmedImages)
+      collections: ['settings']
     });
+    trimmedImages = await store.trimImageCache(settings.maxCacheImages, { force: true });
     await removeStoredImages(trimmedImages);
     scheduleQueueDrain();
     sendJson(res, 200, settings);
@@ -1519,11 +1522,8 @@ async function logStartupQueueState() {
 
 async function cleanupImageStorage() {
   const startedAt = Date.now();
-  const trimmedImages = await store.update((db) => trimImageCacheRecords(db, { force: true }), {
-    collections: ['settings'],
-    dirtyRows: imageCacheTrimDirtyRows,
-    shouldPersist: (images) => Array.isArray(images) && images.length > 0
-  }) || [];
+  const settings = await store.readSettings();
+  const trimmedImages = await store.trimImageCache(normalizeCacheImageLimit(settings.maxCacheImages), { force: true }) || [];
   await removeStoredImages(trimmedImages);
 
   const imageFiles = await store.readImageFiles();
@@ -1607,7 +1607,7 @@ function uniqueIds(values = []) {
   return [...new Set(values.map((value) => String(value || '').trim()).filter(Boolean))];
 }
 
-function imageCacheTrimBuffer(maxCacheImages) {
+function imageCacheTrimBuffer(maxCacheImages = 1) {
   return maxCacheImages > 0 ? 100 : 0;
 }
 
@@ -1655,7 +1655,6 @@ async function importPackage(body) {
     db.cards = mergeById(db.cards, incoming.cards);
     db.users = mergeById(db.users, incoming.users);
     db.accounts = mergeById(db.accounts, incoming.accounts).map((account) => ({ ...account, inFlight: 0 }));
-    trimmedImages = trimImageCacheRecords(db, { force: true });
     return {
       mode,
       users: db.users.length,
@@ -1663,9 +1662,9 @@ async function importPackage(body) {
       images: db.images.length
     };
   }, {
-    collections: ['settings', 'cards', 'users', 'accounts'],
-    dirtyRows: () => imageCacheTrimDirtyRows(trimmedImages)
+    collections: ['settings', 'cards', 'users', 'accounts']
   });
+  trimmedImages = await store.trimImageCache(null, { force: true });
   await removeStoredImages(trimmedImages);
   return result;
 }
@@ -2345,21 +2344,19 @@ async function completeGeneration(reservation, request, image, meta = {}) {
         }
       }
 
-      trimmedImages = trimImageCacheRecords(db);
-
       return { ...saved, balance: user.balance };
     }, {
       dirtyRows: (saved) => ({
-        ...imageCacheTrimDirtyRows(trimmedImages),
         accounts: uniqueIds([reservation.account?.id]),
-        images: uniqueIds([saved?.id, ...trimmedImages.map((item) => item?.id)]),
-        jobs: uniqueIds([meta.jobId, ...(trimmedImages.affectedJobIds || [])])
+        images: uniqueIds([saved?.id]),
+        jobs: uniqueIds([meta.jobId])
       })
     });
   } catch (error) {
     await removeStoredImages([{ id: imageId, file: imageFile }]);
     throw error;
   }
+  trimmedImages = await store.trimImageCache(null, { batchSize: imageCacheTrimBuffer() });
   await removeStoredImages(trimmedImages);
   scheduleQueueDrain();
   if (meta.jobId) notifyJobWaiters(meta.jobId, { saved: savedImage, image, balance: savedImage.balance });
@@ -2737,14 +2734,17 @@ async function readStoredImage(image) {
 }
 
 async function removeStoredImages(images) {
-  await Promise.all(images.map(async (image) => {
-    if (!image.file) return;
-    try {
-      await rm(imageFilePath(image.file), { force: true });
-    } catch (error) {
-      console.error(`Failed to delete cached image ${image.id}:`, error);
-    }
-  }));
+  for (let index = 0; index < images.length; index += 50) {
+    const batch = images.slice(index, index + 50);
+    await Promise.all(batch.map(async (image) => {
+      if (!image.file) return;
+      try {
+        await rm(imageFilePath(image.file), { force: true });
+      } catch (error) {
+        console.error(`Failed to delete cached image ${image.id}:`, error);
+      }
+    }));
+  }
 }
 
 function imageStorageName(id, mimeType = '') {

@@ -181,6 +181,93 @@ export class JsonStore {
     return (this.db.images || []).map((image) => image.file).filter(Boolean);
   }
 
+  async trimImageCache(maxCacheImages = null, options = {}) {
+    await this.ensureLoaded();
+    this.flushPendingPersistSync();
+
+    const maxCache = clampNumber(maxCacheImages ?? this.db.settings.maxCacheImages, 0, MAX_CACHE_IMAGES_LIMIT);
+    this.db.settings.maxCacheImages = maxCache;
+    const total = this.countRecords('images');
+    const force = options.force === true || maxCache <= 0;
+    const trimBuffer = force ? 0 : Math.max(0, Math.floor(Number(options.batchSize ?? 100) || 0));
+    const trimAt = maxCache + trimBuffer;
+    if (total < trimAt) return [];
+
+    const deleteCount = Math.max(0, total - maxCache);
+    if (!deleteCount) return [];
+
+    const startedAt = Date.now();
+    const removedRows = this.sqlite.prepare(`
+      SELECT id, order_value AS orderValue, data
+      FROM images
+      ORDER BY order_value ASC
+      LIMIT @deleteCount
+    `).all({ deleteCount });
+    const removedImages = removedRows
+      .map((row) => ({ row, image: safeJson(row.data, null) }))
+      .filter((entry) => entry.image)
+      .map((entry) => ({ ...entry.image, id: entry.image.id || entry.row.id }));
+    const removedIds = removedImages.map((image) => String(image.id || '')).filter(Boolean);
+    if (!removedIds.length) return [];
+
+    const affectedJobs = [];
+    for (const chunk of chunks(removedIds, 500)) {
+      const placeholders = chunk.map(() => '?').join(',');
+      const rows = this.sqlite.prepare(`
+        SELECT id, order_value AS orderValue, data
+        FROM jobs
+        WHERE image_id IN (${placeholders})
+      `).all(...chunk);
+      affectedJobs.push(...rows);
+    }
+
+    const jobUpdates = affectedJobs
+      .map((row) => {
+        const job = safeJson(row.data, null);
+        if (!job) return null;
+        if (!job.id) job.id = row.id;
+        job.imageId = '';
+        const data = JSON.stringify(job);
+        const order = Number(row.orderValue);
+        return {
+          id: row.id,
+          data,
+          order,
+          sql: sqlRecord('jobs', job, order, data)
+        };
+      })
+      .filter(Boolean);
+
+    const applyTrim = this.sqlite.transaction(() => {
+      for (const update of jobUpdates) this.statements.upsertRecord.jobs.run(update.sql);
+      for (const id of removedIds) this.statements.deleteRecord.images.run(id);
+    });
+    applyTrim();
+
+    const removedSet = new Set(removedIds);
+    this.db.images = (this.db.images || []).filter((image) => !removedSet.has(String(image.id || '')));
+    for (const id of removedIds) {
+      this.rowState.images?.delete(id);
+      this.orderKeys.images?.delete(id);
+    }
+
+    const affectedJobIds = [];
+    for (const update of jobUpdates) {
+      affectedJobIds.push(update.id);
+      const cachedJob = (this.db.jobs || []).find((job) => job.id === update.id);
+      if (cachedJob) cachedJob.imageId = '';
+      if (this.rowState.jobs?.has(update.id)) {
+        this.rowState.jobs.set(update.id, { data: update.data, order: update.order });
+        this.orderKeys.jobs.set(update.id, update.order);
+      }
+    }
+    removedImages.affectedJobIds = uniqueStrings(affectedJobIds);
+    this.trimRuntimePartialCaches();
+
+    runtimeLog(`SQLite image cache trimmed ${removedIds.length} image record(s), affectedJobs=${removedImages.affectedJobIds.length}, totalBefore=${total}, max=${maxCache}, duration=${Date.now() - startedAt}ms`);
+    return removedImages;
+  }
+
   hasPartialCollection(collection) {
     return this.partialCollections.has(collection);
   }
@@ -721,10 +808,12 @@ export class JsonStore {
     if (!scope.full && !scope.includeSettings && !scope.collections.length) return;
     if (scope.hasDirtyRows) {
       const fullCollections = scope.collections.filter((collection) => !scope.dirtyRows[collection]?.size);
+      this.assertFullCollectionsAreLoaded(fullCollections);
       if (fullCollections.length) trimDb(db, { collections: fullCollections });
       this.persistDirtyRows(db, scope, startedAt);
       return;
     }
+    this.assertFullCollectionsAreLoaded(scope.full ? collections : scope.collections);
     const safeDb = trimDb(normalizeDb(db), { collections: scope.full ? null : scope.collections });
     const snapshot = buildSnapshotState(safeDb, this.orderKeys, {
       collections: scope.full ? null : scope.collections,
@@ -765,6 +854,7 @@ export class JsonStore {
       }).join(',');
       runtimeLog(`SQLite incremental persist slow: ${duration}ms scope=${scopeText || 'none'} upserts=${changes.upserts.length} deletes=${changes.deletes.length} settings=${changes.settingsChanged ? 1 : 0}`);
     }
+    this.trimRuntimePartialCaches();
   }
 
   persistDirtyRows(db, scope, startedAt = Date.now()) {
@@ -814,6 +904,7 @@ export class JsonStore {
     }
 
     if (fullCollections.length) {
+      this.assertFullCollectionsAreLoaded(fullCollections);
       const snapshot = buildSnapshotState(db, this.orderKeys, {
         collections: fullCollections,
         includeSettings: false,
@@ -871,6 +962,54 @@ export class JsonStore {
     const duration = Date.now() - startedAt;
     if (duration >= sqliteSlowLogMs()) {
       runtimeLog(`SQLite dirty-row persist slow: ${duration}ms scope=${scope.collections.join(',') || 'none'} upserts=${changes.upserts.length} deletes=${changes.deletes.length} settings=${changes.settingsChanged ? 1 : 0}`);
+    }
+    this.trimRuntimePartialCaches();
+  }
+
+  assertFullCollectionsAreLoaded(collectionList = []) {
+    const partial = collectionList.filter((collection) => this.partialCollections.has(collection) && ['jobs', 'images'].includes(collection));
+    if (partial.length) {
+      throw new Error(`Refusing full persistence for partially loaded collection(s): ${partial.join(',')}`);
+    }
+  }
+
+  trimRuntimePartialCaches() {
+    if (!this.db) return;
+    if (this.partialCollections.has('images')) {
+      this.trimRuntimeCollection('images', runtimeCacheLimit('images'));
+    }
+    if (this.partialCollections.has('ledger')) {
+      this.trimRuntimeCollection('ledger', runtimeCacheLimit('ledger'));
+    }
+    if (this.partialCollections.has('jobs')) {
+      const limit = runtimeCacheLimit('jobs');
+      const retained = [];
+      const removed = [];
+      for (const [index, job] of (this.db.jobs || []).entries()) {
+        if (index < limit || ['queued', 'running'].includes(job.status)) {
+          retained.push(job);
+        } else {
+          removed.push(job);
+        }
+      }
+      this.db.jobs = retained;
+      for (const job of removed) {
+        if (!job?.id) continue;
+        this.rowState.jobs?.delete(job.id);
+        this.orderKeys.jobs?.delete(job.id);
+      }
+    }
+  }
+
+  trimRuntimeCollection(collection, limit) {
+    const items = Array.isArray(this.db?.[collection]) ? this.db[collection] : [];
+    if (items.length <= limit) return;
+    const removed = items.slice(limit);
+    this.db[collection] = items.slice(0, limit);
+    for (const item of removed) {
+      if (!item?.id) continue;
+      this.rowState[collection]?.delete(item.id);
+      this.orderKeys[collection]?.delete(item.id);
     }
   }
 
@@ -1275,6 +1414,18 @@ function dirtyItemIndexes(items, dirtyIds) {
     remaining -= 1;
   }
   return indexes;
+}
+
+function chunks(values, size) {
+  const selected = [];
+  for (let index = 0; index < values.length; index += size) {
+    selected.push(values.slice(index, index + size));
+  }
+  return selected;
+}
+
+function uniqueStrings(values = []) {
+  return [...new Set(values.map((value) => String(value || '').trim()).filter(Boolean))];
 }
 
 function existingOrderSequenceIsStable(items, previousOrders) {
