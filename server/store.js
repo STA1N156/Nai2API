@@ -12,6 +12,7 @@ export const legacyDefaultArtist =
   'artist:ningen_mame,, noyu_(noyu23386566),, toosaka asagi,, location,\n20::best quality, absurdres, very aesthetic, detailed, masterpiece::,:,, very aesthetic, masterpiece, no text,';
 
 const collections = ['cards', 'users', 'accounts', 'jobs', 'images', 'ledger'];
+const largeRuntimeCollections = new Set(['jobs', 'images', 'ledger']);
 const collectionTables = Object.freeze({
   cards: 'cards',
   users: 'users',
@@ -97,6 +98,7 @@ export class JsonStore {
     this.settingsState = '';
     this.pendingPersistScope = null;
     this.pendingPersistTimer = null;
+    this.partialCollections = new Set();
   }
 
   async init() {
@@ -141,6 +143,9 @@ export class JsonStore {
     await this.ensureLoaded();
     const snapshot = {};
     for (const key of requestedCollections) {
+      if (largeRuntimeCollections.has(key) && this.partialCollections.has(key)) {
+        throw new Error(`Refusing to clone partial large collection: ${key}`);
+      }
       if (key === 'settings') {
         snapshot.settings = structuredClone(this.db.settings);
       } else if (Array.isArray(this.db[key])) {
@@ -152,31 +157,37 @@ export class JsonStore {
 
   async readQueueStateCounts() {
     await this.ensureLoaded();
-    const counts = {
-      queued: 0,
-      running: 0,
-      directQueued: 0,
-      openAiQueued: 0
-    };
-    for (const job of this.db.jobs || []) {
-      if (job.status === 'queued') {
-        counts.queued += 1;
-        if (job.source === 'direct') counts.directQueued += 1;
-        if (job.source === 'openai') counts.openAiQueued += 1;
+    const rows = this.sqlite.prepare(`
+      SELECT status, source, COUNT(*) AS count
+      FROM jobs
+      WHERE status IN ('queued', 'running')
+      GROUP BY status, source
+    `).all();
+    return rows.reduce((counts, row) => {
+      const count = Number(row.count || 0);
+      if (row.status === 'queued') {
+        counts.queued += count;
+        if (row.source === 'direct') counts.directQueued += count;
+        if (row.source === 'openai') counts.openAiQueued += count;
       }
-      if (job.status === 'running') counts.running += 1;
-    }
-    return counts;
+      if (row.status === 'running') counts.running += count;
+      return counts;
+    }, { queued: 0, running: 0, directQueued: 0, openAiQueued: 0 });
   }
 
   async readImageFiles() {
     await this.ensureLoaded();
+    if (this.partialCollections.has('images')) return null;
     return (this.db.images || []).map((image) => image.file).filter(Boolean);
+  }
+
+  hasPartialCollection(collection) {
+    return this.partialCollections.has(collection);
   }
 
   async findJobContext(id) {
     await this.ensureLoaded();
-    const job = this.db.jobs.find((item) => item.id === id);
+    const job = this.db.jobs.find((item) => item.id === id) || this.selectItemById('jobs', id);
     if (!job) return null;
     const account = job.accountId
       ? this.db.accounts.find((item) => item.id === job.accountId) || null
@@ -184,7 +195,7 @@ export class JsonStore {
     return {
       job: structuredClone(job),
       account: account ? structuredClone(account) : null,
-      queue: jobQueueProgress(job, this.db.jobs)
+      queue: this.jobQueueProgress(job)
     };
   }
 
@@ -286,9 +297,9 @@ export class JsonStore {
         ORDER BY COALESCE(created_at, '') ASC
       `),
       images: this.selectItems('images', 'ORDER BY order_value DESC LIMIT 12'),
-      imageCount: this.db.images.length,
-      imageTotal: this.db.images.length,
-      cacheImageCount: this.db.images.length,
+      imageCount: this.countRecords('images'),
+      imageTotal: this.countRecords('images'),
+      cacheImageCount: this.countRecords('images'),
       ledger: this.selectItems('ledger', 'ORDER BY order_value DESC LIMIT 80')
     };
   }
@@ -304,6 +315,9 @@ export class JsonStore {
 
   async readRaw() {
     await this.ensureLoaded();
+    if ([...this.partialCollections].some((collection) => largeRuntimeCollections.has(collection))) {
+      throw new Error('Refusing to clone full database while large collections are partially loaded.');
+    }
     return cloneDb(this.db);
   }
 
@@ -386,6 +400,40 @@ export class JsonStore {
     if (!table) return [];
     const rows = this.sqlite.prepare(`SELECT data FROM ${table} ${clause}`).all(params);
     return rows.map((row) => safeJson(row.data, null)).filter(Boolean);
+  }
+
+  selectItemById(collection, id) {
+    const statement = this.statements.selectById[collection];
+    if (!statement || !id) return null;
+    const row = statement.get(String(id));
+    return row ? safeJson(row.data, null) : null;
+  }
+
+  countRecords(collection) {
+    const statement = this.statements.countRecords[collection];
+    if (!statement) return 0;
+    return Number(statement.get()?.count || 0);
+  }
+
+  jobQueueProgress(job) {
+    if (!job || !['queued', 'running'].includes(job.status)) return { progress: 0, total: 0 };
+    const active = this.sqlite.prepare(`
+      SELECT COUNT(*) AS count
+      FROM jobs
+      WHERE status IN ('queued', 'running')
+    `).get();
+    const activeAhead = this.sqlite.prepare(`
+      SELECT COUNT(*) AS count
+      FROM jobs
+      WHERE status IN ('queued', 'running')
+        AND id != @id
+        AND COALESCE(created_at, '') <= @createdAt
+    `).get({ id: job.id, createdAt: job.createdAt || '' });
+    const total = Math.max(1, Number(job.queueTotal || 0) || Number(active?.count || 0) || 1);
+    return {
+      progress: Math.min(total, Number(activeAhead?.count || 0) + 1),
+      total
+    };
   }
 
   selectJobStatRows(clause = 'ORDER BY order_value DESC', params = {}) {
@@ -525,6 +573,7 @@ export class JsonStore {
       hasTypedRecords: {},
       selectRecords: {},
       selectById: {},
+      countRecords: {},
       deleteAllRecords: {},
       upsertRecord: {},
       deleteRecord: {}
@@ -534,6 +583,7 @@ export class JsonStore {
       this.statements.hasTypedRecords[collection] = this.sqlite.prepare(`SELECT 1 FROM ${table} LIMIT 1`);
       this.statements.selectRecords[collection] = this.sqlite.prepare(`SELECT id, order_value AS orderValue, data FROM ${table} ORDER BY order_value DESC`);
       this.statements.selectById[collection] = this.sqlite.prepare(`SELECT data FROM ${table} WHERE id = ? LIMIT 1`);
+      this.statements.countRecords[collection] = this.sqlite.prepare(`SELECT COUNT(*) AS count FROM ${table}`);
       this.statements.deleteAllRecords[collection] = this.sqlite.prepare(`DELETE FROM ${table}`);
       this.statements.upsertRecord[collection] = this.sqlite.prepare(`
         INSERT INTO ${table} (${recordColumns.join(', ')})
@@ -573,9 +623,12 @@ export class JsonStore {
     };
     const rowState = emptyCollectionMaps();
     const orderKeys = emptyCollectionMaps();
+    const totalCounts = Object.fromEntries(collections.map((collection) => [collection, this.countRecords(collection)]));
+    this.partialCollections = new Set();
 
     for (const collection of collections) {
-      const rows = this.statements.selectRecords[collection].all();
+      const rows = this.runtimeRowsForCollection(collection);
+      if (rows.length < totalCounts[collection]) this.partialCollections.add(collection);
       db[collection] = rows.map((row) => {
         rowState[collection].set(row.id, { data: row.data, order: Number(row.orderValue) });
         orderKeys[collection].set(row.id, Number(row.orderValue));
@@ -587,8 +640,33 @@ export class JsonStore {
     this.rowState = rowState;
     this.orderKeys = orderKeys;
     this.settingsState = JSON.stringify(normalized.settings);
-    runtimeLog(`Loaded typed SQLite tables in ${Date.now() - startedAt}ms: ${formatDbCounts(normalized)}`);
+    runtimeLog(`Loaded typed SQLite runtime cache in ${Date.now() - startedAt}ms: ${formatDbCounts(normalized)} total=${formatDbCounts(totalCounts)} partial=${[...this.partialCollections].join(',') || 'none'}`);
     return normalized;
+  }
+
+  runtimeRowsForCollection(collection) {
+    const table = collectionTables[collection];
+    if (!table) return [];
+    if (collection === 'jobs') {
+      return this.sqlite.prepare(`
+        SELECT id, order_value AS orderValue, data FROM ${table}
+        WHERE status IN ('queued', 'running')
+           OR id IN (
+             SELECT id FROM ${table}
+             ORDER BY order_value DESC
+             LIMIT @limit
+           )
+        ORDER BY order_value DESC
+      `).all({ limit: runtimeCacheLimit('jobs') });
+    }
+    if (collection === 'images' || collection === 'ledger') {
+      return this.sqlite.prepare(`
+        SELECT id, order_value AS orderValue, data FROM ${table}
+        ORDER BY order_value DESC
+        LIMIT @limit
+      `).all({ limit: runtimeCacheLimit(collection) });
+    }
+    return this.statements.selectRecords[collection].all();
   }
 
   loadFromGenericRecords() {
@@ -606,6 +684,7 @@ export class JsonStore {
 
   replaceAll(db) {
     this.clearPendingPersist();
+    this.partialCollections = new Set();
     const safeDb = trimDb(normalizeDb(db));
     const snapshot = buildSnapshotState(safeDb, emptyCollectionMaps(), { dense: true });
     const startedAt = Date.now();
@@ -1260,14 +1339,27 @@ function sqliteWriteDebounceMs() {
   return 500;
 }
 
+function runtimeCacheLimit(collection) {
+  const defaults = {
+    jobs: 3000,
+    images: 1000,
+    ledger: 1000
+  };
+  const envName = `RUNTIME_${collection.toUpperCase()}_CACHE_LIMIT`;
+  const configured = Number(process.env[envName] || defaults[collection] || 1000);
+  if (Number.isFinite(configured) && configured >= 0) return Math.floor(configured);
+  return defaults[collection] || 1000;
+}
+
 function formatDbCounts(db = {}) {
+  const count = (value) => Array.isArray(value) ? value.length : Number(value || 0);
   return [
-    `users=${db.users?.length || 0}`,
-    `accounts=${db.accounts?.length || 0}`,
-    `jobs=${db.jobs?.length || 0}`,
-    `images=${db.images?.length || 0}`,
-    `cards=${db.cards?.length || 0}`,
-    `ledger=${db.ledger?.length || 0}`
+    `users=${count(db.users)}`,
+    `accounts=${count(db.accounts)}`,
+    `jobs=${count(db.jobs)}`,
+    `images=${count(db.images)}`,
+    `cards=${count(db.cards)}`,
+    `ledger=${count(db.ledger)}`
   ].join(' ');
 }
 

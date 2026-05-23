@@ -1527,6 +1527,14 @@ async function cleanupImageStorage() {
   await removeStoredImages(trimmedImages);
 
   const imageFiles = await store.readImageFiles();
+  if (!imageFiles) {
+    if (trimmedImages.length) {
+      console.log(`[runtime] image cache cleanup removed ${trimmedImages.length} expired records and skipped orphan scan because image cache is partially loaded in ${Date.now() - startedAt}ms`);
+    } else {
+      console.log(`[runtime] image cache cleanup skipped orphan scan because image cache is partially loaded in ${Date.now() - startedAt}ms`);
+    }
+    return;
+  }
   const referencedFiles = new Set(imageFiles
     .map((file) => path.resolve(dataDir, file)));
 
