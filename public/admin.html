@@ -177,25 +177,28 @@
         </div>
 
         <div class="admin-grid wide-grid">
-          <section class="panel">
+          <section id="accountMonitorPanel" class="panel collapsible-panel is-collapsed">
             <div class="panel-title">
               <div>
                 <h2>账号监控</h2>
                 <span id="accountCount">0 个账号</span>
               </div>
+              <button id="accountMonitorToggle" class="secondary collapse-toggle" type="button" aria-expanded="false" aria-controls="accountMonitorBody">展开</button>
             </div>
-            <div class="toolbar">
-              <label class="checkline">
-                <input id="selectAllAccounts" type="checkbox" />
-                全选
-              </label>
-              <button id="enableAccountsBtn" class="secondary">启用</button>
-              <button id="disableAccountsBtn" class="secondary">禁用</button>
-              <button id="refreshAccountQuotaBtn" class="secondary">刷新点数</button>
-              <button id="resetAccountStatsBtn" class="ghost">重置监控</button>
-              <button id="deleteAccountsBtn" class="ghost">批量删除</button>
+            <div id="accountMonitorBody" class="collapsible-body" hidden>
+              <div class="toolbar">
+                <label class="checkline">
+                  <input id="selectAllAccounts" type="checkbox" />
+                  全选
+                </label>
+                <button id="enableAccountsBtn" class="secondary">启用</button>
+                <button id="disableAccountsBtn" class="secondary">禁用</button>
+                <button id="refreshAccountQuotaBtn" class="secondary">刷新点数</button>
+                <button id="resetAccountStatsBtn" class="ghost">重置监控</button>
+                <button id="deleteAccountsBtn" class="ghost">批量删除</button>
+              </div>
+              <div id="accountList" class="data-list"></div>
             </div>
-            <div id="accountList" class="data-list"></div>
           </section>
 
           <section id="userMonitorPanel" class="panel collapsible-panel is-collapsed">
@@ -208,7 +211,7 @@
             </div>
             <div id="userMonitorBody" class="collapsible-body" hidden>
               <div class="toolbar">
-                <input id="userSearch" class="search-input" placeholder="搜索密钥、备注或卡密来源" />
+                <input id="userSearch" class="search-input" placeholder="搜索密钥、备注、卡密来源或融合关系" />
                 <label class="checkline">
                   <input id="selectAllUsers" type="checkbox" />
                   全选
@@ -222,30 +225,36 @@
             </div>
           </section>
 
-          <section class="panel">
+          <section id="requestLogPanel" class="panel collapsible-panel is-collapsed">
             <div class="panel-title">
               <div>
-                <h2>最近任务</h2>
+                <h2>请求日志</h2>
                 <span id="jobCountText">0 条</span>
               </div>
+              <button id="requestLogToggle" class="secondary collapse-toggle" type="button" aria-expanded="false" aria-controls="requestLogBody">展开</button>
             </div>
-            <div id="jobList" class="data-list"></div>
-            <div class="pager">
-              <button id="jobPrevBtn" class="ghost" type="button">上一页</button>
-              <span id="jobPageText">第 1 / 1 页</span>
-              <button id="jobNextBtn" class="ghost" type="button">下一页</button>
+            <div id="requestLogBody" class="collapsible-body" hidden>
+              <div id="jobList" class="data-list"></div>
+              <div class="pager">
+                <button id="jobPrevBtn" class="ghost" type="button">上一页</button>
+                <span id="jobPageText">第 1 / 1 页</span>
+                <button id="jobNextBtn" class="ghost" type="button">下一页</button>
+              </div>
             </div>
           </section>
         </div>
 
-        <section class="panel error-log-panel">
+        <section id="errorLogPanel" class="panel error-log-panel collapsible-panel is-collapsed">
           <div class="panel-title">
             <div>
               <h2>错误日志</h2>
               <span id="errorLogCount">最近 7 天失败请求</span>
             </div>
+            <button id="errorLogToggle" class="secondary collapse-toggle" type="button" aria-expanded="false" aria-controls="errorLogBody">展开</button>
           </div>
-          <div id="errorLogList" class="data-list error-log-list"></div>
+          <div id="errorLogBody" class="collapsible-body" hidden>
+            <div id="errorLogList" class="data-list error-log-list"></div>
+          </div>
         </section>
 
         <section class="panel">

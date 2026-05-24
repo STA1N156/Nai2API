@@ -25,6 +25,12 @@ const ids = [
   'balanceText',
   'userToken',
   'saveTokenBtn',
+  'mergePanel',
+  'toggleMergeBtn',
+  'mergeToggleHint',
+  'mergeFields',
+  'mergeSourceToken',
+  'mergeTokenBtn',
   'promptInput',
   'artistPresetInput',
   'artistInput',
@@ -139,6 +145,8 @@ async function boot() {
 
 function bindEvents() {
   el.saveTokenBtn.addEventListener('click', saveToken);
+  el.toggleMergeBtn.addEventListener('click', () => setMergePanelOpen(el.mergeFields.hidden));
+  el.mergeTokenBtn.addEventListener('click', mergeTokenBalance);
   el.directGenerateBtn.addEventListener('click', startJob);
   el.copySnippetTopBtn.addEventListener('click', () => copyText(buildSnippet(), '嵌入代码已复制'));
   el.imageFrame.addEventListener('click', handleResultPreview);
@@ -226,6 +234,53 @@ async function loadMe() {
   if (!state.token) return;
   const user = await api(`/api/me?token=${encodeURIComponent(state.token)}`);
   el.balanceText.textContent = `${user.balance} 点可用`;
+}
+
+async function mergeTokenBalance() {
+  const targetToken = el.userToken.value.trim();
+  const sourceToken = el.mergeSourceToken.value.trim();
+  if (!targetToken) {
+    showToast('请先输入需要保留额度的密钥', true);
+    return;
+  }
+  if (!sourceToken) {
+    showToast('请输入被融合的密钥', true);
+    return;
+  }
+  if (sourceToken === targetToken) {
+    showToast('两个密钥不能相同', true);
+    return;
+  }
+
+  el.mergeTokenBtn.disabled = true;
+  el.mergeTokenBtn.textContent = '融合中...';
+  try {
+    const result = await api('/api/me/merge', {
+      method: 'POST',
+      timeoutMs: 20000,
+      body: { token: sourceToken, targetToken }
+    });
+    state.token = result.target.token;
+    el.userToken.value = state.token;
+    el.mergeSourceToken.value = '';
+    setMergePanelOpen(false);
+    localStorage.setItem('nai.userToken', state.token);
+    el.balanceText.textContent = `${result.target.balance} 点可用`;
+    updateUrlOutputs();
+    showToast(`已融合 ${result.amount} 点额度`);
+  } catch (error) {
+    showToast(error.message, true);
+  } finally {
+    el.mergeTokenBtn.disabled = false;
+    el.mergeTokenBtn.textContent = '确认融合';
+  }
+}
+
+function setMergePanelOpen(isOpen) {
+  el.mergeFields.hidden = !isOpen;
+  el.mergePanel.classList.toggle('open', isOpen);
+  el.mergePanel.classList.toggle('collapsed', !isOpen);
+  el.toggleMergeBtn.setAttribute('aria-expanded', String(isOpen));
 }
 
 function collectParams() {

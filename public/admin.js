@@ -8,7 +8,10 @@ const state = {
   selectedUsageDate: '',
   chartScrollSyncing: false,
   chartDrag: null,
+  accountMonitorExpanded: false,
   userMonitorExpanded: false,
+  requestLogExpanded: false,
+  errorLogExpanded: false,
   summary: null,
   images: [],
   imageTotal: 0,
@@ -37,9 +40,18 @@ const ids = [
   'clearLogsBtn',
   'usageDateSelect',
   'usageChart',
+  'accountMonitorPanel',
+  'accountMonitorToggle',
+  'accountMonitorBody',
   'userMonitorPanel',
   'userMonitorToggle',
   'userMonitorBody',
+  'requestLogPanel',
+  'requestLogToggle',
+  'requestLogBody',
+  'errorLogPanel',
+  'errorLogToggle',
+  'errorLogBody',
   'userCount',
   'userCredits',
   'userNote',
@@ -141,7 +153,10 @@ function bindEvents() {
   el.deleteAccountsBtn.addEventListener('click', deleteSelectedAccounts);
   el.refreshImagesBtn.addEventListener('click', refreshImages);
   el.clearLogsBtn.addEventListener('click', clearLogs);
+  el.accountMonitorToggle.addEventListener('click', toggleAccountMonitor);
   el.userMonitorToggle.addEventListener('click', toggleUserMonitor);
+  el.requestLogToggle.addEventListener('click', toggleRequestLog);
+  el.errorLogToggle.addEventListener('click', toggleErrorLog);
   el.usageDateSelect.addEventListener('change', () => {
     state.selectedUsageDate = el.usageDateSelect.value;
     renderUsageChart(state.summary?.usageHourlyDays || []);
@@ -641,12 +656,35 @@ function renderSummaryImages(summary) {
   renderImages({ images, total, matched: total, offset: 0 });
 }
 
+function toggleAccountMonitor() {
+  state.accountMonitorExpanded = !state.accountMonitorExpanded;
+  setCollapsiblePanel('accountMonitor', state.accountMonitorExpanded);
+}
+
 function toggleUserMonitor() {
   state.userMonitorExpanded = !state.userMonitorExpanded;
-  el.userMonitorBody.hidden = !state.userMonitorExpanded;
-  el.userMonitorPanel.classList.toggle('is-collapsed', !state.userMonitorExpanded);
-  el.userMonitorToggle.textContent = state.userMonitorExpanded ? '收起' : '展开';
-  el.userMonitorToggle.setAttribute('aria-expanded', String(state.userMonitorExpanded));
+  setCollapsiblePanel('userMonitor', state.userMonitorExpanded);
+}
+
+function toggleRequestLog() {
+  state.requestLogExpanded = !state.requestLogExpanded;
+  setCollapsiblePanel('requestLog', state.requestLogExpanded);
+}
+
+function toggleErrorLog() {
+  state.errorLogExpanded = !state.errorLogExpanded;
+  setCollapsiblePanel('errorLog', state.errorLogExpanded);
+}
+
+function setCollapsiblePanel(prefix, isExpanded) {
+  const panel = el[`${prefix}Panel`];
+  const body = el[`${prefix}Body`];
+  const toggle = el[`${prefix}Toggle`];
+  if (!panel || !body || !toggle) return;
+  body.hidden = !isExpanded;
+  panel.classList.toggle('is-collapsed', !isExpanded);
+  toggle.textContent = isExpanded ? '收起' : '展开';
+  toggle.setAttribute('aria-expanded', String(isExpanded));
 }
 
 function syncUsageChartScroll(event) {
@@ -1076,14 +1114,36 @@ function renderAccount(account) {
 
 function renderUser(user) {
   const checked = state.selectedUsers.has(user.id) ? 'checked' : '';
+  const mergeTrace = userMergeTrace(user);
   return `<article class="data-row selectable user-row">
     <input class="row-check user-select" type="checkbox" value="${escapeHtml(user.id)}" ${checked} />
     <div class="row-main">
       <strong class="token-text">${escapeHtml(user.token)}</strong>
       <span>${escapeHtml(user.note || user.sourceCard || '未备注')} · ${formatDate(user.createdAt)}</span>
+      ${mergeTrace.map((line) => `<span class="merge-trace">${escapeHtml(line)}</span>`).join('')}
     </div>
     <div class="pill">${user.balance} 点</div>
   </article>`;
+}
+
+function userMergeTrace(user) {
+  const lines = [];
+  if (user.mergedInto) {
+    const amount = Number(user.mergedAmount || 0);
+    const amountText = amount > 0 ? ` · ${formatNumber(amount)} 点` : '';
+    lines.push(`已融合到 ${user.mergedInto}${amountText}${user.mergedAt ? ` · ${formatDate(user.mergedAt)}` : ''}`);
+  }
+  const mergedFrom = Array.isArray(user.mergedFrom) ? user.mergedFrom : [];
+  if (mergedFrom.length) {
+    const sourceText = mergedFrom
+      .slice(0, 3)
+      .map((entry) => entry.token)
+      .filter(Boolean)
+      .join('、');
+    const extra = mergedFrom.length > 3 ? ` 等 ${mergedFrom.length} 个` : '';
+    if (sourceText) lines.push(`融合来源 ${sourceText}${extra}`);
+  }
+  return lines;
 }
 
 function renderJob(job) {
@@ -1208,8 +1268,22 @@ function closeImagePreview() {
 function filteredUsers(users) {
   const q = el.userSearch.value.trim().toLowerCase();
   if (!q) return users;
-  return users.filter((user) => [user.token, user.note, user.sourceCard, user.id]
+  return users.filter((user) => userSearchValues(user)
     .some((value) => String(value || '').toLowerCase().includes(q)));
+}
+
+function userSearchValues(user) {
+  const mergedFrom = Array.isArray(user.mergedFrom) ? user.mergedFrom : [];
+  return [
+    user.token,
+    user.note,
+    user.sourceCard,
+    user.id,
+    user.mergedInto,
+    user.mergedAt,
+    user.mergedAmount,
+    ...mergedFrom.flatMap((entry) => [entry.token, entry.at, entry.amount])
+  ];
 }
 
 function visibleUsers(users) {

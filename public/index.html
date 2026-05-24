@@ -17,10 +17,23 @@
           </div>
         </div>
         <label>
-          STA1N Token
+          当前密钥（保留额度）
           <input id="userToken" placeholder="STA1N-..." />
         </label>
         <button id="saveTokenBtn" class="secondary wide">加载密钥</button>
+        <div id="mergePanel" class="merge-panel collapsed">
+          <button id="toggleMergeBtn" class="secondary wide merge-toggle" type="button" aria-expanded="false" aria-controls="mergeFields">
+            <span>融合额度</span>
+            <span id="mergeToggleHint" class="merge-toggle-hint" aria-hidden="true"></span>
+          </button>
+          <div id="mergeFields" class="merge-fields" hidden>
+            <label>
+              被融合的密钥
+              <input id="mergeSourceToken" placeholder="STA1N-..." />
+            </label>
+            <button id="mergeTokenBtn" class="secondary wide">确认融合</button>
+          </div>
+        </div>
       </section>
 
       <section class="panel composer-panel">

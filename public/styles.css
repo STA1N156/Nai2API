@@ -569,6 +569,72 @@ h1 {
   font-size: 15px;
 }
 
+.merge-panel {
+  position: relative;
+  grid-column: 1 / -1;
+  display: grid;
+  gap: 14px;
+}
+
+.merge-toggle {
+  justify-content: space-between;
+  padding: 0 18px;
+  color: var(--ink-soft);
+}
+
+.merge-toggle:hover {
+  transform: none;
+}
+
+.merge-toggle-hint {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border-radius: 999px;
+  background: rgba(15, 118, 110, 0.08);
+  color: var(--muted);
+  transition:
+    background 0.16s ease,
+    transform 0.16s ease;
+}
+
+.merge-toggle-hint::before {
+  content: "";
+  width: 8px;
+  height: 8px;
+  border-right: 2px solid currentColor;
+  border-bottom: 2px solid currentColor;
+  transform: translateY(-2px) rotate(45deg);
+  transition: transform 0.16s ease;
+}
+
+.merge-panel.open .merge-toggle-hint {
+  background: rgba(15, 118, 110, 0.14);
+  color: var(--teal-dark);
+}
+
+.merge-panel.open .merge-toggle-hint::before {
+  transform: translateY(2px) rotate(225deg);
+}
+
+.merge-fields {
+  display: grid;
+  grid-template-columns: minmax(420px, 1fr) 170px;
+  align-items: end;
+  gap: 20px;
+}
+
+.merge-fields label {
+  margin-bottom: 0;
+}
+
+.merge-fields[hidden] {
+  display: none;
+}
+
 .composer-panel,
 .result-panel {
   min-height: calc(100vh - 122px);
@@ -1032,6 +1098,10 @@ textarea:focus {
   border-radius: 999px;
 }
 
+.collapsible-panel.is-collapsed .panel-title {
+  margin-bottom: 0;
+}
+
 .collapsible-body[hidden] {
   display: none !important;
 }
@@ -1465,6 +1535,16 @@ textarea:focus {
 
 .token-text {
   font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+}
+
+.merge-trace {
+  width: fit-content;
+  border-radius: 999px;
+  padding: 4px 9px;
+  background: rgba(15, 118, 110, 0.08);
+  color: var(--teal-dark) !important;
+  font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+  font-weight: 720;
 }
 
 .row-stats {
@@ -1994,6 +2074,10 @@ html:has(body.modal-open) {
   .token-panel {
     grid-template-columns: 1fr;
     align-items: stretch;
+  }
+
+  .merge-fields {
+    grid-template-columns: 1fr;
   }
 
   .result-panel {

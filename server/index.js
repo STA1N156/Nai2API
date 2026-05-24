@@ -216,6 +216,15 @@ async function route(req, res) {
     return;
   }
 
+  if (method === 'POST' && url.pathname === '/api/me/merge') {
+    const body = await readJson(req);
+    const sourceToken = String(body.token || tokenFrom(req, url) || '').trim();
+    const targetToken = String(body.targetToken || body.keepToken || body.toToken || '').trim();
+    const result = await mergeUserBalance(sourceToken, targetToken);
+    sendJson(res, 200, result);
+    return;
+  }
+
   if (url.pathname === '/api/api/getUser' && ['GET', 'POST'].includes(method)) {
     const body = method === 'POST' ? await readJson(req) : {};
     const token = String(body.toUserId || body.token || url.searchParams.get('toUserId') || url.searchParams.get('token') || '').trim();
@@ -260,7 +269,7 @@ async function route(req, res) {
     const payload = {
       settings: db.settings,
       cards: db.cards.map(publicCard),
-      users: db.users.map(publicUser),
+      users: publicAdminUsers(db.users),
       accounts: db.accounts.map((account) => publicAccount(account, {
         revealToken: revealTokens,
         stats1h: accountStats1h.get(account.id) || finalizeStats({})
@@ -919,6 +928,74 @@ async function redeemCard(cardCode) {
     });
     return publicUser(user);
   }, { collections: ['cards', 'users', 'ledger'] });
+}
+
+async function mergeUserBalance(sourceToken, targetToken) {
+  if (!sourceToken) throw httpError(400, '请先输入被融合密钥。');
+  if (!targetToken) throw httpError(400, '请输入需要保留额度的密钥。');
+  if (sourceToken === targetToken) throw httpError(409, '两个密钥不能相同。');
+
+  return store.update((db) => {
+    const source = getUserOrThrow(db, sourceToken);
+    const target = db.users.find((item) => item.token === targetToken);
+    if (!target || target.enabled === false) throw httpError(404, '保留额度的密钥不存在或已被禁用。');
+    if (source.id === target.id) throw httpError(409, '两个密钥不能相同。');
+
+    const activeJob = (db.jobs || []).find((job) => (
+      job.userToken === source.token && ['queued', 'running'].includes(job.status)
+    ));
+    if (activeJob) throw httpError(409, '当前密钥还有任务正在生成，完成后再融合。');
+
+    const amount = Number(source.balance || 0);
+    if (!Number.isFinite(amount) || amount <= 0) throw httpError(409, '被融合密钥没有可融合额度。');
+
+    const now = new Date().toISOString();
+    target.balance = Math.max(0, Number(target.balance || 0)) + amount;
+    target.updatedAt = now;
+    source.balance = 0;
+    source.enabled = false;
+    source.mergedInto = target.token;
+    source.mergedAt = now;
+    source.mergedAmount = amount;
+    source.updatedAt = now;
+    target.mergedFrom = mergedFromEntries(target.mergedFrom);
+    target.mergedFrom = [
+      { token: source.token, amount, at: now },
+      ...target.mergedFrom.filter((entry) => entry.token !== source.token)
+    ].slice(0, 200);
+
+    const mergeInLog = {
+      id: createId('log'),
+      type: 'merge-in',
+      token: target.token,
+      amount,
+      at: now,
+      note: `Merged balance from ${maskToken(source.token)}`
+    };
+    const mergeOutLog = {
+      id: createId('log'),
+      type: 'merge-out',
+      token: source.token,
+      amount: -amount,
+      at: now,
+      note: `Merged balance into ${maskToken(target.token)}`
+    };
+    db.ledger.unshift(mergeInLog, mergeOutLog);
+
+    return {
+      amount,
+      source: publicUser(source),
+      target: publicUser(target),
+      ledgerIds: [mergeInLog.id, mergeOutLog.id]
+    };
+  }, {
+    collections: ['users', 'ledger'],
+    dirtyRows: (result) => ({
+      users: [result?.source?.id, result?.target?.id],
+      ledger: result?.ledgerIds || []
+    }),
+    immediate: true
+  });
 }
 
 async function createCards(body) {
@@ -2630,8 +2707,8 @@ function getUserOrThrow(db, token) {
   return user;
 }
 
-function publicUser(user) {
-  return {
+function publicUser(user, options = {}) {
+  const payload = {
     id: user.id,
     token: user.token,
     balance: user.balance,
@@ -2641,6 +2718,60 @@ function publicUser(user) {
     createdAt: user.createdAt,
     updatedAt: user.updatedAt
   };
+  if (options.includeMergeTrace) {
+    payload.mergedInto = user.mergedInto || '';
+    payload.mergedAt = user.mergedAt || '';
+    payload.mergedAmount = Number(user.mergedAmount || 0);
+    payload.mergedFrom = mergedFromEntries(user.mergedFrom);
+  }
+  return payload;
+}
+
+function publicAdminUsers(users = []) {
+  const mergedFromByTarget = new Map();
+  for (const user of users) {
+    if (!user?.mergedInto) continue;
+    const token = String(user.mergedInto || '').trim();
+    if (!token) continue;
+    const entries = mergedFromByTarget.get(token) || [];
+    entries.push({
+      token: user.token || '',
+      amount: Number(user.mergedAmount || 0),
+      at: user.mergedAt || ''
+    });
+    mergedFromByTarget.set(token, entries);
+  }
+
+  return users.map((user) => {
+    const payload = publicUser(user, { includeMergeTrace: true });
+    payload.mergedFrom = uniqueMergedFromEntries([
+      ...payload.mergedFrom,
+      ...(mergedFromByTarget.get(user.token) || [])
+    ]);
+    return payload;
+  });
+}
+
+function mergedFromEntries(value = []) {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((entry) => ({
+      token: String(entry?.token || '').trim(),
+      amount: Number(entry?.amount || 0),
+      at: entry?.at || ''
+    }))
+    .filter((entry) => entry.token);
+}
+
+function uniqueMergedFromEntries(entries = []) {
+  const seen = new Set();
+  const selected = [];
+  for (const entry of mergedFromEntries(entries)) {
+    if (seen.has(entry.token)) continue;
+    seen.add(entry.token);
+    selected.push(entry);
+  }
+  return selected;
 }
 
 function publicCard(card) {
