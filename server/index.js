@@ -1438,58 +1438,19 @@ async function fetchNovelAiAccountQuotaWithTimeout(token, proxyUrl = '') {
 }
 
 async function clearImageCache(body) {
-  const deletedImages = [];
-  const result = await store.update((db) => {
-    const ids = new Set(collectValues(body.ids || body.images));
-    const query = String(body.q || body.query || '').trim().toLowerCase();
-    const clearAll = body.all === true || body.mode === 'all';
-    if (!clearAll && !ids.size && !query) throw httpError(400, 'cache clear target is required.');
+  const ids = collectValues(body.ids || body.images);
+  const query = String(body.q || body.query || '').trim().toLowerCase();
+  const clearAll = body.all === true || body.mode === 'all';
+  if (!clearAll && !ids.length && !query) throw httpError(400, 'cache clear target is required.');
 
-    const shouldDelete = (image) => {
-      if (clearAll) return true;
-      if (ids.has(image.id)) return true;
-      if (!query) return false;
-      return [image.id, image.token, image.prompt, image.fullPrompt, image.model]
-        .some((value) => String(value || '').toLowerCase().includes(query));
-    };
-
-    const deletedIds = new Set();
-    db.images = db.images.filter((image) => {
-      if (!shouldDelete(image)) return true;
-      deletedIds.add(image.id);
-      deletedImages.push(image);
-      return false;
-    });
-
-    if (deletedIds.size) {
-      db.jobs.forEach((job) => {
-        if (deletedIds.has(job.imageId)) job.imageId = '';
-      });
-    }
-
-    db.ledger.unshift({
-      id: createId('log'),
-      type: 'clear-cache',
-      amount: deletedIds.size,
-      at: new Date().toISOString(),
-      note: clearAll ? 'Cleared all cached images' : query ? `Cleared cached images matching ${query}` : 'Cleared selected cached images'
-    });
-
-    return { deleted: deletedIds.size, remaining: db.images.length };
-  }, { collections: ['images', 'jobs', 'ledger'] });
-  await removeStoredImages(deletedImages);
+  const result = await store.clearCachedImages({ ...body, ids, q: query, all: clearAll });
+  await removeStoredImages(result.images || []);
+  delete result.images;
   return result;
 }
 
 async function clearRequestLogs() {
-  return store.update((db) => {
-    const before = Array.isArray(db.jobs) ? db.jobs.length : 0;
-    db.jobs = (Array.isArray(db.jobs) ? db.jobs : []).filter((job) => ['queued', 'running'].includes(job.status));
-    return {
-      removed: before - db.jobs.length,
-      remaining: db.jobs.length
-    };
-  }, { collections: ['jobs'] });
+  return store.clearRequestLogs();
 }
 
 async function cleanupStaleActiveJobs(reason = 'stale active job cleanup') {
@@ -2209,6 +2170,7 @@ async function generateWithAccountRetry(reservation, request, options = {}) {
       reservation.account = current.account;
       return image;
     } catch (error) {
+      logNovelAiGenerateError(error, request, current.account, current.job);
       if (options.signal?.aborted || isAbortError(error)) throw error;
       if (!firstError) firstError = error;
       const next = await retryReservationWithNextAccount(current, error, tried, options);
@@ -3650,6 +3612,32 @@ function runtimeRequestLog(label, startedAt, detail = {}) {
     .map(([key, value]) => `${key}=${value}`)
     .join(' ');
   console.log(`[runtime] ${label}: total=${duration}ms${parts ? ` ${parts}` : ''}`);
+}
+
+function logNovelAiGenerateError(error, request = {}, account = {}, job = {}) {
+  const message = String(error?.message || error || '');
+  if (!/NovelAI returned 5\d\d/i.test(message)) return;
+  const cid = message.match(/cid=([a-z0-9]+)/i)?.[1] || '-';
+  console.error([
+    `[runtime] NovelAI generate error status=5xx`,
+    `cid=${cid}`,
+    `job=${shortRuntimeId(job?.id)}`,
+    `route=${account?.routeId || '-'}`,
+    `account=${shortRuntimeId(account?.id)}`,
+    `proxy=${account?.proxyUrl ? 1 : 0}`,
+    `model=${request.model || '-'}`,
+    `size=${request.width || '-'}x${request.height || '-'}`,
+    `steps=${request.steps || '-'}`,
+    `sampler=${request.sampler || '-'}`,
+    `noise=${request.noiseSchedule || '-'}`
+  ].join(' '));
+}
+
+function shortRuntimeId(value = '') {
+  const text = String(value || '');
+  if (!text) return '-';
+  if (text.length <= 12) return text;
+  return `${text.slice(0, 8)}...${text.slice(-4)}`;
 }
 
 function installRuntimeSafetyHandlers() {

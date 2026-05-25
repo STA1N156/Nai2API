@@ -76,6 +76,7 @@ export async function generateNovelAiImage(request, account, env, options = {}) 
   }
 
   const baseUrl = (env.NOVELAI_API_URL || 'https://image.novelai.net').replace(/\/$/, '');
+  const correlationId = novelAiCorrelationId();
   const response = await novelAiFetch(`${baseUrl}/ai/generate-image`, {
     method: 'POST',
     signal: options.signal,
@@ -85,6 +86,7 @@ export async function generateNovelAiImage(request, account, env, options = {}) 
       accept: 'application/x-zip-compressed,image/png,application/json',
       origin: 'https://novelai.net',
       referer: 'https://novelai.net/',
+      'x-correlation-id': correlationId,
       'user-agent': 'Mozilla/5.0 Nai2API/1.0'
     },
     body: JSON.stringify({
@@ -100,7 +102,7 @@ export async function generateNovelAiImage(request, account, env, options = {}) 
 
   if (!response.ok) {
     const text = buffer.toString('utf8').slice(0, 1000);
-    throw new Error(`NovelAI returned ${response.status}: ${text}`);
+    throw new Error(`NovelAI returned ${response.status} (cid=${correlationId}): ${text}`);
   }
 
   if (contentType.includes('application/json')) {
@@ -593,9 +595,12 @@ function buildV4Parameters(request) {
     minimize_sigma_inf: false,
     uncond_per_vibe: true,
     wonky_vibe_correlation: true,
-    stream: 'none',
     version: 1
   };
+}
+
+function novelAiCorrelationId() {
+  return Math.random().toString(36).slice(2, 8);
 }
 
 function isV4Model(model) {

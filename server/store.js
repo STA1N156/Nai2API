@@ -271,6 +271,150 @@ export class JsonStore {
     return removedImages;
   }
 
+  async clearRequestLogs() {
+    await this.ensureLoaded();
+    this.flushPendingPersistSync();
+
+    const startedAt = Date.now();
+    const before = this.countRecords('jobs');
+    const result = this.sqlite.prepare(`
+      DELETE FROM jobs
+      WHERE status NOT IN ('queued', 'running')
+    `).run();
+    const remaining = this.countRecords('jobs');
+
+    this.db.jobs = (this.db.jobs || []).filter((job) => ['queued', 'running'].includes(job.status));
+    const snapshot = buildSnapshotState(this.db, this.orderKeys, {
+      collections: ['jobs'],
+      includeSettings: false,
+      baseRowState: this.rowState,
+      baseOrderKeys: this.orderKeys
+    });
+    this.rowState.jobs = snapshot.rowState.jobs;
+    this.orderKeys.jobs = snapshot.orderKeys.jobs;
+    this.partialCollections.delete('jobs');
+
+    const removed = Number(result?.changes || 0);
+    runtimeLog(`SQLite request logs cleared ${removed} job record(s), before=${before}, remaining=${remaining}, duration=${Date.now() - startedAt}ms`);
+    return { removed, remaining };
+  }
+
+  async clearCachedImages(options = {}) {
+    await this.ensureLoaded();
+    this.flushPendingPersistSync();
+
+    const ids = uniqueStrings(options.ids || options.images);
+    const query = String(options.q || options.query || '').trim().toLowerCase();
+    const clearAll = options.all === true || options.mode === 'all';
+    const startedAt = Date.now();
+    const totalBefore = this.countRecords('images');
+    const imageRows = this.selectImagesForClear({ ids, query, clearAll });
+    const removedImages = imageRows
+      .map((row) => ({ row, image: safeJson(row.data, null) }))
+      .filter((entry) => entry.image)
+      .map((entry) => ({ ...entry.image, id: entry.image.id || entry.row.id }));
+    const removedIds = uniqueStrings(removedImages.map((image) => image.id));
+    if (!removedIds.length) {
+      return { deleted: 0, remaining: totalBefore, images: [] };
+    }
+
+    const affectedJobs = [];
+    for (const chunk of chunks(removedIds, 500)) {
+      const placeholders = chunk.map(() => '?').join(',');
+      affectedJobs.push(...this.sqlite.prepare(`
+        SELECT id, order_value AS orderValue, data
+        FROM jobs
+        WHERE image_id IN (${placeholders})
+      `).all(...chunk));
+    }
+
+    const jobUpdates = affectedJobs
+      .map((row) => {
+        const job = safeJson(row.data, null);
+        if (!job) return null;
+        if (!job.id) job.id = row.id;
+        job.imageId = '';
+        const data = JSON.stringify(job);
+        const order = Number(row.orderValue);
+        return {
+          id: row.id,
+          data,
+          order,
+          sql: sqlRecord('jobs', job, order, data)
+        };
+      })
+      .filter(Boolean);
+
+    const ledger = {
+      id: createId('log'),
+      type: 'clear-cache',
+      amount: removedIds.length,
+      at: new Date().toISOString(),
+      note: clearAll ? 'Cleared all cached images' : query ? `Cleared cached images matching ${query}` : 'Cleared selected cached images'
+    };
+    const ledgerOrder = Number(this.sqlite.prepare('SELECT MAX(order_value) AS value FROM ledger').get()?.value || 0) + 1;
+    const ledgerData = JSON.stringify(ledger);
+    const ledgerRow = sqlRecord('ledger', ledger, ledgerOrder, ledgerData);
+
+    const applyClear = this.sqlite.transaction(() => {
+      for (const update of jobUpdates) this.statements.upsertRecord.jobs.run(update.sql);
+      for (const chunk of chunks(removedIds, 500)) {
+        const placeholders = chunk.map(() => '?').join(',');
+        this.sqlite.prepare(`DELETE FROM images WHERE id IN (${placeholders})`).run(...chunk);
+      }
+      this.statements.upsertRecord.ledger.run(ledgerRow);
+    });
+    applyClear();
+
+    const removedSet = new Set(removedIds);
+    this.db.images = (this.db.images || []).filter((image) => !removedSet.has(String(image.id || '')));
+    for (const id of removedIds) {
+      this.rowState.images?.delete(id);
+      this.orderKeys.images?.delete(id);
+    }
+
+    for (const update of jobUpdates) {
+      const cachedJob = (this.db.jobs || []).find((job) => job.id === update.id);
+      if (cachedJob) cachedJob.imageId = '';
+      if (this.rowState.jobs?.has(update.id)) {
+        this.rowState.jobs.set(update.id, { data: update.data, order: update.order });
+        this.orderKeys.jobs.set(update.id, update.order);
+      }
+    }
+
+    this.db.ledger.unshift(ledger);
+    this.rowState.ledger?.set(ledger.id, { data: ledgerData, order: ledgerOrder });
+    this.orderKeys.ledger?.set(ledger.id, ledgerOrder);
+    this.refreshPartialCollectionState('images');
+    this.trimRuntimePartialCaches();
+
+    const remaining = this.countRecords('images');
+    runtimeLog(`SQLite image cache cleared ${removedIds.length} image record(s), affectedJobs=${jobUpdates.length}, totalBefore=${totalBefore}, remaining=${remaining}, duration=${Date.now() - startedAt}ms`);
+    return { deleted: removedIds.length, remaining, images: removedImages };
+  }
+
+  selectImagesForClear({ ids = [], query = '', clearAll = false } = {}) {
+    if (clearAll) {
+      return this.sqlite.prepare('SELECT id, data FROM images ORDER BY order_value ASC').all();
+    }
+
+    const rowsById = new Map();
+    for (const chunk of chunks(uniqueStrings(ids), 500)) {
+      const placeholders = chunk.map(() => '?').join(',');
+      const rows = this.sqlite.prepare(`SELECT id, data FROM images WHERE id IN (${placeholders})`).all(...chunk);
+      rows.forEach((row) => rowsById.set(row.id, row));
+    }
+    if (query) {
+      const rows = this.sqlite.prepare(`
+        SELECT id, data FROM images
+        WHERE search_text LIKE @query
+        ORDER BY order_value ASC
+      `).all({ query: `%${query}%` });
+      rows.forEach((row) => rowsById.set(row.id, row));
+    }
+    return [...rowsById.values()];
+  }
+
   hasPartialCollection(collection) {
     return this.partialCollections.has(collection);
   }
@@ -1122,6 +1266,14 @@ export class JsonStore {
       this.rowState[collection]?.delete(item.id);
       this.orderKeys[collection]?.delete(item.id);
     }
+  }
+
+  refreshPartialCollectionState(collection) {
+    if (!collectionTables[collection]) return;
+    const loaded = Array.isArray(this.db?.[collection]) ? this.db[collection].length : 0;
+    const total = this.countRecords(collection);
+    if (loaded < total) this.partialCollections.add(collection);
+    else this.partialCollections.delete(collection);
   }
 
   async readLegacyOrDefault() {
