@@ -972,10 +972,10 @@ function hourFailureRate(hour) {
 
 function renderErrorLogs(logs) {
   const list = Array.isArray(logs) ? logs : [];
-  el.errorLogCount.textContent = list.length ? `最近 7 天失败请求 · ${list.length} 条` : '最近 7 天没有失败请求';
+  el.errorLogCount.textContent = list.length ? `最近 7 天账号真实错误 · ${list.length} 条` : '最近 7 天没有账号真实错误';
   el.errorLogList.innerHTML = list.length
     ? list.map(renderErrorLog).join('')
-    : '<div class="empty small">最近 7 天没有失败请求</div>';
+    : '<div class="empty small">最近 7 天没有账号真实错误</div>';
 }
 
 function renderErrorLog(log) {

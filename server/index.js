@@ -264,7 +264,7 @@ async function route(req, res) {
     const errorLogJobs = db.errorJobs || statsJobs;
     const queueJobs = db.queueJobs || statsJobs;
     const computeStartedAt = Date.now();
-    const accountStats1h = accountStatsMapSince(statsJobs, 60 * 60 * 1000);
+    const accountStats1h = db.accountStats1h || Object.fromEntries(accountStatsMapSince(statsJobs, 60 * 60 * 1000));
     const queueDb = { ...db, jobs: queueJobs };
     const payload = {
       settings: db.settings,
@@ -272,15 +272,15 @@ async function route(req, res) {
       users: publicAdminUsers(db.users),
       accounts: db.accounts.map((account) => publicAccount(account, {
         revealToken: revealTokens,
-        stats1h: accountStats1h.get(account.id) || finalizeStats({})
+        stats1h: accountStats1h[account.id] || finalizeStats({})
       })),
       images: db.images.slice(0, 12).map(publicImage),
       imageCount: db.imageCount ?? db.images.length,
       imageTotal: db.imageCount ?? db.images.length,
       cacheImageCount: db.imageCount ?? db.images.length,
-      requestStats1m: requestStatsSince(statsJobs, 60 * 1000),
-      jobStats1h: jobStatsSince(statsJobs, 60 * 60 * 1000),
-      usageHourlyDays: hourlyUsageStatsByDay(statsJobs),
+      requestStats1m: db.requestStats1m || requestStatsSince(statsJobs, 60 * 1000),
+      jobStats1h: db.jobStats1h || jobStatsSince(statsJobs, 60 * 60 * 1000),
+      usageHourlyDays: db.usageHourlyDays || hourlyUsageStatsByDay(statsJobs),
       errorLogs: errorLogs(errorLogJobs, db, 100),
       jobs: db.jobs.slice(0, 50).map((job) => publicJob(job, queueDb)),
       ledger: db.ledger.slice(0, 80)
@@ -295,7 +295,7 @@ async function route(req, res) {
       sendMs,
       users: db.users.length,
       accounts: db.accounts.length,
-      statsJobs: statsJobs.length,
+      statsRows: db.statsRowsRead ?? statsJobs.length,
       recentJobs: db.jobs.length,
       images: db.imageCount ?? db.images.length
     });
@@ -1685,7 +1685,7 @@ function uniqueIds(values = []) {
 }
 
 function imageCacheTrimBuffer(maxCacheImages = 1) {
-  return maxCacheImages > 0 ? 100 : 0;
+  return maxCacheImages > 0 ? 300 : 0;
 }
 
 function normalizeCacheImageLimit(value) {
@@ -3084,6 +3084,7 @@ function errorLogs(jobs, db = {}, limit = 100) {
   const cutoff = Date.now() - errorLogRetentionMs;
   return jobs
     .filter((job) => job.status === 'failed')
+    .filter(isAccountErrorLogJob)
     .filter((job) => {
       const timestamp = Date.parse(job.updatedAt || job.createdAt || '');
       return timestamp && timestamp >= cutoff;
@@ -3091,6 +3092,16 @@ function errorLogs(jobs, db = {}, limit = 100) {
     .sort((a, b) => Date.parse(b.updatedAt || b.createdAt || '') - Date.parse(a.updatedAt || a.createdAt || ''))
     .slice(0, limit)
     .map((job) => publicErrorLog(job, db));
+}
+
+function isAccountErrorLogJob(job) {
+  if (!job?.accountId) return false;
+  const text = `${job.error || ''}\n${job.errorDetail || ''}`;
+  if (isNovelAiCapacityError({ message: text })) return false;
+  if (/all NovelAI accounts are busy|server busy|direct generate timeout|AbortError|operation was aborted/i.test(text)) return false;
+  if (/job deadline expired|stale timeout|queued job exceeded|running job exceeded/i.test(text)) return false;
+  if (/invalid user token|invalid STA1N|密钥额度不足|用户额度不足/i.test(text)) return false;
+  return true;
 }
 
 function publicErrorLog(job, db = {}) {

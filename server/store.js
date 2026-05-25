@@ -82,6 +82,8 @@ const defaultDb = {
   images: [],
   ledger: []
 };
+const usageChartDays = 7;
+const beijingOffsetHours = 8;
 
 export class JsonStore {
   constructor(dataDir) {
@@ -193,7 +195,8 @@ export class JsonStore {
     const trimAt = maxCache + trimBuffer;
     if (total < trimAt) return [];
 
-    const deleteCount = Math.max(0, total - maxCache);
+    const maxDelete = trimImageCacheDeleteLimit(options.maxDelete);
+    const deleteCount = Math.min(Math.max(0, total - maxCache), maxDelete);
     if (!deleteCount) return [];
 
     const startedAt = Date.now();
@@ -264,7 +267,7 @@ export class JsonStore {
     removedImages.affectedJobIds = uniqueStrings(affectedJobIds);
     this.trimRuntimePartialCaches();
 
-    runtimeLog(`SQLite image cache trimmed ${removedIds.length} image record(s), affectedJobs=${removedImages.affectedJobIds.length}, totalBefore=${total}, max=${maxCache}, duration=${Date.now() - startedAt}ms`);
+    runtimeLog(`SQLite image cache trimmed ${removedIds.length} image record(s), affectedJobs=${removedImages.affectedJobIds.length}, totalBefore=${total}, max=${maxCache}, maxDelete=${maxDelete}, duration=${Date.now() - startedAt}ms`);
     return removedImages;
   }
 
@@ -368,16 +371,21 @@ export class JsonStore {
       users: this.selectItems('users'),
       accounts: this.selectItems('accounts'),
       jobs: this.selectItems('jobs', 'ORDER BY order_value DESC LIMIT 50'),
-      statsJobs: this.selectJobStatRows(`
-        WHERE COALESCE(created_at, '') >= @cutoff
-          OR COALESCE(updated_at, '') >= @cutoff
-          OR status IN ('queued', 'running')
-        ORDER BY order_value DESC
-      `, { cutoff: statsCutoff }),
+      ...this.readAdminSummaryStats(),
+      statsRowsRead: 0,
       errorJobs: this.selectItems('jobs', `
-        WHERE status = 'failed' AND COALESCE(updated_at, created_at, '') >= @cutoff
-        ORDER BY COALESCE(updated_at, created_at, '') DESC
-        LIMIT 100
+        WHERE status = 'failed'
+          AND updated_at >= @cutoff
+          AND account_id IS NOT NULL
+          AND account_id != ''
+          AND data NOT LIKE '%all NovelAI accounts are busy%'
+          AND data NOT LIKE '%server busy%'
+          AND data NOT LIKE '%NovelAI returned 429%'
+          AND data NOT LIKE '%statusCode"%429%'
+          AND data NOT LIKE '%Concurrent generation is locked%'
+          AND data NOT LIKE '%concurrent generation%'
+        ORDER BY updated_at DESC
+        LIMIT 500
       `, { cutoff: statsCutoff }),
       queueJobs: this.selectItems('jobs', `
         WHERE status IN ('queued', 'running')
@@ -389,6 +397,103 @@ export class JsonStore {
       cacheImageCount: this.countRecords('images'),
       ledger: this.selectItems('ledger', 'ORDER BY order_value DESC LIMIT 80')
     };
+  }
+
+  readAdminSummaryStats() {
+    const now = Date.now();
+    const oneMinuteAgo = new Date(now - 60 * 1000).toISOString();
+    const oneHourAgo = new Date(now - 60 * 60 * 1000).toISOString();
+    return {
+      requestStats1m: this.readRequestStatsSince(oneMinuteAgo),
+      jobStats1h: this.readJobStatsSince(oneHourAgo),
+      accountStats1h: this.readAccountStatsSince(oneHourAgo),
+      usageHourlyDays: this.readUsageHourlyDays(now, usageChartDays)
+    };
+  }
+
+  readRequestStatsSince(sinceIso) {
+    const row = this.sqlite.prepare(`
+      SELECT COUNT(*) AS total
+      FROM jobs
+      WHERE created_at >= @since
+    `).get({ since: sinceIso });
+    return { total: Number(row?.total || 0) };
+  }
+
+  readJobStatsSince(sinceIso) {
+    const rows = this.sqlite.prepare(`
+      SELECT status, COUNT(*) AS count
+      FROM jobs
+      WHERE status IN ('done', 'failed')
+        AND created_at >= @since
+        AND ${nonQuotaFailureSql()}
+      GROUP BY status
+    `).all({ since: sinceIso });
+    return finalizeSqlStats(rows);
+  }
+
+  readAccountStatsSince(sinceIso) {
+    const rows = this.sqlite.prepare(`
+      SELECT account_id AS accountId, status, COUNT(*) AS count
+      FROM jobs
+      WHERE status IN ('done', 'failed')
+        AND account_id IS NOT NULL
+        AND account_id != ''
+        AND created_at >= @since
+        AND ${nonQuotaFailureSql()}
+      GROUP BY account_id, status
+    `).all({ since: sinceIso });
+    const stats = {};
+    for (const row of rows) {
+      const accountId = row.accountId || '';
+      if (!accountId) continue;
+      if (!stats[accountId]) stats[accountId] = { done: 0, failed: 0 };
+      if (row.status === 'done') stats[accountId].done += Number(row.count || 0);
+      if (row.status === 'failed') stats[accountId].failed += Number(row.count || 0);
+    }
+    for (const accountId of Object.keys(stats)) stats[accountId] = finalizeStatsObject(stats[accountId]);
+    return stats;
+  }
+
+  readUsageHourlyDays(now = Date.now(), days = usageChartDays) {
+    const buckets = usageBuckets(now, days);
+    const cutoff = new Date(now - days * 24 * 60 * 60 * 1000).toISOString();
+    const rows = this.sqlite.prepare(`
+      SELECT
+        strftime('%Y-%m-%d', datetime(updated_at, '+${beijingOffsetHours} hours')) AS date,
+        CAST(strftime('%H', datetime(updated_at, '+${beijingOffsetHours} hours')) AS INTEGER) AS hour,
+        status,
+        COUNT(*) AS count
+      FROM jobs
+      WHERE status IN ('done', 'failed')
+        AND updated_at >= @cutoff
+      GROUP BY date, hour, status
+    `).all({ cutoff });
+    for (const row of rows) {
+      const bucket = buckets.map.get(row.date);
+      if (!bucket) continue;
+      const hour = bucket.hours[Number(row.hour || 0)];
+      if (!hour) continue;
+      const count = Number(row.count || 0);
+      if (row.status === 'done') {
+        bucket.done += count;
+        hour.done += count;
+      }
+      if (row.status === 'failed') {
+        bucket.failed += count;
+        hour.failed += count;
+      }
+    }
+    return buckets.keys.map((key) => {
+      const bucket = buckets.map.get(key);
+      bucket.total = bucket.done + bucket.failed;
+      bucket.successRate = bucket.total ? bucket.done / bucket.total : 0;
+      bucket.hours.forEach((hour) => {
+        hour.total = hour.done + hour.failed;
+        hour.successRate = hour.total ? hour.done / hour.total : 0;
+      });
+      return bucket;
+    });
   }
 
   async ensureLoaded() {
@@ -633,6 +738,12 @@ export class JsonStore {
         ON jobs (user_token);
       CREATE INDEX IF NOT EXISTS idx_jobs_image_id
         ON jobs (image_id);
+      CREATE INDEX IF NOT EXISTS idx_jobs_created
+        ON jobs (created_at);
+      CREATE INDEX IF NOT EXISTS idx_jobs_updated
+        ON jobs (updated_at);
+      CREATE INDEX IF NOT EXISTS idx_jobs_account_status_created
+        ON jobs (account_id, status, created_at);
       CREATE INDEX IF NOT EXISTS idx_users_token
         ON users (token);
       CREATE INDEX IF NOT EXISTS idx_accounts_route_id
@@ -1426,6 +1537,72 @@ function chunks(values, size) {
 
 function uniqueStrings(values = []) {
   return [...new Set(values.map((value) => String(value || '').trim()).filter(Boolean))];
+}
+
+function trimImageCacheDeleteLimit(value) {
+  const number = Number(value ?? 300);
+  if (!Number.isFinite(number) || number <= 0) return 300;
+  return Math.max(1, Math.floor(number));
+}
+
+function nonQuotaFailureSql() {
+  return `NOT (
+    status = 'failed'
+    AND (
+      data LIKE '%insufficient balance%'
+      OR data LIKE '%额度不足%'
+      OR data LIKE '%余额不足%'
+    )
+  )`;
+}
+
+function finalizeSqlStats(rows = []) {
+  const stats = rows.reduce((current, row) => {
+    if (row.status === 'done') current.done += Number(row.count || 0);
+    if (row.status === 'failed') current.failed += Number(row.count || 0);
+    return current;
+  }, { done: 0, failed: 0 });
+  return finalizeStatsObject(stats);
+}
+
+function finalizeStatsObject(stats = {}) {
+  const done = Number(stats.done || 0);
+  const failed = Number(stats.failed || 0);
+  const total = done + failed;
+  return {
+    done,
+    failed,
+    total,
+    successRate: total ? done / total : 0
+  };
+}
+
+function usageBuckets(now = Date.now(), days = usageChartDays) {
+  const current = new Date(now + beijingOffsetHours * 60 * 60 * 1000);
+  const midnight = Date.UTC(current.getUTCFullYear(), current.getUTCMonth(), current.getUTCDate());
+  const keys = Array.from({ length: days }, (_, index) => {
+    const dayOffset = index - days + 1;
+    return new Date(midnight + dayOffset * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  });
+  return {
+    keys,
+    map: new Map(keys.map((key) => [key, {
+      date: key,
+      label: key.slice(5),
+      done: 0,
+      failed: 0,
+      total: 0,
+      successRate: 0,
+      hours: Array.from({ length: 24 }, (_, hour) => ({
+        hour,
+        label: `${String(hour).padStart(2, '0')}:00`,
+        done: 0,
+        failed: 0,
+        total: 0,
+        successRate: 0
+      }))
+    }]))
+  };
 }
 
 function existingOrderSequenceIsStable(items, previousOrders) {
