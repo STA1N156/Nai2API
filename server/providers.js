@@ -75,7 +75,7 @@ export async function generateNovelAiImage(request, account, env, options = {}) 
     return generateMockImage(request);
   }
 
-  if (shouldUseNovelAiStream(request, env)) {
+  if (shouldUseNovelAiStream(request, env, options)) {
     return generateNovelAiImageStream(request, account, env, options);
   }
 
@@ -396,7 +396,14 @@ function buildHttpRequest(target, options = {}) {
 
 function writeAndReadHttpResponse(socket, request, signal) {
   return new Promise((resolve, reject) => {
-    const chunks = [];
+    let headerBuffer = Buffer.alloc(0);
+    let responseResolved = false;
+    let bodyClosed = false;
+    let bodyController = null;
+    let chunkedDecoder = null;
+    let contentLength = 0;
+    let receivedBodyBytes = 0;
+    const bodyChunks = [];
     const abort = () => rejectAndClose(abortError(signal?.reason));
     const cleanup = () => {
       signal?.removeEventListener('abort', abort);
@@ -404,21 +411,101 @@ function writeAndReadHttpResponse(socket, request, signal) {
       socket.off('end', onEnd);
       socket.off('error', onError);
     };
+    const body = new ReadableStream({
+      start(controller) {
+        bodyController = controller;
+      },
+      cancel() {
+        cleanup();
+        destroySocketQuietly(socket);
+      }
+    });
+    const closeBody = () => {
+      if (bodyClosed) return;
+      bodyClosed = true;
+      cleanup();
+      try {
+        bodyController?.close();
+      } catch {}
+      destroySocketQuietly(socket);
+    };
+    const errorBody = (error) => {
+      if (bodyClosed) return;
+      bodyClosed = true;
+      cleanup();
+      try {
+        bodyController?.error(error);
+      } catch {}
+    };
+    const enqueueBody = (chunk) => {
+      if (!chunk?.length || bodyClosed) return;
+      const copy = Buffer.from(chunk);
+      bodyChunks.push(copy);
+      bodyController?.enqueue(new Uint8Array(copy));
+    };
     const rejectAndClose = (error) => {
       cleanup();
       destroySocketQuietly(socket);
-      reject(error);
+      if (responseResolved) errorBody(error);
+      else reject(error);
     };
-    const onData = (chunk) => chunks.push(chunk);
-    const onEnd = () => {
-      cleanup();
+    const onData = (chunk) => {
       try {
-        resolve(parseHttpResponse(Buffer.concat(chunks)));
+        if (!responseResolved) {
+          headerBuffer = Buffer.concat([headerBuffer, chunk]);
+          const headerEnd = headerBuffer.indexOf('\r\n\r\n');
+          if (headerEnd < 0) return;
+          const response = openHttpResponseFromHeader(headerBuffer.slice(0, headerEnd), body, bodyChunks);
+          contentLength = Number(response.headers.get('content-length') || 0);
+          if (/chunked/i.test(response.headers.get('transfer-encoding') || '')) {
+            chunkedDecoder = createChunkedBodyDecoder(enqueueBody, closeBody);
+          }
+          responseResolved = true;
+          resolve(response);
+          const rest = headerBuffer.slice(headerEnd + 4);
+          headerBuffer = Buffer.alloc(0);
+          if (rest.length) handleBodyChunk(rest);
+          return;
+        }
+        handleBodyChunk(chunk);
       } catch (error) {
-        reject(error);
+        rejectAndClose(error);
+      }
+    };
+    const onEnd = () => {
+      if (!responseResolved) {
+        cleanup();
+        try {
+          resolve(parseHttpResponse(headerBuffer));
+        } catch (error) {
+          reject(error);
+        }
+        return;
+      }
+      try {
+        chunkedDecoder?.finish();
+        closeBody();
+      } catch (error) {
+        errorBody(error);
       }
     };
     const onError = (error) => rejectAndClose(error);
+    const handleBodyChunk = (chunk) => {
+      if (chunkedDecoder) {
+        chunkedDecoder.push(chunk);
+        return;
+      }
+      if (contentLength > 0) {
+        const remaining = contentLength - receivedBodyBytes;
+        if (remaining <= 0) return;
+        const next = chunk.length > remaining ? chunk.slice(0, remaining) : chunk;
+        receivedBodyBytes += next.length;
+        enqueueBody(next);
+        if (receivedBodyBytes >= contentLength) closeBody();
+        return;
+      }
+      enqueueBody(chunk);
+    };
 
     if (signal?.aborted) return abort();
     signal?.addEventListener('abort', abort, { once: true });
@@ -429,6 +516,80 @@ function writeAndReadHttpResponse(socket, request, signal) {
       if (error) rejectAndClose(error);
     });
   });
+}
+
+function openHttpResponseFromHeader(headerBuffer, body, bodyChunks) {
+  const headerText = headerBuffer.toString('latin1');
+  const [statusLine, ...headerLines] = headerText.split('\r\n');
+  const status = Number(statusLine.match(/^HTTP\/\d(?:\.\d)?\s+(\d+)/)?.[1] || 0);
+  if (!status) throw new Error('Invalid HTTP status from NovelAI.');
+  const headers = new Map();
+  headerLines.forEach((line) => {
+    const index = line.indexOf(':');
+    if (index <= 0) return;
+    const key = line.slice(0, index).trim().toLowerCase();
+    const value = line.slice(index + 1).trim();
+    headers.set(key, headers.has(key) ? `${headers.get(key)}, ${value}` : value);
+  });
+
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    headers: {
+      get(name) {
+        return headers.get(String(name || '').toLowerCase()) || '';
+      }
+    },
+    body,
+    async arrayBuffer() {
+      await drainReadableStream(body);
+      return Buffer.concat(bodyChunks);
+    },
+    async text() {
+      await drainReadableStream(body);
+      return Buffer.concat(bodyChunks).toString('utf8');
+    }
+  };
+}
+
+function createChunkedBodyDecoder(enqueue, close) {
+  let buffer = Buffer.alloc(0);
+  let done = false;
+  return {
+    push(chunk) {
+      if (done) return;
+      buffer = Buffer.concat([buffer, chunk]);
+      while (true) {
+        const lineEnd = buffer.indexOf('\r\n');
+        if (lineEnd < 0) return;
+        const sizeText = buffer.slice(0, lineEnd).toString('latin1').split(';')[0].trim();
+        const size = Number.parseInt(sizeText, 16);
+        if (!Number.isFinite(size) || size < 0) throw new Error('Invalid chunked NovelAI response.');
+        const dataStart = lineEnd + 2;
+        const dataEnd = dataStart + size;
+        if (buffer.length < dataEnd + 2) return;
+        if (size === 0) {
+          done = true;
+          buffer = Buffer.alloc(0);
+          close();
+          return;
+        }
+        enqueue(buffer.slice(dataStart, dataEnd));
+        buffer = buffer.slice(dataEnd + 2);
+      }
+    },
+    finish() {
+      if (!done && buffer.length) throw new Error('Truncated chunked NovelAI response.');
+    }
+  };
+}
+
+async function drainReadableStream(body) {
+  const reader = body.getReader();
+  while (true) {
+    const { done } = await reader.read();
+    if (done) return;
+  }
 }
 
 function parseHttpResponse(buffer) {
@@ -664,7 +825,9 @@ function novelAiCorrelationId() {
   return Math.random().toString(36).slice(2, 8);
 }
 
-function shouldUseNovelAiStream(request, env = {}) {
+function shouldUseNovelAiStream(request, env = {}, options = {}) {
+  if (options.forceStream === true) return isV4Model(request.model);
+  if (options.forceStream === false) return false;
   if (String(env.NOVELAI_STREAM_IMAGE || '').toLowerCase() === 'false') return false;
   return isV4Model(request.model);
 }

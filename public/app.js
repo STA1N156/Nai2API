@@ -629,7 +629,7 @@ function setGenerationStreamProgress(progress = null, isVisible = true) {
   stream.hidden = !isVisible;
   const percent = clampGenerationPercent(progress?.percent);
   const bar = document.querySelector('#generationStreamBar');
-  if (bar) bar.style.width = `${percent}%`;
+  if (bar) bar.style.width = `${isVisible ? percent : 0}%`;
 }
 
 function clampGenerationPercent(value) {

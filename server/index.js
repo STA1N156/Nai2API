@@ -2161,15 +2161,19 @@ async function reserveQueuedJob(jobId) {
 async function runReservedJob(reservation) {
   if (!reservation || reservation.skip || reservation.queued) return;
   const control = createRunningJobControl(reservation.job);
-  resetJobStreamProgress(reservation.job?.id, reservation.job?.request);
+  const useStreamProgress = shouldUseJobStreamProgress(reservation.job);
+  if (useStreamProgress) resetJobStreamProgress(reservation.job?.id, reservation.job?.request);
   try {
     const image = await generateWithAccountRetry(reservation, reservation.job.request, {
       signal: control.controller.signal,
       deadline: jobDeadlineTimestamp(reservation.job),
-      onProgress: (progress) => updateJobStreamProgress(reservation.job?.id, progress)
+      forceStream: useStreamProgress,
+      onProgress: useStreamProgress ? (progress) => updateJobStreamProgress(reservation.job?.id, progress) : null
     });
     if (control.controller.signal.aborted) throw control.controller.signal.reason || new Error(control.reason || 'direct generate timeout');
-    updateJobStreamProgress(reservation.job?.id, { percent: 100, step: reservation.job?.request?.steps, total: reservation.job?.request?.steps });
+    if (useStreamProgress) {
+      updateJobStreamProgress(reservation.job?.id, { percent: 100, step: reservation.job?.request?.steps, total: reservation.job?.request?.steps });
+    }
     await completeGeneration(reservation, reservation.job.request, image, { jobId: reservation.job.id });
   } catch (error) {
     if (control.controller.signal.aborted || isAbortError(error)) {
@@ -2184,6 +2188,10 @@ async function runReservedJob(reservation) {
   } finally {
     finishRunningJobControl(reservation.job?.id, control);
   }
+}
+
+function shouldUseJobStreamProgress(job = {}) {
+  return (job.source || 'web') === 'web';
 }
 
 function createRunningJobControl(job = {}) {
@@ -2262,6 +2270,7 @@ async function generateWithAccountRetry(reservation, request, options = {}) {
       });
       const image = await generateNovelAiImage(request, current.account, process.env, {
         signal: options.signal,
+        forceStream: options.forceStream,
         onProgress: (progress) => options.onProgress?.({
           ...progress,
           accountId: current.account?.id || '',
