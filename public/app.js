@@ -458,6 +458,11 @@ function renderLoadingFrame() {
     <div class="loading-orbit"><span></span><span></span><span></span></div>
     <strong>正在生成图片</strong>
     <p id="loadingStatusText">任务已提交，正在分配账号</p>
+    <div id="generationStream" class="generation-stream-panel" aria-label="NovelAI 生成进度" hidden>
+      <div class="generation-stream-track">
+        <span id="generationStreamBar"></span>
+      </div>
+    </div>
     <div class="loading-steps" aria-hidden="true">
       <span class="active">提交任务</span>
       <span>路由账号</span>
@@ -475,6 +480,7 @@ function updateLoadingStatus(job) {
     const position = Number(view.position || 0);
     target.textContent = queueLoadingText(position, count);
     el.jobText.textContent = queueStatusText(position, count);
+    setGenerationStreamProgress(null, false);
     setLoadingStep(1);
     return;
   }
@@ -482,10 +488,14 @@ function updateLoadingStatus(job) {
     if (finishQueueView(job)) return;
     clearQueueView();
     target.textContent = '账号已分配，NovelAI 正在生成';
+    setGenerationStreamProgress(job.generationProgress, true);
     setLoadingStep(2);
     return;
   }
-  if (job.status === 'done') target.textContent = '生成完成，正在载入图片';
+  if (job.status === 'done') {
+    target.textContent = '生成完成，正在载入图片';
+    setGenerationStreamProgress({ percent: 100 }, false);
+  }
 }
 
 function resetQueueView(job = {}) {
@@ -593,6 +603,7 @@ function ensureQueueViewTimer(restart = false) {
       clearQueueView();
       if (target) target.textContent = '账号已分配，NovelAI 正在生成';
       el.jobText.textContent = '生成中';
+      setGenerationStreamProgress({ percent: 0 }, true);
       setLoadingStep(2);
     }
   }, state.queueView?.completing || state.queueView?.fastForward ? queueCompleteStepIntervalMs : queueStepIntervalMs);
@@ -610,6 +621,21 @@ function setLoadingStep(activeIndex) {
   document.querySelectorAll('.loading-steps span').forEach((item, index) => {
     item.classList.toggle('active', index <= activeIndex);
   });
+}
+
+function setGenerationStreamProgress(progress = null, isVisible = true) {
+  const stream = document.querySelector('#generationStream');
+  if (!stream) return;
+  stream.hidden = !isVisible;
+  const percent = clampGenerationPercent(progress?.percent);
+  const bar = document.querySelector('#generationStreamBar');
+  if (bar) bar.style.width = `${percent}%`;
+}
+
+function clampGenerationPercent(value) {
+  const number = Number(value || 0);
+  if (!Number.isFinite(number)) return 0;
+  return Math.max(0, Math.min(100, number));
 }
 
 function clearQueueView() {

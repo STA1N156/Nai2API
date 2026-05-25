@@ -23,6 +23,7 @@ const directGenerateTimeoutMs = Number(process.env.DIRECT_GENERATE_TIMEOUT_MS ||
 const openAiChatTimeoutMs = Number(process.env.OPENAI_CHAT_TIMEOUT_MS || 10 * 60_000);
 const openAiQueuePollMs = 650;
 const openAiFixedSteps = 28;
+const jobStreamProgress = new Map();
 const beijingOffsetMs = 8 * 60 * 60 * 1000;
 const usageChartDays = 7;
 const errorLogRetentionMs = usageChartDays * 24 * 60 * 60 * 1000;
@@ -1939,6 +1940,7 @@ async function markDirectJobFailed(jobId, message) {
     job.updatedAt = new Date().toISOString();
     job.completedAt = job.updatedAt;
   }, { collections: ['jobs'], dirtyRows: dirtyJobRows(jobId) });
+  clearJobStreamProgress(jobId);
   notifyJobWaiters(jobId, { error: publicErrorMessage(detail) });
 }
 
@@ -1982,6 +1984,7 @@ async function cancelQueuedOrRunningJob(jobId, message, detail = message) {
   });
   if (!changed) return;
   scheduleQueueDrain();
+  clearJobStreamProgress(jobId);
   notifyJobWaiters(jobId, { error: message });
 }
 
@@ -2006,6 +2009,35 @@ function notifyJobWaiters(jobId, payload) {
     clearTimeout(waiter.timer);
     waiter.resolve(payload);
   });
+}
+
+function resetJobStreamProgress(jobId, request = {}) {
+  if (!jobId) return;
+  jobStreamProgress.set(jobId, {
+    percent: 0,
+    step: 0,
+    total: Number(request?.steps || 0),
+    updatedAt: new Date().toISOString()
+  });
+}
+
+function updateJobStreamProgress(jobId, progress = {}) {
+  if (!jobId) return;
+  const previous = jobStreamProgress.get(jobId) || {};
+  const percent = clamp(Number(progress.percent ?? previous.percent ?? 0), 0, 100);
+  jobStreamProgress.set(jobId, {
+    percent: Math.max(Number(previous.percent || 0), percent),
+    step: Number(progress.step ?? previous.step ?? 0) || 0,
+    total: Number(progress.total ?? previous.total ?? 0) || 0,
+    accountId: progress.accountId || previous.accountId || '',
+    accountRouteId: Number(progress.accountRouteId || previous.accountRouteId || 0),
+    eventType: progress.eventType || previous.eventType || '',
+    updatedAt: progress.updatedAt || new Date().toISOString()
+  });
+}
+
+function clearJobStreamProgress(jobId) {
+  if (jobId) jobStreamProgress.delete(jobId);
 }
 
 function isTimeoutResultMessage(message) {
@@ -2077,12 +2109,15 @@ async function reserveQueuedJob(jobId) {
 async function runReservedJob(reservation) {
   if (!reservation || reservation.skip || reservation.queued) return;
   const control = createRunningJobControl(reservation.job);
+  resetJobStreamProgress(reservation.job?.id, reservation.job?.request);
   try {
     const image = await generateWithAccountRetry(reservation, reservation.job.request, {
       signal: control.controller.signal,
-      deadline: jobDeadlineTimestamp(reservation.job)
+      deadline: jobDeadlineTimestamp(reservation.job),
+      onProgress: (progress) => updateJobStreamProgress(reservation.job?.id, progress)
     });
     if (control.controller.signal.aborted) throw control.controller.signal.reason || new Error(control.reason || 'direct generate timeout');
+    updateJobStreamProgress(reservation.job?.id, { percent: 100, step: reservation.job?.request?.steps, total: reservation.job?.request?.steps });
     await completeGeneration(reservation, reservation.job.request, image, { jobId: reservation.job.id });
   } catch (error) {
     if (control.controller.signal.aborted || isAbortError(error)) {
@@ -2166,7 +2201,21 @@ async function generateWithAccountRetry(reservation, request, options = {}) {
     if (options.signal?.aborted) throw options.signal.reason || new Error('direct generate timeout');
     if (current.account?.id) tried.add(current.account.id);
     try {
-      const image = await generateNovelAiImage(request, current.account, process.env, { signal: options.signal });
+      options.onProgress?.({
+        percent: 0,
+        step: 0,
+        total: Number(request?.steps || 0),
+        accountId: current.account?.id || '',
+        accountRouteId: current.account?.routeId || 0
+      });
+      const image = await generateNovelAiImage(request, current.account, process.env, {
+        signal: options.signal,
+        onProgress: (progress) => options.onProgress?.({
+          ...progress,
+          accountId: current.account?.id || '',
+          accountRouteId: current.account?.routeId || 0
+        })
+      });
       reservation.account = current.account;
       return image;
     } catch (error) {
@@ -2254,6 +2303,7 @@ async function requeueReservedJob(reservation, error) {
     delay = Math.max(250, nextAccountReadyDelay(db.accounts, db.settings) || delay);
   }, { dirtyRows: dirtyReservationJobRows(reservation) });
   scheduleQueueDrain(delay);
+  clearJobStreamProgress(reservation.job?.id);
 }
 
 async function reserveCreditAndAccount(token, request, cacheKey) {
@@ -2398,7 +2448,10 @@ async function completeGeneration(reservation, request, image, meta = {}) {
   trimmedImages = await store.trimImageCache(null, { batchSize: imageCacheTrimBuffer() });
   await removeStoredImages(trimmedImages);
   scheduleQueueDrain();
-  if (meta.jobId) notifyJobWaiters(meta.jobId, { saved: savedImage, image, balance: savedImage.balance });
+  if (meta.jobId) {
+    clearJobStreamProgress(meta.jobId);
+    notifyJobWaiters(meta.jobId, { saved: savedImage, image, balance: savedImage.balance });
+  }
   return savedImage;
 }
 
@@ -2428,7 +2481,10 @@ async function cancelReservedJob(reservation, error) {
   });
   if (!changed) return;
   scheduleQueueDrain();
-  if (reservation.job?.id) notifyJobWaiters(reservation.job.id, { error: waiterMessage });
+  if (reservation.job?.id) {
+    clearJobStreamProgress(reservation.job.id);
+    notifyJobWaiters(reservation.job.id, { error: waiterMessage });
+  }
 }
 
 async function failGeneration(reservation, error) {
@@ -2469,7 +2525,10 @@ async function failGeneration(reservation, error) {
     dirtyRows: dirtyReservationJobRows(reservation)
   });
   scheduleQueueDrain();
-  if (reservation.job?.id) notifyJobWaiters(reservation.job.id, { error: message });
+  if (reservation.job?.id) {
+    clearJobStreamProgress(reservation.job.id);
+    notifyJobWaiters(reservation.job.id, { error: message });
+  }
 }
 
 function selectAccount(accounts, settings = {}, options = {}) {
@@ -2890,6 +2949,7 @@ function publicJob(job, db = null) {
     accountRouteId: account?.routeId || 0,
     cost: job.cost,
     accountCost: jobAccountCost(job),
+    generationProgress: publicGenerationProgress(job),
     imageId: job.imageId || '',
     imageUrl: job.imageId ? `/api/images/${job.imageId}/content` : '',
     error: publicErrorMessage(job.error || ''),
@@ -2899,6 +2959,33 @@ function publicJob(job, db = null) {
     createdAt: job.createdAt,
     updatedAt: job.updatedAt,
     completedAt: job.completedAt || (['done', 'failed'].includes(job.status) ? job.updatedAt : '')
+  };
+}
+
+function publicGenerationProgress(job = {}) {
+  if (job.status === 'done') {
+    return {
+      percent: 100,
+      step: Number(job.request?.steps || 0),
+      total: Number(job.request?.steps || 0),
+      active: false
+    };
+  }
+  if (job.status !== 'running') {
+    return {
+      percent: 0,
+      step: 0,
+      total: Number(job.request?.steps || 0),
+      active: false
+    };
+  }
+  const progress = jobStreamProgress.get(job.id) || {};
+  return {
+    percent: clamp(Number(progress.percent || 0), 0, 100),
+    step: Number(progress.step || 0),
+    total: Number(progress.total || job.request?.steps || 0),
+    active: true,
+    updatedAt: progress.updatedAt || ''
   };
 }
 

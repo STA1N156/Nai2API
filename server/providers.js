@@ -75,6 +75,10 @@ export async function generateNovelAiImage(request, account, env, options = {}) 
     return generateMockImage(request);
   }
 
+  if (shouldUseNovelAiStream(request, env)) {
+    return generateNovelAiImageStream(request, account, env, options);
+  }
+
   const baseUrl = (env.NOVELAI_API_URL || 'https://image.novelai.net').replace(/\/$/, '');
   const correlationId = novelAiCorrelationId();
   const response = await novelAiFetch(`${baseUrl}/ai/generate-image`, {
@@ -87,6 +91,7 @@ export async function generateNovelAiImage(request, account, env, options = {}) 
       origin: 'https://novelai.net',
       referer: 'https://novelai.net/',
       'x-correlation-id': correlationId,
+      'x-initiated-at': new Date().toISOString(),
       'user-agent': 'Mozilla/5.0 Nai2API/1.0'
     },
     body: JSON.stringify({
@@ -120,6 +125,61 @@ export async function generateNovelAiImage(request, account, env, options = {}) 
     mimeType: contentType.includes('jpeg') ? 'image/jpeg' : 'image/png',
     buffer
   };
+}
+
+async function generateNovelAiImageStream(request, account, env, options = {}) {
+  const baseUrl = (env.NOVELAI_API_URL || 'https://image.novelai.net').replace(/\/$/, '');
+  const correlationId = novelAiCorrelationId();
+  const parameters = buildNovelAiParameters(request);
+  parameters.stream = 'msgpack';
+
+  const response = await novelAiFetch(`${baseUrl}/ai/generate-image-stream`, {
+    method: 'POST',
+    signal: options.signal,
+    headers: {
+      authorization: `Bearer ${account.token}`,
+      'content-type': 'application/json',
+      accept: 'application/octet-stream,application/x-msgpack,application/json',
+      origin: 'https://novelai.net',
+      referer: 'https://novelai.net/',
+      'x-correlation-id': correlationId,
+      'x-initiated-at': new Date().toISOString(),
+      'user-agent': 'Mozilla/5.0 Nai2API/1.0'
+    },
+    body: JSON.stringify({
+      action: 'generate',
+      input: request.prompt,
+      model: request.model,
+      parameters,
+      use_new_shared_trial: true
+    })
+  }, accountProxyUrl(account));
+
+  const contentType = response.headers.get('content-type') || '';
+  if (!response.ok || contentType.includes('application/json')) {
+    const buffer = Buffer.from(await response.arrayBuffer());
+    if (!response.ok) {
+      const text = buffer.toString('utf8').slice(0, 1000);
+      throw new Error(`NovelAI returned ${response.status} (cid=${correlationId}): ${text}`);
+    }
+    const payload = JSON.parse(buffer.toString('utf8'));
+    const base64 = payload.image || payload.data || payload.images?.[0];
+    if (!base64) throw new Error('NovelAI JSON stream response does not contain image data.');
+    return decodeDataUrl(base64);
+  }
+
+  if (response.body) {
+    return extractFinalImageFromNovelAiReadableStream(response.body, {
+      request,
+      onProgress: options.onProgress
+    });
+  }
+
+  const buffer = Buffer.from(await response.arrayBuffer());
+  return extractFinalImageFromNovelAiStream(buffer, {
+    request,
+    onProgress: options.onProgress
+  });
 }
 
 export async function fetchNovelAiAccountQuota(token, env = {}, options = {}) {
@@ -547,7 +607,7 @@ function buildV4Parameters(request) {
     height: request.height,
     scale: request.scale,
     steps: request.steps,
-    uncond_scale: 0,
+    uncond_scale: 0.00001,
     cfg_rescale: request.cfg,
     seed: request.seed,
     n_samples: 1,
@@ -595,12 +655,18 @@ function buildV4Parameters(request) {
     minimize_sigma_inf: false,
     uncond_per_vibe: true,
     wonky_vibe_correlation: true,
+    image_format: 'png',
     version: 1
   };
 }
 
 function novelAiCorrelationId() {
   return Math.random().toString(36).slice(2, 8);
+}
+
+function shouldUseNovelAiStream(request, env = {}) {
+  if (String(env.NOVELAI_STREAM_IMAGE || '').toLowerCase() === 'false') return false;
+  return isV4Model(request.model);
 }
 
 function isV4Model(model) {
@@ -611,11 +677,269 @@ function normalizeV4Sampler(sampler) {
   const supported = new Set([
     'k_euler',
     'k_euler_ancestral',
+    'k_dpm_2',
+    'k_dpm_fast',
     'k_dpmpp_2m',
+    'k_dpmpp_2m_sde',
+    'k_dpmpp_3m_sde',
     'k_dpmpp_sde',
     'k_dpmpp_2s_ancestral'
   ]);
   return supported.has(sampler) ? sampler : 'k_euler_ancestral';
+}
+
+async function extractFinalImageFromNovelAiReadableStream(readable, context = {}) {
+  const reader = readable.getReader();
+  const state = createNovelAiStreamState(context);
+  let pending = Buffer.alloc(0);
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    if (!value?.length) continue;
+    pending = Buffer.concat([pending, Buffer.from(value)]);
+    let offset = 0;
+
+    while (offset + 4 <= pending.length) {
+      const length = pending.readUInt32BE(offset);
+      if (length <= 0) throw invalidNovelAiStreamFrameError(pending, offset);
+      if (offset + 4 + length > pending.length) break;
+      offset += 4;
+      handleNovelAiStreamEvent(decodeMsgpack(pending.slice(offset, offset + length)), state);
+      offset += length;
+    }
+
+    if (offset > 0) pending = pending.slice(offset);
+    if (pending.length > 64 * 1024 * 1024) throw invalidNovelAiStreamFrameError(pending, 0);
+  }
+
+  if (pending.length) throw invalidNovelAiStreamFrameError(pending, 0);
+  return finalNovelAiStreamImage(state);
+}
+
+function extractFinalImageFromNovelAiStream(buffer, context = {}) {
+  const state = createNovelAiStreamState(context);
+  let offset = 0;
+
+  while (offset + 4 <= buffer.length) {
+    const length = buffer.readUInt32BE(offset);
+    offset += 4;
+    if (length <= 0 || offset + length > buffer.length) {
+      throw invalidNovelAiStreamFrameError(buffer, offset - 4);
+    }
+
+    const event = decodeMsgpack(buffer.slice(offset, offset + length));
+    offset += length;
+    handleNovelAiStreamEvent(event, state);
+  }
+
+  return finalNovelAiStreamImage(state);
+}
+
+function createNovelAiStreamState(context = {}) {
+  return {
+    finalImage: null,
+    lastImage: null,
+    errors: [],
+    intermediateCount: 0,
+    lastPercent: 0,
+    request: context.request || {},
+    onProgress: typeof context.onProgress === 'function' ? context.onProgress : null
+  };
+}
+
+function handleNovelAiStreamEvent(event, state) {
+  const eventType = event?.event_type;
+
+  if (eventType === 'error') {
+    state.errors.push(String(event.message || 'unknown stream error'));
+    return;
+  }
+
+  if (eventType === 'intermediate') {
+    state.intermediateCount += 1;
+    if (event.image) state.lastImage = Buffer.from(event.image);
+    emitNovelAiStreamProgress(event, state, false);
+    return;
+  }
+
+  if (eventType === 'final') {
+    if (event.image) state.finalImage = Buffer.from(event.image);
+    emitNovelAiStreamProgress(event, state, true);
+  }
+}
+
+function emitNovelAiStreamProgress(event, state, isFinal) {
+  if (!state.onProgress) return;
+  const progress = normalizeNovelAiStreamProgress(event, state, isFinal);
+  if (!isFinal && progress.percent <= state.lastPercent) return;
+  state.lastPercent = progress.percent;
+  state.onProgress(progress);
+}
+
+function normalizeNovelAiStreamProgress(event, state, isFinal) {
+  const total = positiveNumber(
+    event?.total_steps,
+    event?.totalSteps,
+    event?.n_steps,
+    event?.steps,
+    state.request?.steps
+  ) || 0;
+  const explicitProgress = finiteNumber(
+    event?.progress,
+    event?.percentage,
+    event?.percent
+  );
+  const step = positiveNumber(
+    event?.step,
+    event?.step_index,
+    event?.current_step,
+    event?.currentStep,
+    event?.sampling_step,
+    event?.index,
+    state.intermediateCount
+  ) || 0;
+  let percent = 0;
+
+  if (isFinal) {
+    percent = 100;
+  } else if (explicitProgress !== null) {
+    percent = explicitProgress <= 1 ? explicitProgress * 100 : explicitProgress;
+  } else if (step && total) {
+    percent = (step / total) * 100;
+  }
+
+  percent = Math.max(state.lastPercent, Math.min(isFinal ? 100 : 98, Math.max(0, percent)));
+  return {
+    percent: Math.round(percent),
+    step: total ? Math.max(0, Math.min(total, Math.round(step))) : Math.round(step || 0),
+    total,
+    eventType: event?.event_type || '',
+    updatedAt: new Date().toISOString()
+  };
+}
+
+function finalNovelAiStreamImage(state) {
+  const image = state.finalImage || state.lastImage;
+  if (image) {
+    return {
+      mimeType: imageMimeType(image),
+      buffer: image
+    };
+  }
+
+  if (state.errors.length) throw new Error(`NovelAI stream error: ${state.errors.at(-1)}`);
+  throw new Error('NovelAI stream ended without a final image.');
+}
+
+function invalidNovelAiStreamFrameError(buffer, offset) {
+  const preview = buffer.slice(Math.max(0, offset), Math.min(buffer.length, offset + 80)).toString('latin1');
+  return new Error(`Invalid NovelAI msgpack stream frame: ${preview.replace(/[^\x20-\x7e]/g, '.')}`);
+}
+
+function finiteNumber(...values) {
+  for (const value of values) {
+    const number = Number(value);
+    if (Number.isFinite(number)) return number;
+  }
+  return null;
+}
+
+function positiveNumber(...values) {
+  for (const value of values) {
+    const number = Number(value);
+    if (Number.isFinite(number) && number > 0) return number;
+  }
+  return null;
+}
+
+function decodeMsgpack(buffer) {
+  const reader = {
+    offset: 0,
+    read(length) {
+      if (this.offset + length > buffer.length) throw new Error('Invalid NovelAI msgpack payload.');
+      const chunk = buffer.slice(this.offset, this.offset + length);
+      this.offset += length;
+      return chunk;
+    },
+    byte() {
+      return this.read(1)[0];
+    }
+  };
+
+  return readMsgpackValue(reader);
+}
+
+function readMsgpackValue(reader) {
+  const marker = reader.byte();
+
+  if (marker <= 0x7f) return marker;
+  if (marker >= 0xe0) return marker - 0x100;
+  if ((marker & 0xf0) === 0x80) return readMsgpackMap(reader, marker & 0x0f);
+  if ((marker & 0xf0) === 0x90) return readMsgpackArray(reader, marker & 0x0f);
+  if ((marker & 0xe0) === 0xa0) return reader.read(marker & 0x1f).toString('utf8');
+
+  switch (marker) {
+    case 0xc0: return null;
+    case 0xc2: return false;
+    case 0xc3: return true;
+    case 0xc4: return reader.read(reader.byte());
+    case 0xc5: return reader.read(reader.read(2).readUInt16BE(0));
+    case 0xc6: return reader.read(reader.read(4).readUInt32BE(0));
+    case 0xca: return reader.read(4).readFloatBE(0);
+    case 0xcb: return reader.read(8).readDoubleBE(0);
+    case 0xcc: return reader.byte();
+    case 0xcd: return reader.read(2).readUInt16BE(0);
+    case 0xce: return reader.read(4).readUInt32BE(0);
+    case 0xcf: return numberFromBigInt(reader.read(8).readBigUInt64BE(0));
+    case 0xd0: return reader.read(1).readInt8(0);
+    case 0xd1: return reader.read(2).readInt16BE(0);
+    case 0xd2: return reader.read(4).readInt32BE(0);
+    case 0xd3: return numberFromBigInt(reader.read(8).readBigInt64BE(0));
+    case 0xd9: return reader.read(reader.byte()).toString('utf8');
+    case 0xda: return reader.read(reader.read(2).readUInt16BE(0)).toString('utf8');
+    case 0xdb: return reader.read(reader.read(4).readUInt32BE(0)).toString('utf8');
+    case 0xdc: return readMsgpackArray(reader, reader.read(2).readUInt16BE(0));
+    case 0xdd: return readMsgpackArray(reader, reader.read(4).readUInt32BE(0));
+    case 0xde: return readMsgpackMap(reader, reader.read(2).readUInt16BE(0));
+    case 0xdf: return readMsgpackMap(reader, reader.read(4).readUInt32BE(0));
+    default:
+      throw new Error(`Unsupported NovelAI msgpack marker 0x${marker.toString(16)}.`);
+  }
+}
+
+function readMsgpackArray(reader, length) {
+  const value = [];
+  for (let index = 0; index < length; index += 1) {
+    value.push(readMsgpackValue(reader));
+  }
+  return value;
+}
+
+function readMsgpackMap(reader, length) {
+  const value = {};
+  for (let index = 0; index < length; index += 1) {
+    const key = readMsgpackValue(reader);
+    value[String(key)] = readMsgpackValue(reader);
+  }
+  return value;
+}
+
+function numberFromBigInt(value) {
+  if (value <= BigInt(Number.MAX_SAFE_INTEGER) && value >= BigInt(Number.MIN_SAFE_INTEGER)) {
+    return Number(value);
+  }
+  return value;
+}
+
+function imageMimeType(buffer) {
+  if (buffer.length >= 12 && buffer.slice(0, 4).toString('latin1') === 'RIFF' && buffer.slice(8, 12).toString('latin1') === 'WEBP') {
+    return 'image/webp';
+  }
+  if (buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) {
+    return 'image/jpeg';
+  }
+  return 'image/png';
 }
 
 export function generateMockImage(request, message = 'Mock NovelAI preview') {
