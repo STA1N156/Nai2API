@@ -24,6 +24,7 @@ const openAiChatTimeoutMs = Number(process.env.OPENAI_CHAT_TIMEOUT_MS || 10 * 60
 const openAiQueuePollMs = 650;
 const openAiFixedSteps = 28;
 const jobStreamProgress = new Map();
+const jobStreamProgressPersistState = new Map();
 const beijingOffsetMs = 8 * 60 * 60 * 1000;
 const usageChartDays = 7;
 const errorLogRetentionMs = usageChartDays * 24 * 60 * 60 * 1000;
@@ -2013,19 +2014,22 @@ function notifyJobWaiters(jobId, payload) {
 
 function resetJobStreamProgress(jobId, request = {}) {
   if (!jobId) return;
-  jobStreamProgress.set(jobId, {
+  const progress = {
     percent: 0,
     step: 0,
     total: Number(request?.steps || 0),
     updatedAt: new Date().toISOString()
-  });
+  };
+  jobStreamProgress.set(jobId, progress);
+  patchCachedJobStreamProgress(jobId, progress);
+  jobStreamProgressPersistState.set(jobId, { percent: 0, at: 0 });
 }
 
 function updateJobStreamProgress(jobId, progress = {}) {
   if (!jobId) return;
   const previous = jobStreamProgress.get(jobId) || {};
   const percent = clamp(Number(progress.percent ?? previous.percent ?? 0), 0, 100);
-  jobStreamProgress.set(jobId, {
+  const next = {
     percent: Math.max(Number(previous.percent || 0), percent),
     step: Number(progress.step ?? previous.step ?? 0) || 0,
     total: Number(progress.total ?? previous.total ?? 0) || 0,
@@ -2033,11 +2037,59 @@ function updateJobStreamProgress(jobId, progress = {}) {
     accountRouteId: Number(progress.accountRouteId || previous.accountRouteId || 0),
     eventType: progress.eventType || previous.eventType || '',
     updatedAt: progress.updatedAt || new Date().toISOString()
-  });
+  };
+  jobStreamProgress.set(jobId, next);
+  patchCachedJobStreamProgress(jobId, next);
+  if (shouldPersistJobStreamProgress(jobId, next)) {
+    persistJobStreamProgress(jobId, next).catch((error) => {
+      console.error('[runtime] failed to persist job stream progress:', error);
+    });
+  }
 }
 
 function clearJobStreamProgress(jobId) {
-  if (jobId) jobStreamProgress.delete(jobId);
+  if (!jobId) return;
+  jobStreamProgress.delete(jobId);
+  jobStreamProgressPersistState.delete(jobId);
+}
+
+function patchCachedJobStreamProgress(jobId, progress = {}) {
+  const job = store.db?.jobs?.find((item) => item.id === jobId);
+  if (!job) return;
+  job.generationProgress = publicProgressSnapshot(progress, job);
+}
+
+function shouldPersistJobStreamProgress(jobId, progress = {}) {
+  const now = Date.now();
+  const previous = jobStreamProgressPersistState.get(jobId) || { percent: 0, at: 0 };
+  const percent = Number(progress.percent || 0);
+  if (percent >= 100) return true;
+  if (percent - Number(previous.percent || 0) >= 8) return true;
+  return now - Number(previous.at || 0) >= 1500;
+}
+
+async function persistJobStreamProgress(jobId, progress = {}) {
+  const now = Date.now();
+  jobStreamProgressPersistState.set(jobId, { percent: Number(progress.percent || 0), at: now });
+  await store.update((db) => {
+    const job = db.jobs.find((item) => item.id === jobId);
+    if (!job || job.status !== 'running') return null;
+    job.generationProgress = publicProgressSnapshot(progress, job);
+    return job;
+  }, {
+    collections: ['jobs'],
+    dirtyRows: dirtyJobRows(jobId),
+    shouldPersist: (job) => Boolean(job)
+  });
+}
+
+function publicProgressSnapshot(progress = {}, job = {}) {
+  return {
+    percent: clamp(Number(progress.percent || 0), 0, 100),
+    step: Number(progress.step || 0),
+    total: Number(progress.total || job.request?.steps || 0),
+    updatedAt: progress.updatedAt || new Date().toISOString()
+  };
 }
 
 function isTimeoutResultMessage(message) {
@@ -2979,7 +3031,7 @@ function publicGenerationProgress(job = {}) {
       active: false
     };
   }
-  const progress = jobStreamProgress.get(job.id) || {};
+  const progress = jobStreamProgress.get(job.id) || job.generationProgress || {};
   return {
     percent: clamp(Number(progress.percent || 0), 0, 100),
     step: Number(progress.step || 0),
