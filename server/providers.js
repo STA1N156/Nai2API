@@ -21,12 +21,12 @@ export const sizeCostMap = {
   '竖图': 1,
   '横图': 1,
   '方图': 1,
-  '2K竖图': 20,
-  '2K横图': 20,
-  '2K方图': 20,
-  '4K竖图': 35,
-  '4K横图': 35,
-  '4K方图': 35
+  '2K竖图': 8,
+  '2K横图': 8,
+  '2K方图': 8,
+  '4K竖图': 15,
+  '4K横图': 15,
+  '4K方图': 15
 };
 
 export function normalizeNovelAiRequest(input, settings, options = {}) {
