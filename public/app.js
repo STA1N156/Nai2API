@@ -86,12 +86,12 @@ const sizeOptions = [
   { value: '竖图', label: '竖图(-1)', cost: 1 },
   { value: '横图', label: '横图(-1)', cost: 1 },
   { value: '方图', label: '方图(-1)', cost: 1 },
-  { value: '2K竖图', label: '2K竖图(-8)', cost: 8 },
-  { value: '2K横图', label: '2K横图(-8)', cost: 8 },
-  { value: '2K方图', label: '2K方图(-8)', cost: 8 },
-  { value: '4K竖图', label: '4K竖图(-15)', cost: 15 },
-  { value: '4K横图', label: '4K横图(-15)', cost: 15 },
-  { value: '4K方图', label: '4K方图(-15)', cost: 15 }
+  { value: '2K竖图', label: '2K竖图(-15)', cost: 15 },
+  { value: '2K横图', label: '2K横图(-15)', cost: 15 },
+  { value: '2K方图', label: '2K方图(-15)', cost: 15 },
+  { value: '4K竖图', label: '4K竖图(-25)', cost: 25 },
+  { value: '4K横图', label: '4K横图(-25)', cost: 25 },
+  { value: '4K方图', label: '4K方图(-25)', cost: 25 }
 ];
 
 const paramOrder = [

@@ -39,7 +39,7 @@ const openAiSamplers = [
 const openAiSizeTiers = {
   '2K': {
     label: '[2K]',
-    cost: 8,
+    cost: 15,
     sizes: {
       '竖图': { width: 1088, height: 1600 },
       '横图': { width: 1600, height: 1088 },
@@ -48,7 +48,7 @@ const openAiSizeTiers = {
   },
   '4K': {
     label: '[4K]',
-    cost: 15,
+    cost: 25,
     sizes: {
       '竖图': { width: 1344, height: 1984 },
       '横图': { width: 1984, height: 1344 },
@@ -1400,7 +1400,7 @@ function accountAvailability(account, settings = {}) {
   const enabled = account.enabled !== false;
   const hasSlot = inFlight < maxConcurrency;
   const standardAvailable = enabled && !coolingDown && hasSlot;
-  const highResolutionAvailable = standardAvailable && (quotaPoints === null || quotaPoints >= 8);
+  const highResolutionAvailable = standardAvailable && (quotaPoints === null || quotaPoints >= 15);
 
   return {
     enabled,
@@ -3388,8 +3388,8 @@ function accountGenerationCost(request = null) {
 function resolutionGenerationCost(request = null) {
   const width = Number(request?.width || 0);
   const height = Number(request?.height || 0);
-  if (width >= 1700 || height >= 1900) return 15;
-  if (width >= 1300 || height >= 1500) return 8;
+  if (width >= 1700 || height >= 1900) return 25;
+  if (width >= 1300 || height >= 1500) return 15;
   return 1;
 }
 
