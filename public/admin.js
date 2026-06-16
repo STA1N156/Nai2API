@@ -5,6 +5,8 @@ const state = {
   selectedUsers: new Set(),
   selectedAccounts: new Set(),
   testingAccounts: new Set(),
+  refreshingAccounts: new Set(),
+  refreshingQuotas: false,
   selectedUsageDate: '',
   chartScrollSyncing: false,
   chartDrag: null,
@@ -463,17 +465,53 @@ async function setSelectedAccountsEnabled(enabled) {
 }
 
 async function refreshSelectedAccountQuotas() {
+  if (state.refreshingQuotas) return;
+  const selectedIds = Array.from(state.selectedAccounts);
+  const allIds = (state.summary?.accounts || []).map((account) => account.id);
+  const ids = selectedIds.length ? selectedIds : allIds;
+  if (!ids.length) return showToast('暂无账号可刷新', true);
+  state.refreshingQuotas = true;
+  el.refreshAccountQuotaBtn.disabled = true;
   try {
-    const ids = Array.from(state.selectedAccounts);
-    const result = await api('/api/admin/accounts/quota', {
-      method: 'POST',
-      admin: true,
-      body: ids.length ? { ids } : {}
-    });
-    await reloadDashboard();
-    showToast(`点数和会员状态已刷新：成功 ${result.ok} 个，失败 ${result.failed} 个`);
+    let ok = 0;
+    let failed = 0;
+    for (let index = 0; index < ids.length; index += 1) {
+      const id = ids[index];
+      state.refreshingAccounts.add(id);
+      renderAccounts();
+      syncSelectionControls();
+      el.refreshAccountQuotaBtn.textContent = `刷新中 ${index + 1}/${ids.length}`;
+      showToast(`正在刷新点数和会员 ${index + 1}/${ids.length}`);
+      try {
+        const result = await api('/api/admin/accounts/quota', {
+          method: 'POST',
+          admin: true,
+          body: { ids: [id] },
+          timeoutMs: 12000
+        });
+        ok += Number(result.ok || 0);
+        failed += Number(result.failed || 0);
+        (result.accounts || []).forEach(replaceSummaryAccount);
+      } catch (error) {
+        failed += 1;
+        showToast(normalizeErrorMessage(error), true);
+      } finally {
+        state.refreshingAccounts.delete(id);
+        renderAccounts();
+        syncSelectionControls();
+        await sleep(0);
+      }
+    }
+    showToast(`点数和会员状态已刷新：成功 ${ok} 个，失败 ${failed} 个`);
   } catch (error) {
     showToast(normalizeErrorMessage(error), true);
+  } finally {
+    state.refreshingQuotas = false;
+    state.refreshingAccounts.clear();
+    el.refreshAccountQuotaBtn.disabled = false;
+    el.refreshAccountQuotaBtn.textContent = '刷新点数/会员';
+    renderAccounts();
+    syncSelectionControls();
   }
 }
 
@@ -1009,18 +1047,24 @@ function renderErrorLog(log) {
 }
 
 function renderJobs(jobs) {
-  const pageCount = Math.max(1, Math.ceil(jobs.length / jobPageSize));
+  const logJobs = requestLogJobs(jobs);
+  const pageCount = Math.max(1, Math.ceil(logJobs.length / jobPageSize));
+  if (state.jobPage > pageCount) state.jobPage = pageCount;
   const start = (state.jobPage - 1) * jobPageSize;
-  const pageJobs = jobs.slice(start, start + jobPageSize);
-  el.jobCountText.textContent = jobs.length
-    ? `${start + 1}-${start + pageJobs.length} / ${jobs.length} 条`
-    : '0 条';
+  const pageJobs = logJobs.slice(start, start + jobPageSize);
+  el.jobCountText.textContent = logJobs.length
+    ? `${start + 1}-${start + pageJobs.length} / ${logJobs.length} 条失败`
+    : '0 条失败';
   el.jobList.innerHTML = pageJobs.length
     ? pageJobs.map(renderJob).join('')
-    : '<div class="empty small">暂无任务</div>';
+    : '<div class="empty small">暂无失败请求</div>';
   el.jobPageText.textContent = `第 ${state.jobPage} / ${pageCount} 页`;
   el.jobPrevBtn.disabled = state.jobPage <= 1;
   el.jobNextBtn.disabled = state.jobPage >= pageCount;
+}
+
+function requestLogJobs(jobs = []) {
+  return (Array.isArray(jobs) ? jobs : []).filter((job) => job.status === 'failed');
 }
 
 function renderUsers(users) {
@@ -1064,10 +1108,10 @@ function renderAccounts(accounts = state.summary?.accounts || []) {
 }
 
 function changeJobPage(delta) {
-  const jobs = state.summary?.jobs || [];
+  const jobs = requestLogJobs(state.summary?.jobs || []);
   const pageCount = Math.max(1, Math.ceil(jobs.length / jobPageSize));
   state.jobPage = Math.max(1, Math.min(pageCount, state.jobPage + delta));
-  renderJobs(jobs);
+  renderJobs(state.summary?.jobs || []);
 }
 
 async function changeImagePage(delta) {
@@ -1081,6 +1125,7 @@ async function changeImagePage(delta) {
 function renderAccount(account) {
   const checked = state.selectedAccounts.has(account.id) ? 'checked' : '';
   const testing = state.testingAccounts.has(account.id);
+  const refreshing = state.refreshingAccounts.has(account.id);
   const status = account.enabled ? '已启用' : '已禁用';
   const statusClass = account.enabled ? 'ok' : 'muted';
   const stats1h = account.stats1h || { done: 0, failed: 0, total: 0, successRate: 0 };
@@ -1091,11 +1136,13 @@ function renderAccount(account) {
       ? '点数未查询'
       : `${formatNumber(account.quotaPoints)} 点`;
   const tierText = account.quotaError ? '会员查询失败' : accountTierText(account);
+  const tierClass = account.quotaError ? 'tier-error' : accountTierClass(account);
   return `<article class="data-row selectable account-row">
     <input class="row-check account-select" type="checkbox" value="${escapeHtml(account.id)}" ${checked} />
     <div class="row-main">
       <div class="row-heading">
         <span class="route-badge">#${escapeHtml(account.routeId || '-')}</span>
+        <span class="tier-badge ${tierClass}">${escapeHtml(tierText)}</span>
         <strong>${escapeHtml(account.name || 'NovelAI 账号')}</strong>
         <span class="status-badge ${statusClass}">${status}</span>
       </div>
@@ -1103,12 +1150,9 @@ function renderAccount(account) {
       <span class="token-text">${escapeHtml(proxyText)}</span>
     </div>
     <div class="row-stats">
-      <span><b>${account.inFlight}</b> 运行中</span>
       <span><b>${escapeHtml(quotaText)}</b></span>
-      <span><b>${escapeHtml(tierText)}</b></span>
       <span><b>${formatPercent(stats1h.successRate)}</b>% 1h成功率</span>
-      <span><b>${stats1h.total || 0}</b> 1h请求</span>
-      <button class="row-action account-test-btn" type="button" data-account-id="${escapeHtml(account.id)}" ${testing ? 'disabled' : ''}>${testing ? '测试中' : '测试'}</button>
+      <button class="row-action account-test-btn" type="button" data-account-id="${escapeHtml(account.id)}" ${testing || refreshing ? 'disabled' : ''}>${refreshing ? '刷新中' : testing ? '测试中' : '测试'}</button>
     </div>
   </article>`;
 }
@@ -1347,6 +1391,10 @@ function syncSelectionControls() {
   el.selectAllAccounts.checked = Boolean(visibleAccounts.length) && visibleAccounts.every((account) => state.selectedAccounts.has(account.id));
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function api(path, options = {}) {
   if (options.admin && !state.adminToken) {
     throw new Error('请先输入 Admin Token');
@@ -1473,6 +1521,32 @@ function accountTierText(account = {}) {
     scroll: 'Scroll 会员',
     opus: 'Opus 会员'
   }[key] || String(tier);
+}
+
+function accountTierClass(account = {}) {
+  if (account.quotaTierText) {
+    const text = String(account.quotaTierText).toLowerCase();
+    if (text.includes('opus')) return 'tier-opus';
+    if (text.includes('scroll')) return 'tier-scroll';
+    if (text.includes('tablet')) return 'tier-tablet';
+    if (text.includes('无订阅')) return 'tier-free';
+  }
+  const tier = account.quotaTier;
+  if (tier === null || tier === undefined || tier === '') return 'tier-unknown';
+  const value = Number(tier);
+  if (Number.isFinite(value)) {
+    if (value === 3) return 'tier-opus';
+    if (value === 2) return 'tier-scroll';
+    if (value === 1) return 'tier-tablet';
+    if (value === 0) return 'tier-free';
+    return 'tier-unknown';
+  }
+  const key = String(tier).trim().toLowerCase();
+  if (['opus'].includes(key)) return 'tier-opus';
+  if (['scroll'].includes(key)) return 'tier-scroll';
+  if (['tablet'].includes(key)) return 'tier-tablet';
+  if (['none', 'paper', 'free', 'unsubscribed'].includes(key)) return 'tier-free';
+  return 'tier-unknown';
 }
 
 function showToast(message, isError = false) {

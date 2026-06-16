@@ -514,7 +514,7 @@ export class JsonStore {
       cards: this.selectItems('cards'),
       users: this.selectItems('users'),
       accounts: this.selectItems('accounts'),
-      jobs: this.selectItems('jobs', 'ORDER BY order_value DESC LIMIT 50'),
+      jobs: this.selectItems('jobs', "WHERE status = 'failed' ORDER BY order_value DESC LIMIT 50"),
       ...this.readAdminSummaryStats(),
       statsRowsRead: 0,
       errorJobs: this.selectItems('jobs', `

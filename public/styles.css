@@ -1290,6 +1290,10 @@ textarea:focus {
   grid-template-columns: 18px minmax(0, 1fr) auto;
 }
 
+.account-row.selectable {
+  grid-template-columns: 18px minmax(280px, 1fr) auto;
+}
+
 .usage-chart {
   display: grid;
   gap: 12px;
@@ -1547,12 +1551,17 @@ textarea:focus {
   gap: 8px;
 }
 
+.account-row .row-heading {
+  flex-wrap: wrap;
+}
+
 .data-row strong {
   display: block;
   color: var(--ink);
   font-size: 13px;
   font-weight: 760;
-  word-break: break-all;
+  overflow-wrap: anywhere;
+  word-break: normal;
 }
 
 .route-badge {
@@ -1570,6 +1579,46 @@ textarea:focus {
   font-weight: 800;
   white-space: nowrap;
   word-break: normal !important;
+}
+
+.tier-badge {
+  min-height: 24px;
+  display: inline-flex !important;
+  align-items: center;
+  justify-content: center;
+  margin: 0 !important;
+  border-radius: 999px;
+  padding: 0 9px;
+  font-size: 11px !important;
+  font-weight: 800;
+  white-space: nowrap;
+  word-break: normal !important;
+}
+
+.tier-badge.tier-opus {
+  background: rgba(181, 112, 20, 0.14);
+  color: #8a4c0b !important;
+}
+
+.tier-badge.tier-scroll {
+  background: rgba(63, 79, 143, 0.13);
+  color: var(--indigo) !important;
+}
+
+.tier-badge.tier-tablet {
+  background: rgba(15, 118, 110, 0.12);
+  color: var(--teal-dark) !important;
+}
+
+.tier-badge.tier-free,
+.tier-badge.tier-unknown {
+  background: rgba(102, 112, 133, 0.13);
+  color: var(--muted) !important;
+}
+
+.tier-badge.tier-error {
+  background: rgba(179, 64, 64, 0.13);
+  color: var(--danger) !important;
 }
 
 .data-row span {
