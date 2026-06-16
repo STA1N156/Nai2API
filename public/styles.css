@@ -1555,6 +1555,23 @@ textarea:focus {
   word-break: break-all;
 }
 
+.route-badge {
+  min-height: 24px;
+  display: inline-flex !important;
+  align-items: center;
+  justify-content: center;
+  margin: 0 !important;
+  border: 1px solid rgba(63, 79, 143, 0.16);
+  border-radius: 999px;
+  padding: 0 8px;
+  background: rgba(63, 79, 143, 0.08);
+  color: var(--indigo) !important;
+  font-size: 11px !important;
+  font-weight: 800;
+  white-space: nowrap;
+  word-break: normal !important;
+}
+
 .data-row span {
   display: block;
   margin-top: 4px;

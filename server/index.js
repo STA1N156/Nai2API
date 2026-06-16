@@ -1354,6 +1354,7 @@ async function testAccount(id) {
 }
 
 function accountQuotaResult(id, quota, now) {
+  const noSubscription = isUnsubscribedAccountTier(quota.tier);
   return {
     id,
     ok: true,
@@ -1362,11 +1363,15 @@ function accountQuotaResult(id, quota, now) {
     quotaPurchased: quota.purchased,
     quotaTier: quota.tier,
     quotaCheckedAt: now,
-    quotaError: ''
+    quotaError: '',
+    disableAccount: noSubscription,
+    disableReason: noSubscription ? '无订阅' : ''
   };
 }
 
 function accountQuotaErrorResult(id, error, now) {
+  const message = error.message || 'quota query failed.';
+  const banned = isNovelAiAccountBannedError(message);
   return {
     id,
     ok: false,
@@ -1375,7 +1380,9 @@ function accountQuotaErrorResult(id, error, now) {
     quotaPurchased: null,
     quotaTier: null,
     quotaCheckedAt: now,
-    quotaError: publicErrorMessage(error.message || 'quota query failed.')
+    quotaError: publicErrorMessage(message),
+    disableAccount: banned,
+    disableReason: banned ? '账号已封禁' : ''
   };
 }
 
@@ -1387,6 +1394,7 @@ function applyAccountQuotaResult(account, result, now) {
   account.quotaCheckedAt = result.quotaCheckedAt;
   account.quotaError = result.quotaError;
   if (result.ok) account.cooldownUntil = '';
+  if (result.disableAccount) disableNovelAiAccount(account);
   account.updatedAt = now;
 }
 
@@ -1417,13 +1425,54 @@ function accountAvailability(account, settings = {}) {
 }
 
 function accountTestMessage(result, availability) {
+  if (result.disableAccount && !result.ok) return `测试失败：${result.disableReason || '账号不可用'}，已自动禁用`;
   if (!result.ok) return `测试失败：${result.quotaError || '账号不可用'}`;
-  if (!availability.enabled) return '测试通过：Token 有效，但这个账号已禁用';
-  if (availability.coolingDown) return '测试通过：Token 有效，但账号正在冷却中';
-  if (!availability.hasSlot) return '测试通过：Token 有效，但账号当前并发已满';
   const quotaText = availability.quotaPoints === null ? '点数未知' : `剩余 ${availability.quotaPoints} 点`;
-  if (!availability.highResolutionAvailable) return `测试通过：普通生成可用，2K/4K 点数不足（${quotaText}）`;
-  return `测试通过：账号当前可用（${quotaText}）`;
+  const accountText = `${quotaText}，${accountTierText(result.quotaTier, '会员未知')}`;
+  if (result.disableAccount) return `测试通过：${result.disableReason || '账号不可用'}，已自动禁用（${accountText}）`;
+  if (!availability.enabled) return `测试通过：Token 有效，但这个账号已禁用（${accountText}）`;
+  if (availability.coolingDown) return `测试通过：Token 有效，但账号正在冷却中（${accountText}）`;
+  if (!availability.hasSlot) return `测试通过：Token 有效，但账号当前并发已满（${accountText}）`;
+  if (!availability.highResolutionAvailable) return `测试通过：普通生成可用，2K/4K 点数不足（${accountText}）`;
+  return `测试通过：账号当前可用（${accountText}）`;
+}
+
+function accountTierText(tier, fallback = '会员未查询') {
+  if (tier === null || tier === undefined || tier === '') return fallback;
+  const value = Number(tier);
+  const tierNames = {
+    0: '无订阅',
+    1: 'Tablet 会员',
+    2: 'Scroll 会员',
+    3: 'Opus 会员'
+  };
+  if (Number.isFinite(value)) return tierNames[value] || `Tier ${value}`;
+  const key = String(tier).trim().toLowerCase();
+  return {
+    none: '无订阅',
+    paper: '无订阅',
+    tablet: 'Tablet 会员',
+    scroll: 'Scroll 会员',
+    opus: 'Opus 会员'
+  }[key] || String(tier);
+}
+
+function isUnsubscribedAccountTier(tier) {
+  if (tier === null || tier === undefined || tier === '') return false;
+  const value = Number(tier);
+  if (Number.isFinite(value)) return value === 0;
+  return ['none', 'paper', 'free', 'unsubscribed'].includes(String(tier).trim().toLowerCase());
+}
+
+function isNovelAiAccountBannedError(error) {
+  const text = String(error?.message || error || '');
+  return /ban(?:ned)?|封禁/i.test(text);
+}
+
+function disableNovelAiAccount(account) {
+  account.enabled = false;
+  account.inFlight = 0;
+  account.cooldownUntil = '';
 }
 
 async function fetchNovelAiAccountQuotaWithTimeout(token, proxyUrl = '') {
@@ -2300,15 +2349,21 @@ async function retryReservationWithNextAccount(reservation, error, tried, option
   return store.update((db) => {
     const failedAccount = db.accounts.find((item) => item.id === reservation.account.id);
     if (failedAccount) {
+      const now = new Date().toISOString();
       failedAccount.inFlight = Math.max(0, Number(failedAccount.inFlight || 0) - 1);
       failedAccount.failures = Number(failedAccount.failures || 0) + 1;
       if (isNovelAiCapacityError(error)) failedAccount.cooldownUntil = new Date(Date.now() + accountBusyCooldownMs()).toISOString();
+      if (isNovelAiAccountBannedError(error)) {
+        disableNovelAiAccount(failedAccount);
+        failedAccount.quotaError = '账号已封禁，已自动禁用';
+        failedAccount.quotaCheckedAt = now;
+      }
       if (isNovelAiAccountQuotaError(error)) {
         failedAccount.quotaPoints = 0;
         failedAccount.quotaError = '点数不足';
-        failedAccount.quotaCheckedAt = new Date().toISOString();
+        failedAccount.quotaCheckedAt = now;
       }
-      failedAccount.updatedAt = new Date().toISOString();
+      failedAccount.updatedAt = now;
     }
 
     if (options.deadline && Date.now() >= options.deadline) return null;
@@ -2887,6 +2942,7 @@ function publicAccount(account, options = {}) {
     quotaFixed: account.quotaFixed ?? null,
     quotaPurchased: account.quotaPurchased ?? null,
     quotaTier: account.quotaTier ?? null,
+    quotaTierText: accountTierText(account.quotaTier),
     quotaCheckedAt: account.quotaCheckedAt || '',
     quotaError: account.quotaError || '',
     cooldownUntil: account.cooldownUntil || '',
@@ -3453,6 +3509,7 @@ function isQuotaFailureJob(job) {
 
 function publicErrorMessage(message) {
   const text = String(message || '');
+  if (isNovelAiAccountBannedError(text)) return '账号已封禁，已自动禁用';
   if (isInsufficientBalanceError({ message: text })) return insufficientBalanceMessage;
   if (/This operation was aborted|operation was aborted|direct generate timeout|AbortError/i.test(text)) return '连接超时';
   if (/invalid token/i.test(text)) return '密钥无效或已被禁用。';

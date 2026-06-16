@@ -471,7 +471,7 @@ async function refreshSelectedAccountQuotas() {
       body: ids.length ? { ids } : {}
     });
     await reloadDashboard();
-    showToast(`点数已刷新：成功 ${result.ok} 个，失败 ${result.failed} 个`);
+    showToast(`点数和会员状态已刷新：成功 ${result.ok} 个，失败 ${result.failed} 个`);
   } catch (error) {
     showToast(normalizeErrorMessage(error), true);
   }
@@ -1083,7 +1083,6 @@ function renderAccount(account) {
   const testing = state.testingAccounts.has(account.id);
   const status = account.enabled ? '已启用' : '已禁用';
   const statusClass = account.enabled ? 'ok' : 'muted';
-  const lastUsed = account.lastUsedAt ? `最近使用 ${formatDate(account.lastUsedAt)}` : '尚未使用';
   const stats1h = account.stats1h || { done: 0, failed: 0, total: 0, successRate: 0 };
   const proxyText = account.proxyUrl ? `SOCKS5 ${account.proxyUrl}` : 'SOCKS5 -';
   const quotaText = account.quotaError
@@ -1091,20 +1090,22 @@ function renderAccount(account) {
     : account.quotaPoints === null || account.quotaPoints === undefined
       ? '点数未查询'
       : `${formatNumber(account.quotaPoints)} 点`;
+  const tierText = account.quotaError ? '会员查询失败' : accountTierText(account);
   return `<article class="data-row selectable account-row">
     <input class="row-check account-select" type="checkbox" value="${escapeHtml(account.id)}" ${checked} />
     <div class="row-main">
       <div class="row-heading">
-        <strong>#${account.routeId || '-'} ${escapeHtml(account.name || 'NovelAI 账号')}</strong>
+        <span class="route-badge">#${escapeHtml(account.routeId || '-')}</span>
+        <strong>${escapeHtml(account.name || 'NovelAI 账号')}</strong>
         <span class="status-badge ${statusClass}">${status}</span>
       </div>
       <span class="token-text">${escapeHtml(account.token)}</span>
       <span class="token-text">${escapeHtml(proxyText)}</span>
-      <span>${lastUsed}</span>
     </div>
     <div class="row-stats">
       <span><b>${account.inFlight}</b> 运行中</span>
       <span><b>${escapeHtml(quotaText)}</b></span>
+      <span><b>${escapeHtml(tierText)}</b></span>
       <span><b>${formatPercent(stats1h.successRate)}</b>% 1h成功率</span>
       <span><b>${stats1h.total || 0}</b> 1h请求</span>
       <button class="row-action account-test-btn" type="button" data-account-id="${escapeHtml(account.id)}" ${testing ? 'disabled' : ''}>${testing ? '测试中' : '测试'}</button>
@@ -1450,6 +1451,28 @@ function formatNumber(value) {
   const number = Number(value);
   if (!Number.isFinite(number)) return '-';
   return number.toLocaleString('zh-CN', { maximumFractionDigits: 0 });
+}
+
+function accountTierText(account = {}) {
+  if (account.quotaTierText) return account.quotaTierText;
+  const tier = account.quotaTier;
+  if (tier === null || tier === undefined || tier === '') return '会员未查询';
+  const value = Number(tier);
+  const tierNames = {
+    0: '无订阅',
+    1: 'Tablet 会员',
+    2: 'Scroll 会员',
+    3: 'Opus 会员'
+  };
+  if (Number.isFinite(value)) return tierNames[value] || `Tier ${value}`;
+  const key = String(tier).trim().toLowerCase();
+  return {
+    none: '无订阅',
+    paper: '无订阅',
+    tablet: 'Tablet 会员',
+    scroll: 'Scroll 会员',
+    opus: 'Opus 会员'
+  }[key] || String(tier);
 }
 
 function showToast(message, isError = false) {
