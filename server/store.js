@@ -1230,24 +1230,26 @@ export class JsonStore {
 
   trimRuntimePartialCaches() {
     if (!this.db) return;
-    if (this.partialCollections.has('images')) {
-      this.trimRuntimeCollection('images', runtimeCacheLimit('images'));
+    if (this.trimRuntimeCollection('images', runtimeCacheLimit('images'))) {
+      this.partialCollections.add('images');
     }
-    if (this.partialCollections.has('ledger')) {
-      this.trimRuntimeCollection('ledger', runtimeCacheLimit('ledger'));
+    if (this.trimRuntimeCollection('ledger', runtimeCacheLimit('ledger'))) {
+      this.partialCollections.add('ledger');
     }
-    if (this.partialCollections.has('jobs')) {
-      const limit = runtimeCacheLimit('jobs');
-      const retained = [];
-      const removed = [];
-      for (const [index, job] of (this.db.jobs || []).entries()) {
-        if (index < limit || ['queued', 'running'].includes(job.status)) {
-          retained.push(job);
-        } else {
-          removed.push(job);
-        }
+
+    const limit = runtimeCacheLimit('jobs');
+    const retained = [];
+    const removed = [];
+    for (const [index, job] of (this.db.jobs || []).entries()) {
+      if (index < limit || ['queued', 'running'].includes(job.status)) {
+        retained.push(job);
+      } else {
+        removed.push(job);
       }
+    }
+    if (removed.length) {
       this.db.jobs = retained;
+      this.partialCollections.add('jobs');
       for (const job of removed) {
         if (!job?.id) continue;
         this.rowState.jobs?.delete(job.id);
@@ -1258,7 +1260,7 @@ export class JsonStore {
 
   trimRuntimeCollection(collection, limit) {
     const items = Array.isArray(this.db?.[collection]) ? this.db[collection] : [];
-    if (items.length <= limit) return;
+    if (items.length <= limit) return 0;
     const removed = items.slice(limit);
     this.db[collection] = items.slice(0, limit);
     for (const item of removed) {
@@ -1266,6 +1268,7 @@ export class JsonStore {
       this.rowState[collection]?.delete(item.id);
       this.orderKeys[collection]?.delete(item.id);
     }
+    return removed.length;
   }
 
   refreshPartialCollectionState(collection) {
