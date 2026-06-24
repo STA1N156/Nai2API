@@ -13,3 +13,8 @@ test('direct cached image hits stream files instead of buffering them', () => {
   assert.match(source, /await sendStoredImage\(res, 200, cached,/);
   assert.doesNotMatch(source, /cachedBuffer\s*=\s*await readStoredImage\(cached\)/);
 });
+
+test('direct newly generated image misses stream the stored file response', () => {
+  assert.match(source, /await sendStoredImage\(res, 200, result\.saved,/);
+  assert.doesNotMatch(source, /image\.buffer\s*\|\|\s*image/);
+});
