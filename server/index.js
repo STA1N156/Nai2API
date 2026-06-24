@@ -1,5 +1,6 @@
 import http from 'node:http';
-import { mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { createReadStream } from 'node:fs';
+import { mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { JsonStore, MAX_CACHE_IMAGES_LIMIT, createId, createPublicToken, defaultArtist2_5D, hashObject, legacyDefaultArtist, maskToken, normalizeDb } from './store.js';
@@ -519,7 +520,7 @@ async function route(req, res) {
     const id = decodeURIComponent(url.pathname.split('/').at(-2) || '');
     const image = await store.findImage(id);
     if (!image) throw httpError(404, 'image not found.');
-    sendImage(res, 200, image.mimeType, await readStoredImage(image));
+    await sendStoredImage(res, 200, image);
     return;
   }
 
@@ -548,14 +549,13 @@ async function handleDirectGenerate(url, res) {
     const cached = await store.findImageByCacheKey(cacheKey);
     if (cached) {
       try {
-        const cachedBuffer = await readStoredImage(cached);
         await createDirectJob(token, request, cacheKey, {
           status: 'done',
           accountId: cached.accountId || '',
           imageId: cached.id,
           cost: 0
         });
-        sendImage(res, 200, cached.mimeType, cachedBuffer, {
+        await sendStoredImage(res, 200, cached, {
           'x-cache': 'hit',
           'x-balance': String(getUserOrThrow(db, token).balance)
         });
@@ -3705,6 +3705,58 @@ function sendImage(res, statusCode, mimeType, buffer, extraHeaders = {}) {
     ...extraHeaders
   });
   res.end(buffer);
+}
+
+async function sendStoredImage(res, statusCode, image, extraHeaders = {}) {
+  if (!image?.file) {
+    sendImage(res, statusCode, image?.mimeType || 'image/png', await readStoredImage(image), extraHeaders);
+    return;
+  }
+
+  const filePath = imageFilePath(image.file);
+  const fileStat = await stat(filePath);
+  res.writeHead(statusCode, {
+    'content-type': image.mimeType || 'image/png',
+    'cache-control': 'public, max-age=31536000, immutable',
+    'content-length': fileStat.size,
+    ...corsHeaders(),
+    ...extraHeaders
+  });
+
+  await new Promise((resolve, reject) => {
+    const stream = createReadStream(filePath);
+    const cleanup = () => {
+      stream.off('error', onStreamError);
+      res.off('error', onResponseError);
+      res.off('finish', onFinish);
+      res.off('close', onClose);
+    };
+    const finish = () => {
+      cleanup();
+      resolve();
+    };
+    const onStreamError = (error) => {
+      cleanup();
+      if (!res.destroyed) res.destroy(error);
+      resolve();
+    };
+    const onResponseError = (error) => {
+      cleanup();
+      stream.destroy();
+      reject(error);
+    };
+    const onFinish = () => finish();
+    const onClose = () => {
+      cleanup();
+      stream.destroy();
+      resolve();
+    };
+    stream.once('error', onStreamError);
+    res.once('error', onResponseError);
+    res.once('finish', onFinish);
+    res.once('close', onClose);
+    stream.pipe(res);
+  });
 }
 
 function sendBusyImage(res) {
