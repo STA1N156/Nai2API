@@ -2244,7 +2244,7 @@ async function runReservedJob(reservation) {
 }
 
 function shouldUseJobStreamProgress(job = {}) {
-  return (job.source || 'web') === 'web';
+  return ['web', 'direct', 'openai'].includes(job.source || 'web');
 }
 
 function createRunningJobControl(job = {}) {

@@ -18,3 +18,11 @@ test('direct newly generated image misses stream the stored file response', () =
   assert.match(source, /await sendStoredImage\(res, 200, result\.saved,/);
   assert.doesNotMatch(source, /image\.buffer\s*\|\|\s*image/);
 });
+
+test('direct and OpenAI jobs force NovelAI stream generation like the frontend', () => {
+  const match = source.match(/function shouldUseJobStreamProgress\(job = \{\}\) \{(?<body>[\s\S]*?)\n\}/);
+  assert.ok(match?.groups?.body);
+  assert.match(match.groups.body, /direct/);
+  assert.match(match.groups.body, /openai/);
+  assert.doesNotMatch(match.groups.body, /===\s*'web'/);
+});
