@@ -403,7 +403,6 @@ function writeAndReadHttpResponse(socket, request, signal) {
     let chunkedDecoder = null;
     let contentLength = 0;
     let receivedBodyBytes = 0;
-    const bodyChunks = [];
     const abort = () => rejectAndClose(abortError(signal?.reason));
     const cleanup = () => {
       signal?.removeEventListener('abort', abort);
@@ -440,8 +439,7 @@ function writeAndReadHttpResponse(socket, request, signal) {
     const enqueueBody = (chunk) => {
       if (!chunk?.length || bodyClosed) return;
       const copy = Buffer.from(chunk);
-      bodyChunks.push(copy);
-      bodyController?.enqueue(new Uint8Array(copy));
+      bodyController?.enqueue(copy);
     };
     const rejectAndClose = (error) => {
       cleanup();
@@ -455,7 +453,7 @@ function writeAndReadHttpResponse(socket, request, signal) {
           headerBuffer = Buffer.concat([headerBuffer, chunk]);
           const headerEnd = headerBuffer.indexOf('\r\n\r\n');
           if (headerEnd < 0) return;
-          const response = openHttpResponseFromHeader(headerBuffer.slice(0, headerEnd), body, bodyChunks);
+          const response = openHttpResponseFromHeader(headerBuffer.slice(0, headerEnd), body);
           contentLength = Number(response.headers.get('content-length') || 0);
           if (/chunked/i.test(response.headers.get('transfer-encoding') || '')) {
             chunkedDecoder = createChunkedBodyDecoder(enqueueBody, closeBody);
@@ -518,7 +516,7 @@ function writeAndReadHttpResponse(socket, request, signal) {
   });
 }
 
-function openHttpResponseFromHeader(headerBuffer, body, bodyChunks) {
+function openHttpResponseFromHeader(headerBuffer, body) {
   const headerText = headerBuffer.toString('latin1');
   const [statusLine, ...headerLines] = headerText.split('\r\n');
   const status = Number(statusLine.match(/^HTTP\/\d(?:\.\d)?\s+(\d+)/)?.[1] || 0);
@@ -532,6 +530,13 @@ function openHttpResponseFromHeader(headerBuffer, body, bodyChunks) {
     headers.set(key, headers.has(key) ? `${headers.get(key)}, ${value}` : value);
   });
 
+  let bodyUsed = false;
+  const consumeBody = async () => {
+    if (bodyUsed || body.locked) throw new Error('NovelAI response body has already been consumed.');
+    bodyUsed = true;
+    return collectReadableStream(body);
+  };
+
   return {
     ok: status >= 200 && status < 300,
     status,
@@ -541,13 +546,14 @@ function openHttpResponseFromHeader(headerBuffer, body, bodyChunks) {
       }
     },
     body,
+    get bodyUsed() {
+      return bodyUsed || body.locked;
+    },
     async arrayBuffer() {
-      await drainReadableStream(body);
-      return Buffer.concat(bodyChunks);
+      return consumeBody();
     },
     async text() {
-      await drainReadableStream(body);
-      return Buffer.concat(bodyChunks).toString('utf8');
+      return (await consumeBody()).toString('utf8');
     }
   };
 }
@@ -584,11 +590,16 @@ function createChunkedBodyDecoder(enqueue, close) {
   };
 }
 
-async function drainReadableStream(body) {
+async function collectReadableStream(body) {
   const reader = body.getReader();
+  const chunks = [];
+  let totalBytes = 0;
   while (true) {
-    const { done } = await reader.read();
-    if (done) return;
+    const { done, value } = await reader.read();
+    if (done) return Buffer.concat(chunks, totalBytes);
+    const chunk = Buffer.from(value);
+    chunks.push(chunk);
+    totalBytes += chunk.length;
   }
 }
 
@@ -632,6 +643,10 @@ function parseHttpResponse(buffer) {
     }
   };
 }
+
+export const __providerInternals = {
+  openHttpResponseFromHeader
+};
 
 function decodeChunkedBody(buffer) {
   const chunks = [];
