@@ -176,6 +176,11 @@ async function route(req, res) {
     return;
   }
 
+  if (method === 'GET' && url.pathname === '/memory') {
+    sendJson(res, 200, await memoryDiagnostics());
+    return;
+  }
+
   if (method === 'PUT' && url.pathname === '/api/settings') {
     assertAdmin(req, url);
     const body = await readJson(req);
@@ -3855,6 +3860,91 @@ function numberOrNull(value) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function memoryDiagnostics() {
+  return {
+    process: process.memoryUsage(),
+    cgroup: await readCgroupMemory(),
+    runtime: {
+      jobWaiters: countJobWaiters(),
+      jobWaiterJobs: jobWaiters.size,
+      runningJobControls: runningJobControls.size,
+      jobStreamProgress: jobStreamProgress.size,
+      jobStreamProgressPersistState: jobStreamProgressPersistState.size,
+      queueDrainTimer: Boolean(queueDrainTimer),
+      queueDraining,
+      queueDrainRequested
+    },
+    store: {
+      runtimeJobs: store.db?.jobs?.length ?? 0,
+      runtimeImages: store.db?.images?.length ?? 0,
+      runtimeLedger: store.db?.ledger?.length ?? 0,
+      jobRecords: safeCountRecords('jobs'),
+      imageRecords: safeCountRecords('images'),
+      ledgerRecords: safeCountRecords('ledger'),
+      partialCollections: [...(store.partialCollections || [])]
+    }
+  };
+}
+
+function countJobWaiters() {
+  let count = 0;
+  for (const waiters of jobWaiters.values()) count += waiters?.size || 0;
+  return count;
+}
+
+function safeCountRecords(collection) {
+  try {
+    return store.countRecords(collection);
+  } catch {
+    return null;
+  }
+}
+
+async function readCgroupMemory() {
+  const current = parseMemoryNumber(await readTextFileOrNull('/sys/fs/cgroup/memory.current'))
+    ?? parseMemoryNumber(await readTextFileOrNull('/sys/fs/cgroup/memory/memory.usage_in_bytes'));
+  const max = parseMemoryNumber(await readTextFileOrNull('/sys/fs/cgroup/memory.max'))
+    ?? parseMemoryNumber(await readTextFileOrNull('/sys/fs/cgroup/memory/memory.limit_in_bytes'));
+  const statText = await readTextFileOrNull('/sys/fs/cgroup/memory.stat')
+    ?? await readTextFileOrNull('/sys/fs/cgroup/memory/memory.stat');
+  const statValues = parseMemoryStat(statText);
+  return {
+    current,
+    max,
+    anon: statValues.anon ?? statValues.rss ?? null,
+    file: statValues.file ?? statValues.cache ?? null,
+    inactiveFile: statValues.inactive_file ?? null,
+    activeFile: statValues.active_file ?? null,
+    stat: statValues
+  };
+}
+
+async function readTextFileOrNull(filePath) {
+  try {
+    return await readFile(filePath, 'utf8');
+  } catch {
+    return null;
+  }
+}
+
+function parseMemoryNumber(text) {
+  const value = String(text || '').trim();
+  if (!value || value === 'max') return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function parseMemoryStat(text) {
+  const values = {};
+  String(text || '').split(/\r?\n/).forEach((line) => {
+    const [key, value] = line.trim().split(/\s+/);
+    if (!key) return;
+    const number = Number(value);
+    if (Number.isFinite(number)) values[key] = number;
+  });
+  return values;
 }
 
 function runtimeSlowLog(label, startedAt, detail = '', thresholdMs = 500) {
