@@ -583,8 +583,7 @@ async function handleDirectGenerate(url, res) {
       return;
     }
     if (result.error) throw new Error(result.error);
-    const image = result.image || await readStoredImage(result.saved);
-    sendImage(res, 200, result.saved.mimeType, image.buffer || image, {
+    await sendStoredImage(res, 200, result.saved, {
       'x-cache': 'miss',
       'x-balance': String(result.balance ?? '')
     });
