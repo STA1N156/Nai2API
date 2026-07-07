@@ -43,6 +43,7 @@ Nai2API 是一个 Docker-ready 的 NovelAI 图片生成网关。它把 NovelAI �
 | `ADMIN_TOKEN` | `123456` | 管理后台密码。正式部署必须改成强密码。 |
 | `DATA_DIR` | `/data` | 数据存储目录。Docker/Zeabur 持久化时挂载这个目录。 |
 | `NOVELAI_API_URL` | `https://image.novelai.net` | NovelAI 图片接口地址，通常不用改。 |
+| `NOVELAI_ACCOUNT_API_URL` | `https://image.novelai.net` | NovelAI account quota API URL, normally keep default. |
 | `MOCK_WHEN_NO_ACCOUNT` | `true` | 没有账号时是否返回 mock 预览图。生产环境建议 `false`。 |
 | `DIRECT_GENERATE_TIMEOUT_MS` | `60000` | `/generate` 图片 URL 请求最长等待时间，默认 60 秒。 |
 | `OPENAI_CHAT_TIMEOUT_MS` | `600000` | OpenAI Chat Completions 兼容接口最长等待时间，默认 10 分钟。 |
@@ -356,6 +357,7 @@ ADMIN_TOKEN=换成强密码
 DATA_DIR=/data
 HOST=0.0.0.0
 NOVELAI_API_URL=https://image.novelai.net
+NOVELAI_ACCOUNT_API_URL=https://image.novelai.net
 MOCK_WHEN_NO_ACCOUNT=false
 DIRECT_GENERATE_TIMEOUT_MS=60000
 ```

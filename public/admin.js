@@ -117,6 +117,7 @@ const ids = [
   'toast'
 ];
 const el = Object.fromEntries(ids.map((id) => [id, document.querySelector(`#${id}`)]));
+const enterAdminButtonText = el.enterAdminBtn.textContent;
 
 enhanceSelects();
 bindEvents();
@@ -206,22 +207,42 @@ function bindEvents() {
 }
 
 async function enterAdmin(options = {}) {
+  if (state.loggingIn) return;
+  state.loggingIn = true;
+  setLoginBusy(true);
   try {
     state.adminToken = el.adminToken.value.trim();
     if (!state.adminToken) return showToast('请输入 Admin Token', true);
-    const summary = await loadSummary();
+    await api('/api/admin/ping', { admin: true, timeoutMs: 8000 });
     localStorage.setItem('nai.adminToken', state.adminToken);
     setAuthenticated(true);
-    renderSummary(summary, { renderImages: false });
-    await refreshImages(false);
-    if (!options.silent) showToast('已进入后台');
+    el.adminState.textContent = '正在加载后台数据';
+    if (!options.silent) showToast('正在加载后台数据...');
+    try {
+      await reloadDashboard();
+      await refreshImages(false);
+      el.adminState.textContent = '监控在线';
+      if (!options.silent) showToast('已进入后台');
+    } catch (error) {
+      el.adminState.textContent = '数据加载失败';
+      showToast(normalizeErrorMessage(error), true);
+    }
   } catch (error) {
     localStorage.removeItem('nai.adminToken');
     state.adminToken = '';
     el.adminToken.value = '';
     setAuthenticated(false);
     if (!options.silent) showToast(normalizeErrorMessage(error), true);
+  } finally {
+    state.loggingIn = false;
+    setLoginBusy(false);
   }
+}
+
+function setLoginBusy(isBusy) {
+  el.enterAdminBtn.disabled = isBusy;
+  el.enterAdminBtn.textContent = isBusy ? '进入中...' : enterAdminButtonText;
+  if (isBusy) el.adminState.textContent = '正在验证';
 }
 
 async function refreshAdmin() {
@@ -475,13 +496,21 @@ async function refreshSelectedAccountQuotas() {
   try {
     let ok = 0;
     let failed = 0;
-    for (let index = 0; index < ids.length; index += 1) {
-      const id = ids[index];
+    let active = 0;
+    let completed = 0;
+    const total = ids.length;
+    const concurrency = Math.min(5, total);
+    const updateProgress = () => {
+      el.refreshAccountQuotaBtn.textContent = `刷新中 ${completed}/${total}，进行中 ${active}，并发 ${concurrency}`;
+    };
+    updateProgress();
+    showToast(`正在并发刷新点数和会员，每次 ${concurrency} 个账号`);
+    await mapLimit(ids, 5, async (id) => {
+      active += 1;
       state.refreshingAccounts.add(id);
+      updateProgress();
       renderAccounts();
       syncSelectionControls();
-      el.refreshAccountQuotaBtn.textContent = `刷新中 ${index + 1}/${ids.length}`;
-      showToast(`正在刷新点数和会员 ${index + 1}/${ids.length}`);
       try {
         const result = await api('/api/admin/accounts/quota', {
           method: 'POST',
@@ -496,12 +525,14 @@ async function refreshSelectedAccountQuotas() {
         failed += 1;
         showToast(normalizeErrorMessage(error), true);
       } finally {
+        active -= 1;
+        completed += 1;
         state.refreshingAccounts.delete(id);
+        updateProgress();
         renderAccounts();
         syncSelectionControls();
-        await sleep(0);
       }
-    }
+    });
     showToast(`点数和会员状态已刷新：成功 ${ok} 个，失败 ${failed} 个`);
   } catch (error) {
     showToast(normalizeErrorMessage(error), true);
@@ -1102,9 +1133,31 @@ function renderImages(data) {
 }
 
 function renderAccounts(accounts = state.summary?.accounts || []) {
-  el.accountList.innerHTML = accounts.length
-    ? accounts.map(renderAccount).join('')
+  const sortedAccounts = sortAccountsByRouteDesc(accounts);
+  el.accountList.innerHTML = sortedAccounts.length
+    ? sortedAccounts.map(renderAccount).join('')
     : '<div class="empty small">暂无账号</div>';
+}
+
+function sortAccountsByRouteDesc(accounts = []) {
+  return accounts.slice().sort((a, b) => accountRouteNumber(b) - accountRouteNumber(a));
+}
+
+function accountRouteNumber(account) {
+  const value = Number(account?.routeId || 0);
+  return Number.isFinite(value) ? value : 0;
+}
+
+async function mapLimit(items, limit, mapper) {
+  let next = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length) {
+      const index = next;
+      next += 1;
+      await mapper(items[index], index);
+    }
+  });
+  await Promise.all(workers);
 }
 
 function changeJobPage(delta) {
@@ -1389,10 +1442,6 @@ function syncSelectionControls() {
   const visibleAccounts = state.summary?.accounts || [];
   el.selectAllUsers.checked = Boolean(shownUsers.length) && shownUsers.every((user) => state.selectedUsers.has(user.id));
   el.selectAllAccounts.checked = Boolean(visibleAccounts.length) && visibleAccounts.every((account) => state.selectedAccounts.has(account.id));
-}
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function api(path, options = {}) {

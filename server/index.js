@@ -310,6 +310,12 @@ async function route(req, res) {
     return;
   }
 
+  if (method === 'GET' && url.pathname === '/api/admin/ping') {
+    assertAdmin(req, url);
+    sendJson(res, 200, { ok: true });
+    return;
+  }
+
   if (method === 'DELETE' && url.pathname === '/api/admin/logs') {
     assertAdmin(req, url);
     const result = await clearRequestLogs();
@@ -1295,15 +1301,14 @@ async function refreshAccountQuotas(body) {
   if (!targets.length) throw httpError(ids.size ? 404 : 400, ids.size ? 'no matching accounts found.' : 'no accounts found.');
 
   const now = new Date().toISOString();
-  const results = [];
-  for (const target of targets) {
+  const results = await mapLimit(targets, 5, async (target) => {
     try {
       const quota = await fetchNovelAiAccountQuotaWithTimeout(target.token, target.proxyUrl);
-      results.push(accountQuotaResult(target.id, quota, now));
+      return accountQuotaResult(target.id, quota, now);
     } catch (error) {
-      results.push(accountQuotaErrorResult(target.id, error, now));
+      return accountQuotaErrorResult(target.id, error, now);
     }
-  }
+  });
 
   const resultMap = new Map(results.map((result) => [result.id, result]));
   const accounts = await store.update((db) => {
@@ -1376,6 +1381,7 @@ function accountQuotaResult(id, quota, now) {
 function accountQuotaErrorResult(id, error, now) {
   const message = error.message || 'quota query failed.';
   const banned = isNovelAiAccountBannedError(message);
+  const outOfTrial = isNovelAiOutOfTrialImageGenerationError(message);
   return {
     id,
     ok: false,
@@ -1385,8 +1391,8 @@ function accountQuotaErrorResult(id, error, now) {
     quotaTier: null,
     quotaCheckedAt: now,
     quotaError: publicErrorMessage(message),
-    disableAccount: banned,
-    disableReason: banned ? '账号已封禁' : ''
+    disableAccount: banned || outOfTrial,
+    disableReason: banned ? '账号已封禁' : outOfTrial ? '试用次数已用完' : ''
   };
 }
 
@@ -1490,6 +1496,20 @@ async function fetchNovelAiAccountQuotaWithTimeout(token, proxyUrl = '') {
   } finally {
     clearTimeout(timer);
   }
+}
+
+async function mapLimit(items, limit, mapper) {
+  const results = new Array(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length) {
+      const index = next;
+      next += 1;
+      results[index] = await mapper(items[index], index);
+    }
+  });
+  await Promise.all(workers);
+  return results;
 }
 
 async function clearImageCache(body) {
@@ -2363,8 +2383,10 @@ async function retryReservationWithNextAccount(reservation, error, tried, option
         failedAccount.quotaCheckedAt = now;
       }
       if (isNovelAiAccountQuotaError(error)) {
+        const outOfTrial = isNovelAiOutOfTrialImageGenerationError(error);
+        if (outOfTrial) disableNovelAiAccount(failedAccount);
         failedAccount.quotaPoints = 0;
-        failedAccount.quotaError = '点数不足';
+        failedAccount.quotaError = outOfTrial ? '试用次数已用完，已自动禁用' : '点数不足';
         failedAccount.quotaCheckedAt = now;
       }
       failedAccount.updatedAt = now;
@@ -3500,6 +3522,10 @@ function isInsufficientBalanceError(error) {
 function isNovelAiAccountQuotaError(error) {
   const text = String(error?.message || error || '');
   return /NovelAI returned (402|400|403).*?(insufficient|balance|quota|anlas|training|point|额度|余额|点数)|insufficient.*?(quota|anlas|training|point|balance)/i.test(text);
+}
+
+function isNovelAiOutOfTrialImageGenerationError(error) {
+  return /out of trial image generations/i.test(String(error?.message || error || ''));
 }
 
 function isNovelAiCapacityError(error) {

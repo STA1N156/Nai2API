@@ -184,7 +184,7 @@ async function generateNovelAiImageStream(request, account, env, options = {}) {
 
 export async function fetchNovelAiAccountQuota(token, env = {}, options = {}) {
   if (!token) throw new Error('NovelAI account token is required.');
-  const baseUrl = (env.NOVELAI_ACCOUNT_API_URL || 'https://api.novelai.net').replace(/\/$/, '');
+  const baseUrl = (env.NOVELAI_ACCOUNT_API_URL || 'https://image.novelai.net').replace(/\/$/, '');
   const response = await novelAiFetch(`${baseUrl}/user/data`, {
     method: 'GET',
     signal: options.signal,
