@@ -1868,33 +1868,6 @@ async function createJob(token, body, options = {}) {
     const user = getUserOrThrow(db, token);
     const request = normalizeNovelAiRequest(body, db.settings, { maxSteps: DIRECT_URL_MAX_STEPS });
     const cacheKey = requestCacheKey(token, request, body.seed);
-    const nocache = isNoCache(body.nocache);
-    if (!nocache) {
-      const cached = db.images.find((image) => image.cacheKey === cacheKey && !image.mock && image.mimeType !== 'image/svg+xml');
-      if (cached) {
-        const now = new Date().toISOString();
-        const job = {
-          id: createId('job'),
-          source: options.source || 'web',
-          userToken: token,
-          status: 'done',
-          request,
-          cacheKey,
-          cost: 0,
-          accountCost: 0,
-          accountId: cached.accountId || '',
-          createdAt: now,
-          updatedAt: now,
-          completedAt: now,
-          imageId: cached.id,
-          error: '',
-          errorDetail: ''
-        };
-        db.jobs.unshift(job);
-        return job;
-      }
-    }
-
     const cost = generationCost(request);
     const accountCost = accountGenerationCost(request);
     if (user.balance < cost) throw httpError(402, insufficientBalanceMessage);
@@ -3001,10 +2974,11 @@ function exportAccount(account) {
 }
 
 function exportMigrationData(db) {
+  const users = db.users.filter((user) => Number(user.balance || 0) > 0);
   return {
     settings: db.settings,
     cards: db.cards,
-    users: db.users,
+    users,
     accounts: db.accounts.map((account) => ({ ...account, inFlight: 0 })),
     jobs: [],
     images: [],
@@ -3496,9 +3470,8 @@ function normalizeSizeName(value) {
   return String(value || '').replace(/\s*\(-\d+\)\s*$/, '').trim();
 }
 
-function requestCacheKey(token, request, explicitSeed = '') {
+function requestCacheKey(_token, request, explicitSeed = '') {
   return hashObject({
-    token,
     request: cacheableRequest({
       ...request,
       seed: explicitSeed === undefined || explicitSeed === '' ? '' : Number(explicitSeed)

@@ -91,6 +91,7 @@ const ids = [
   'balanceAdjustValue',
   'setBalanceBtn',
   'addBalanceBtn',
+  'deleteZeroBalanceUsersBtn',
   'deleteUsersBtn',
   'imageSearch',
   'imageTier',
@@ -147,6 +148,7 @@ function bindEvents() {
   el.selectAllUsers.addEventListener('change', toggleAllUsers);
   el.selectAllAccounts.addEventListener('change', toggleAllAccounts);
   el.deleteUsersBtn.addEventListener('click', deleteSelectedUsers);
+  el.deleteZeroBalanceUsersBtn.addEventListener('click', deleteZeroBalanceUsers);
   el.setBalanceBtn.addEventListener('click', () => adjustSelectedUsers('set'));
   el.addBalanceBtn.addEventListener('click', () => adjustSelectedUsers('delta'));
   el.enableAccountsBtn.addEventListener('click', () => setSelectedAccountsEnabled(true));
@@ -431,6 +433,31 @@ async function deleteSelectedUsers() {
   } catch (error) {
     showToast(normalizeErrorMessage(error), true);
   }
+}
+
+async function deleteZeroBalanceUsers() {
+  try {
+    const users = state.summary?.users || [];
+    const ids = users
+      .filter((user) => Number(user.balance || 0) <= 0 && !hasMergeTrace(user))
+      .map((user) => user.id);
+    if (!ids.length) return showToast('没有 0 额度密钥可清理', true);
+    if (!confirm(`确定删除 ${ids.length} 个 0 额度密钥？`)) return;
+    const result = await api('/api/admin/users', {
+      method: 'DELETE',
+      admin: true,
+      body: { ids }
+    });
+    state.selectedUsers.clear();
+    showToast(`已删除 ${result.deleted} 个 0 额度密钥`);
+    await refreshAdmin();
+  } catch (error) {
+    showToast(normalizeErrorMessage(error), true);
+  }
+}
+
+function hasMergeTrace(user) {
+  return Boolean(user?.mergedInto || user?.mergedAt || user?.mergedFrom?.length);
 }
 
 async function adjustSelectedUsers(mode) {
