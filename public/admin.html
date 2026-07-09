@@ -3,64 +3,69 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Nai2API 管理后台</title>
+    <meta name="description" content="Nai2API 服务管理后台" />
+    <meta name="theme-color" content="#f2f0e9" />
+    <title>Nai2API · 管理后台</title>
     <link rel="stylesheet" href="/styles.css" />
   </head>
-  <body class="admin-page">
-    <header class="topbar admin-topbar">
-      <div class="brand">
-        <span class="brand-mark">OPS</span>
-        <div>
-          <h1>Nai2API 管理后台</h1>
-          <p id="adminState">等待验证</p>
-        </div>
-      </div>
-      <nav class="top-actions">
-        <a class="nav-link" href="/">用户界面</a>
-        <button id="refreshBtn" class="secondary hidden">刷新监控</button>
-      </nav>
-    </header>
-
+  <body>
     <main class="admin-shell">
       <section id="loginPanel" class="panel login-panel">
-        <div class="panel-title">
-          <div>
-            <h2>管理员验证</h2>
-            <span>ADMIN_TOKEN</span>
-          </div>
+        <div class="login-intro">
+          <span class="eyebrow">Private access</span>
+          <h1>进入控制室</h1>
+          <p>验证管理员令牌后，才能查看账号、密钥与服务运行数据。</p>
         </div>
-        <label>
-          Admin Token
-          <input id="adminToken" type="password" autocomplete="current-password" />
-        </label>
-        <button id="enterAdminBtn" class="primary wide">进入后台</button>
+        <div class="login-form">
+          <label>
+            <span>Admin Token</span>
+            <input id="adminToken" type="password" autocomplete="current-password" placeholder="输入管理令牌" />
+          </label>
+          <button id="enterAdminBtn" class="primary wide">验证并进入 <span aria-hidden="true">→</span></button>
+        </div>
       </section>
 
       <section id="dashboard" class="hidden">
+        <div class="dashboard-heading">
+          <div>
+            <span class="eyebrow">Live overview</span>
+            <h1>服务运行总览</h1>
+          </div>
+          <nav class="top-actions" aria-label="后台操作">
+            <a class="nav-link" href="/">进入前台 <span aria-hidden="true">↗</span></a>
+            <button id="refreshBtn" class="secondary hidden">刷新数据</button>
+          </nav>
+        </div>
+
         <div class="metric-grid">
-          <article class="metric-card">
-            <span>RPM</span>
+          <article class="metric-card" data-index="01">
+            <span>每分钟请求</span>
             <strong id="metricUsers">0</strong>
+            <small>RPM</small>
           </article>
-          <article class="metric-card">
-            <span>1h 实际成功率</span>
+          <article class="metric-card" data-index="02">
+            <span>近 1 小时成功率</span>
             <strong id="metricCredits">0</strong>
+            <small>Actual</small>
           </article>
-          <article class="metric-card">
+          <article class="metric-card" data-index="03">
             <span>可用账号</span>
             <strong id="metricAccounts">0</strong>
+            <small>Online</small>
           </article>
-          <article class="metric-card">
+          <article class="metric-card" data-index="04">
             <span>缓存图片</span>
             <strong id="metricImages">0</strong>
+            <small>Stored</small>
           </article>
         </div>
 
         <section class="panel usage-panel">
           <div class="panel-title">
             <div>
-              <h2>使用图表</h2>
-              <span id="usageChartSummary">北京时间，按小时 00-23 统计</span>
+              <span class="eyebrow">Traffic</span>
+              <h2>使用趋势</h2>
+              <span id="usageChartSummary">北京时间，按小时 00–23 统计</span>
             </div>
             <div class="usage-chart-controls">
               <button id="clearLogsBtn" class="danger" type="button">清空日志</button>
@@ -70,42 +75,52 @@
           <div id="usageChart" class="usage-chart" aria-label="选中日期使用统计"></div>
         </section>
 
+        <div class="section-heading">
+          <span>01 / Access</span>
+          <div>
+            <h2>密钥与配额</h2>
+            <p>发放使用凭证，控制缓存上限。</p>
+          </div>
+        </div>
+
         <div class="admin-grid">
           <section class="panel">
             <div class="panel-title">
               <div>
+                <span class="eyebrow">Issue keys</span>
                 <h2>发放 STA1N 密钥</h2>
-                <span>管理员直接生成，用户拿到即可使用</span>
+                <span>生成后即可交给用户，无需二次开通</span>
               </div>
             </div>
             <div class="grid-three">
               <label>
-                数量
+                <span>数量</span>
                 <input id="userCount" type="number" min="1" max="200" value="5" />
               </label>
               <label>
-                额度
+                <span>额度</span>
                 <input id="userCredits" type="number" min="1" value="20" />
               </label>
               <label>
-                备注
+                <span>备注</span>
                 <input id="userNote" value="issued" />
               </label>
             </div>
             <button id="createUsersBtn" class="primary wide">生成密钥</button>
-            <textarea id="newUsersOutput" class="codebox" rows="6" readonly></textarea>
+            <textarea id="newUsersOutput" class="codebox" rows="6" readonly aria-label="新生成的密钥"></textarea>
           </section>
 
           <section class="panel">
             <div class="panel-title">
               <div>
+                <span class="eyebrow">Limits</span>
                 <h2>系统设置</h2>
-                <span>普通 1 点，2K 15 点，4K 25 点，每账号最高并发固定为 1</span>
+                <span>普通 1 点，2K 15 点，4K 25 点；每账号最高并发固定为 1</span>
               </div>
             </div>
             <div class="grid-two">
               <label class="settings-wide">
-                最大缓存图片数
+                <span>最大缓存图片数</span>
                 <input id="maxCacheImages" type="number" min="0" max="4000000" value="500" />
               </label>
             </div>
@@ -113,24 +128,33 @@
           </section>
         </div>
 
+        <div class="section-heading">
+          <span>02 / Infrastructure</span>
+          <div>
+            <h2>账号与数据</h2>
+            <p>维护 NovelAI 路由池，处理环境迁移。</p>
+          </div>
+        </div>
+
         <div class="admin-grid">
-          <section class="panel">
+          <section class="panel account-form-panel">
             <div class="panel-title">
               <div>
-                <h2>Nai2API 账号池</h2>
-                <span>负载均衡与 token 迁移</span>
+                <span class="eyebrow">Account pool</span>
+                <h2>NovelAI 账号池</h2>
+                <span>新增账号、配置代理或批量迁移 Token</span>
               </div>
             </div>
             <label>
-              账号备注
+              <span>账号备注</span>
               <input id="accountName" placeholder="nai-1" />
             </label>
             <label>
-              Persistent API Token
+              <span>Persistent API Token</span>
               <textarea id="accountToken" class="codebox" rows="3" placeholder="pst-..."></textarea>
             </label>
             <label>
-              SOCKS5 Proxy
+              <span>SOCKS5 Proxy</span>
               <input id="accountProxy" placeholder="socks5://user:pass@127.0.0.1:1080" />
             </label>
             <div class="button-row">
@@ -138,7 +162,7 @@
               <button id="exportAccountsBtn" class="secondary">导出账号</button>
             </div>
             <label>
-              批量导入 token
+              <span>批量导入 Token</span>
               <textarea id="accountImportText" class="codebox" rows="4" placeholder="每行一个 token，也支持：备注,token,proxy,权重"></textarea>
             </label>
             <div class="button-row">
@@ -146,7 +170,7 @@
               <button id="replaceAccountsBtn" class="ghost">覆盖导入</button>
             </div>
             <label>
-              SOCKS5 Proxy List
+              <span>SOCKS5 Proxy List</span>
               <textarea id="accountProxyImportText" class="codebox" rows="5" placeholder="45.41.173.217:6584:STA1N156:156456aa"></textarea>
             </label>
             <div class="button-row">
@@ -154,21 +178,22 @@
             </div>
           </section>
 
-          <section class="panel">
+          <section class="panel migration-panel">
             <div class="panel-title">
               <div>
+                <span class="eyebrow">Migration</span>
                 <h2>数据包迁移</h2>
                 <span>包含密钥、额度、账号池和系统设置，不包含记录与图片缓存</span>
               </div>
-              <div class="button-row compact-actions">
-                <button id="exportPackageBtn" class="secondary">一键打包导出</button>
-                <label class="file-button">
-                  选择数据包
-                  <input id="packageFile" type="file" accept="application/json,.json" />
-                </label>
-              </div>
             </div>
-            <textarea id="packageImportText" class="codebox import-area" rows="4" placeholder="也可以把导出的 JSON 数据包粘贴到这里"></textarea>
+            <div class="migration-actions">
+              <button id="exportPackageBtn" class="secondary">一键打包导出</button>
+              <label class="file-button">
+                选择数据包
+                <input id="packageFile" type="file" accept="application/json,.json" />
+              </label>
+            </div>
+            <textarea id="packageImportText" class="codebox import-area" rows="7" placeholder="也可以把导出的 JSON 数据包粘贴到这里"></textarea>
             <div class="button-row">
               <button id="importPackageMergeBtn" class="secondary">合并导入</button>
               <button id="importPackageReplaceBtn" class="danger">覆盖导入</button>
@@ -176,10 +201,19 @@
           </section>
         </div>
 
+        <div class="section-heading">
+          <span>03 / Monitor</span>
+          <div>
+            <h2>运行监控</h2>
+            <p>按需展开，集中处理账号、密钥和失败请求。</p>
+          </div>
+        </div>
+
         <div class="admin-grid wide-grid">
           <section id="accountMonitorPanel" class="panel collapsible-panel is-collapsed">
             <div class="panel-title">
               <div>
+                <span class="eyebrow">Routes</span>
                 <h2>账号监控</h2>
                 <span id="accountCount">0 个账号</span>
               </div>
@@ -193,9 +227,9 @@
                 </label>
                 <button id="enableAccountsBtn" class="secondary">启用</button>
                 <button id="disableAccountsBtn" class="secondary">禁用</button>
-                <button id="refreshAccountQuotaBtn" class="secondary">刷新点数/会员</button>
+                <button id="refreshAccountQuotaBtn" class="secondary">刷新点数 / 会员</button>
                 <button id="resetAccountStatsBtn" class="ghost">重置监控</button>
-                <button id="deleteAccountsBtn" class="ghost">批量删除</button>
+                <button id="deleteAccountsBtn" class="danger">批量删除</button>
               </div>
               <div id="accountList" class="data-list"></div>
             </div>
@@ -204,6 +238,7 @@
           <section id="userMonitorPanel" class="panel collapsible-panel is-collapsed">
             <div class="panel-title">
               <div>
+                <span class="eyebrow">Keys</span>
                 <h2>密钥监控</h2>
                 <span id="userCountText">0 个密钥</span>
               </div>
@@ -216,7 +251,7 @@
                   <input id="selectAllUsers" type="checkbox" />
                   全选
                 </label>
-                <input id="balanceAdjustValue" class="inline-input" type="number" value="10" />
+                <input id="balanceAdjustValue" class="inline-input" type="number" value="10" aria-label="额度调整数值" />
                 <button id="setBalanceBtn" class="secondary">设置额度</button>
                 <button id="addBalanceBtn" class="secondary">增加额度</button>
                 <button id="deleteZeroBalanceUsersBtn" class="ghost">清理 0 额度</button>
@@ -229,7 +264,8 @@
           <section id="requestLogPanel" class="panel collapsible-panel is-collapsed">
             <div class="panel-title">
               <div>
-                <h2>请求日志</h2>
+                <span class="eyebrow">Requests</span>
+                <h2>失败请求</h2>
                 <span id="jobCountText">0 条</span>
               </div>
               <button id="requestLogToggle" class="secondary collapse-toggle" type="button" aria-expanded="false" aria-controls="requestLogBody">展开</button>
@@ -245,9 +281,10 @@
           </section>
         </div>
 
-        <section id="errorLogPanel" class="panel error-log-panel collapsible-panel is-collapsed">
+        <section id="errorLogPanel" class="panel collapsible-panel is-collapsed">
           <div class="panel-title">
             <div>
+              <span class="eyebrow">Diagnostics</span>
               <h2>账号错误日志</h2>
               <span id="errorLogCount">最近 7 天账号真实错误</span>
             </div>
@@ -258,13 +295,22 @@
           </div>
         </section>
 
+        <div class="section-heading">
+          <span>04 / Archive</span>
+          <div>
+            <h2>图片缓存</h2>
+            <p>检索、预览和清理已生成的图片。</p>
+          </div>
+        </div>
+
         <section class="panel">
           <div class="panel-title">
             <div>
-              <h2>缓存图片</h2>
+              <span class="eyebrow">Image cache</span>
+              <h2>缓存图库</h2>
               <span id="imageCountText">0 / 0</span>
             </div>
-            <div class="button-row compact-actions image-cache-actions">
+            <div class="button-row image-cache-actions">
               <input id="imageSearch" class="search-input" placeholder="搜索提示词、模型或密钥" />
               <select id="imageTier" class="inline-select" aria-label="缓存图片分辨率筛选">
                 <option value="">全部</option>

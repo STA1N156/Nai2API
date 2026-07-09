@@ -23,6 +23,7 @@ const state = {
 
 const ids = [
   'balanceText',
+  'tokenStatusDot',
   'userToken',
   'saveTokenBtn',
   'mergePanel',
@@ -238,8 +239,15 @@ async function saveToken() {
     state.token = el.userToken.value.trim();
     localStorage.setItem('nai.userToken', state.token);
     updateUrlOutputs();
+    if (!state.token) {
+      el.balanceText.textContent = '尚未连接';
+      el.tokenStatusDot.classList.remove('connected');
+      return;
+    }
     await loadMe();
   } catch (error) {
+    el.balanceText.textContent = '连接失败';
+    el.tokenStatusDot.classList.remove('connected');
     showToast(error.message, true);
   }
 }
@@ -248,6 +256,7 @@ async function loadMe() {
   if (!state.token) return;
   const user = await api(`/api/me?token=${encodeURIComponent(state.token)}`);
   el.balanceText.textContent = `${user.balance} 点可用`;
+  el.tokenStatusDot.classList.add('connected');
 }
 
 async function mergeTokenBalance() {
@@ -280,6 +289,7 @@ async function mergeTokenBalance() {
     setMergePanelOpen(false);
     localStorage.setItem('nai.userToken', state.token);
     el.balanceText.textContent = `${result.target.balance} 点可用`;
+    el.tokenStatusDot.classList.add('connected');
     updateUrlOutputs();
     showToast(`已融合 ${result.amount} 点额度`);
   } catch (error) {
@@ -293,7 +303,6 @@ async function mergeTokenBalance() {
 function setMergePanelOpen(isOpen) {
   el.mergeFields.hidden = !isOpen;
   el.mergePanel.classList.toggle('open', isOpen);
-  el.mergePanel.classList.toggle('collapsed', !isOpen);
   el.toggleMergeBtn.setAttribute('aria-expanded', String(isOpen));
 }
 
@@ -469,16 +478,16 @@ function renderLoadingFrame() {
   el.imageFrame.classList.remove('result-ready');
   el.imageFrame.classList.add('loading');
   el.imageFrame.innerHTML = `<div class="loading-state" role="status" aria-live="polite">
-    <div class="loading-orbit"><span></span><span></span><span></span></div>
+    <div class="loading-orbit" aria-hidden="true"></div>
     <strong>正在生成图片</strong>
     <p id="loadingStatusText">任务已提交，正在分配账号</p>
-    <div id="generationStream" class="generation-stream-panel" aria-label="NovelAI 生成进度" hidden>
+    <div id="generationStream" class="generation-stream-panel" role="progressbar" aria-label="NovelAI 生成进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" hidden>
       <div class="generation-stream-track">
         <span id="generationStreamBar"></span>
       </div>
     </div>
     <div class="loading-steps" aria-hidden="true">
-      <span class="active">提交任务</span>
+      <span class="active current">提交任务</span>
       <span>路由账号</span>
       <span>等待成图</span>
     </div>
@@ -634,6 +643,7 @@ function renderQueueText() {
 function setLoadingStep(activeIndex) {
   document.querySelectorAll('.loading-steps span').forEach((item, index) => {
     item.classList.toggle('active', index <= activeIndex);
+    item.classList.toggle('current', index === activeIndex);
   });
 }
 
@@ -643,7 +653,9 @@ function setGenerationStreamProgress(progress = null, isVisible = true) {
   stream.hidden = !isVisible;
   const percent = clampGenerationPercent(progress?.percent);
   const bar = document.querySelector('#generationStreamBar');
+  const roundedPercent = Math.round(isVisible ? percent : 0);
   if (bar) bar.style.width = `${isVisible ? percent : 0}%`;
+  stream.setAttribute('aria-valuenow', String(roundedPercent));
 }
 
 function clampGenerationPercent(value) {

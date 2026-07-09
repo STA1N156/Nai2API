@@ -28,7 +28,6 @@ const jobPageSize = 10;
 const userRenderLimit = 300;
 
 const ids = [
-  'adminState',
   'loginPanel',
   'dashboard',
   'adminToken',
@@ -218,15 +217,12 @@ async function enterAdmin(options = {}) {
     await api('/api/admin/ping', { admin: true, timeoutMs: 8000 });
     localStorage.setItem('nai.adminToken', state.adminToken);
     setAuthenticated(true);
-    el.adminState.textContent = '正在加载后台数据';
     if (!options.silent) showToast('正在加载后台数据...');
     try {
       await reloadDashboard();
       await refreshImages(false);
-      el.adminState.textContent = '监控在线';
       if (!options.silent) showToast('已进入后台');
     } catch (error) {
-      el.adminState.textContent = '数据加载失败';
       showToast(normalizeErrorMessage(error), true);
     }
   } catch (error) {
@@ -244,7 +240,6 @@ async function enterAdmin(options = {}) {
 function setLoginBusy(isBusy) {
   el.enterAdminBtn.disabled = isBusy;
   el.enterAdminBtn.textContent = isBusy ? '进入中...' : enterAdminButtonText;
-  if (isBusy) el.adminState.textContent = '正在验证';
 }
 
 async function refreshAdmin() {
@@ -261,7 +256,6 @@ function setAuthenticated(isAuthenticated) {
   el.loginPanel.classList.toggle('hidden', isAuthenticated);
   el.dashboard.classList.toggle('hidden', !isAuthenticated);
   el.refreshBtn.classList.toggle('hidden', !isAuthenticated);
-  el.adminState.textContent = isAuthenticated ? '监控在线' : '等待验证';
 }
 
 async function reloadDashboard() {
@@ -910,7 +904,7 @@ function renderSelectedUsageChart(day) {
   const labels = hours.map((hour) => {
     const x = xFor(hour.hour);
     const label = `${String(hour.hour).padStart(2, '0')}:00`;
-    return `<text x="${x}" y="${height - 24}" class="chart-label chart-hour-label" text-anchor="middle">${label}</text>`;
+    return `<text x="${x}" y="${height - 24}" class="chart-label" text-anchor="middle">${label}</text>`;
   }).join('');
   const base = {
     width,

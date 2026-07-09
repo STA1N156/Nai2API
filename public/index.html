@@ -3,124 +3,149 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Nai2API</title>
+    <meta name="description" content="Nai2API 图像生成工作台" />
+    <meta name="theme-color" content="#f2f0e9" />
+    <title>Nai2API · 图像工作台</title>
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
     <main class="user-shell">
-      <section class="panel token-panel">
+      <section class="panel token-panel" aria-labelledby="tokenTitle">
         <div class="panel-title token-summary">
-          <span class="status-dot"></span>
+          <span id="tokenStatusDot" class="status-dot" aria-hidden="true"></span>
           <div>
-            <h2>访问密钥</h2>
-            <span id="balanceText">未连接</span>
+            <span class="eyebrow">Access</span>
+            <h1 id="tokenTitle">连接密钥</h1>
+            <span id="balanceText">尚未连接</span>
           </div>
         </div>
         <label>
-          当前密钥（保留额度）
-          <input id="userToken" placeholder="STA1N-..." />
+          <span>当前密钥</span>
+          <input id="userToken" autocomplete="off" spellcheck="false" placeholder="STA1N-..." />
         </label>
-        <button id="saveTokenBtn" class="secondary wide">加载密钥</button>
-        <div id="mergePanel" class="merge-panel collapsed">
-          <button id="toggleMergeBtn" class="secondary wide merge-toggle" type="button" aria-expanded="false" aria-controls="mergeFields">
-            <span>融合额度</span>
+        <button id="saveTokenBtn" class="secondary token-submit">加载密钥</button>
+
+        <div id="mergePanel" class="merge-panel">
+          <button id="toggleMergeBtn" class="ghost wide merge-toggle" type="button" aria-expanded="false" aria-controls="mergeFields">
+            <span>融合另一个密钥的额度</span>
             <span id="mergeToggleHint" class="merge-toggle-hint" aria-hidden="true"></span>
           </button>
           <div id="mergeFields" class="merge-fields" hidden>
             <label>
-              被融合的密钥
-              <input id="mergeSourceToken" placeholder="STA1N-..." />
+              <span>被融合的密钥</span>
+              <input id="mergeSourceToken" autocomplete="off" spellcheck="false" placeholder="STA1N-..." />
             </label>
-            <button id="mergeTokenBtn" class="secondary wide">确认融合</button>
+            <button id="mergeTokenBtn" class="secondary">确认融合</button>
           </div>
         </div>
       </section>
 
-      <section class="panel composer-panel">
+      <section class="panel composer-panel" aria-labelledby="composerTitle">
         <div class="panel-title">
           <div>
-            <h2>生成参数</h2>
+            <span class="eyebrow">Create / 01</span>
+            <h2 id="composerTitle">描述画面</h2>
           </div>
         </div>
 
-        <label>
-          提示词
-          <textarea id="promptInput" rows="7">1girl, silver hair, blue eyes, standing in a rainy neon street, cinematic lighting, highly detailed</textarea>
-        </label>
-
-        <div class="grid-two">
+        <div class="form-section prompt-section">
           <label>
-            采样器
-            <select id="samplerInput">
-              <option value="k_dpmpp_2m_sde">DPM++ 2M SDE</option>
-              <option value="k_dpmpp_2m">DPM++ 2M</option>
-              <option value="k_dpmpp_sde">DPM++ SDE</option>
-              <option value="k_dpmpp_2s_ancestral">DPM++ 2S Ancestral</option>
-              <option value="k_euler_ancestral">Euler Ancestral</option>
-              <option value="k_euler">Euler</option>
-            </select>
+            <span>提示词</span>
+            <textarea id="promptInput" rows="7">1girl, solo, long silver hair drifting in the rain, luminous blue eyes, standing beneath a transparent umbrella on a quiet neon-lit street at night, wet pavement, colorful reflections, distant storefront glow, soft drifting mist, gentle wind, cinematic composition, moody atmosphere, deep blue and warm amber lighting, delicate rim light, volumetric rain, shallow depth of field, soft bokeh, subtle film grain, highly detailed background, delicate facial features, masterpiece, best quality</textarea>
           </label>
-          <label>
-            尺寸
+        </div>
+
+        <div class="form-section">
+          <div class="form-section-title">
+            <span>02</span>
+            <strong>生成参数</strong>
+          </div>
+          <div class="grid-two">
+            <label>
+              <span>采样器</span>
+              <select id="samplerInput">
+                <option value="k_dpmpp_2m_sde">DPM++ 2M SDE</option>
+                <option value="k_dpmpp_2m">DPM++ 2M</option>
+                <option value="k_dpmpp_sde">DPM++ SDE</option>
+                <option value="k_dpmpp_2s_ancestral">DPM++ 2S Ancestral</option>
+                <option value="k_euler_ancestral">Euler Ancestral</option>
+                <option value="k_euler">Euler</option>
+              </select>
+            </label>
+            <label>
+              <span>画幅与分辨率</span>
               <select id="sizeInput">
                 <option>竖图</option>
                 <option>横图</option>
                 <option>方图</option>
               </select>
-          </label>
+            </label>
+          </div>
+
+          <div class="grid-three param-grid">
+            <label>
+              <span>步数</span>
+              <input id="stepsInput" type="number" min="1" max="28" value="28" />
+            </label>
+            <label>
+              <span>Scale</span>
+              <input id="scaleInput" type="number" min="1" max="20" step="0.5" value="6" />
+            </label>
+            <label>
+              <span>CFG</span>
+              <input id="cfgInput" type="number" min="0" max="1" step="0.05" value="0" />
+            </label>
+          </div>
         </div>
 
-        <div class="grid-three param-grid">
+        <div class="form-section">
+          <div class="form-section-title">
+            <span>03</span>
+            <strong>风格控制</strong>
+          </div>
           <label>
-            步数
-            <input id="stepsInput" type="number" min="1" max="28" value="28" />
+            <span>Artist / 质量前缀</span>
+            <select id="artistPresetInput">
+              <option value="fresh">韩漫小清新风</option>
+              <option value="comicDoujin">漫画同人风</option>
+              <option value="2.5d">2.5D 唯美风</option>
+              <option value="lolita25d">2.5D 唯美风（萝）</option>
+              <option value="doujin">本子里番风</option>
+              <option value="galgame">GalGame 风</option>
+              <option value="custom">自定义</option>
+            </select>
+            <textarea id="artistInput" rows="7"></textarea>
           </label>
           <label>
-            Scale
-            <input id="scaleInput" type="number" min="1" max="20" step="0.5" value="6" />
-          </label>
-          <label>
-            CFG
-            <input id="cfgInput" type="number" min="0" max="1" step="0.05" value="0" />
+            <span>负面提示词</span>
+            <textarea id="negativeInput" rows="7"></textarea>
           </label>
         </div>
-
-        <label>
-          Artist / 质量前缀
-          <select id="artistPresetInput">
-            <option value="fresh">韩漫小清新风</option>
-            <option value="comicDoujin">漫画同人风</option>
-            <option value="2.5d">2.5D唯美风</option>
-            <option value="lolita25d">2.5D唯美风（萝）</option>
-            <option value="doujin">本子里番风</option>
-            <option value="galgame">GalGame风</option>
-            <option value="custom">自定义</option>
-          </select>
-          <textarea id="artistInput" rows="8"></textarea>
-        </label>
-        <label>
-          负面提示词
-          <textarea id="negativeInput" rows="8"></textarea>
-        </label>
-
       </section>
 
-      <section class="panel result-panel">
-        <div class="panel-title">
+      <section class="panel result-panel" aria-labelledby="resultTitle">
+        <div class="panel-title result-heading">
           <div class="result-title-main">
-            <h2>结果</h2>
+            <span class="eyebrow">Output</span>
             <div class="result-title-row">
-              <span id="jobText">等待请求</span>
+              <div>
+                <h2 id="resultTitle">生成预览</h2>
+                <span id="jobText">等待请求</span>
+              </div>
               <div class="panel-actions result-actions">
-                <button id="directGenerateBtn" class="primary">生成图片</button>
                 <button id="copySnippetTopBtn" class="secondary">复制嵌入代码</button>
+                <button id="directGenerateBtn" class="primary">生成图片 <span aria-hidden="true">→</span></button>
               </div>
             </div>
           </div>
         </div>
 
         <div id="imageFrame" class="image-frame">
-          <span>等待生成</span>
+          <div class="empty-canvas">
+            <span>Preview / 00</span>
+            <strong>图像会在这里出现</strong>
+            <p>确认左侧参数后，开始一次生成。</p>
+          </div>
         </div>
       </section>
     </main>
