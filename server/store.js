@@ -4,7 +4,7 @@ import crypto from 'node:crypto';
 import path from 'node:path';
 import Database from 'better-sqlite3';
 
-export const MAX_CACHE_IMAGES_LIMIT = 200000;
+export const MAX_CACHE_IMAGES_LIMIT = 4000000;
 export const MAX_FREE_STEPS = 28;
 export const defaultArtist2_5D =
   `0.9::misaka_12003-gou ::, dino_(dinoartforame), wanke, liduke, year 2025, realistic, 4k, -2::green ::, textless version, The image is highly intricate finished drawn. Only the character's face is in anime style, but their body is in realistic style. 1.35::A highly finished photo-style artwork that has lively color, graphic texture, realistic skin surface, and lifelike flesh with little obliques::. 1.63::photorealistic::, 1.63::photo(medium)::, \\n20::best quality, absurdres, very aesthetic, detailed, masterpiece::,, very aesthetic, masterpiece, no text,`;
