@@ -905,20 +905,33 @@ function renderResultImage(src) {
 function handleResultPreview(event) {
   const image = event.target.closest('.result-image-button img');
   if (!image) return;
-  const src = image.currentSrc || image.src;
-  const index = state.resultHistory.indexOf(src);
-  openResultPreview(index >= 0 ? index : state.resultHistoryIndex);
+  const src = normalizeResultUrl(image.currentSrc || image.src);
+  let index = state.resultHistory.indexOf(src);
+  if (index < 0) {
+    pushResultHistory(src);
+    index = state.resultHistoryIndex;
+  }
+  openResultPreview(index);
 }
 
 function pushResultHistory(src) {
   if (!src) return;
-  const existingIndex = state.resultHistory.indexOf(src);
+  const normalizedSrc = normalizeResultUrl(src);
+  const existingIndex = state.resultHistory.indexOf(normalizedSrc);
   if (existingIndex >= 0) {
     state.resultHistoryIndex = existingIndex;
     return;
   }
-  state.resultHistory.push(src);
+  state.resultHistory.push(normalizedSrc);
   state.resultHistoryIndex = state.resultHistory.length - 1;
+}
+
+function normalizeResultUrl(src) {
+  try {
+    return new URL(String(src || ''), location.href).href;
+  } catch {
+    return String(src || '');
+  }
 }
 
 function openResultPreview(index = state.resultHistoryIndex) {
