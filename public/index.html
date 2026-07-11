@@ -49,10 +49,11 @@
         </div>
 
         <div class="form-section prompt-section">
-          <label>
-            <span>提示词</span>
-            <textarea id="promptInput" rows="7">1girl, solo, long silver hair drifting in the rain, luminous blue eyes, standing beneath a transparent umbrella on a quiet neon-lit street at night, wet pavement, colorful reflections, distant storefront glow, soft drifting mist, gentle wind, cinematic composition, moody atmosphere, deep blue and warm amber lighting, delicate rim light, volumetric rain, shallow depth of field, soft bokeh, subtle film grain, highly detailed background, delicate facial features, masterpiece, best quality</textarea>
-          </label>
+          <div class="prompt-field-head">
+            <label for="promptInput">提示词</label>
+            <button id="promptConvertBtn" class="secondary prompt-convert-btn" type="button">中文转提示词</button>
+          </div>
+          <textarea id="promptInput" rows="7">1girl, solo, long silver hair drifting in the rain, luminous blue eyes, standing beneath a transparent umbrella on a quiet neon-lit street at night, wet pavement, colorful reflections, distant storefront glow, soft drifting mist, gentle wind, cinematic composition, moody atmosphere, deep blue and warm amber lighting, delicate rim light, volumetric rain, shallow depth of field, soft bokeh, subtle film grain, highly detailed background, delicate facial features, masterpiece, best quality</textarea>
         </div>
 
         <div class="form-section">
@@ -130,9 +131,15 @@
             <div class="result-title-row">
               <div>
                 <h2 id="resultTitle">生成预览</h2>
-                <span id="jobText">等待请求</span>
+                <span id="jobText"></span>
               </div>
               <div class="panel-actions result-actions">
+                <div id="generationCountControl" class="generation-count-control" role="group" aria-label="生图数量">
+                  <span>数量</span>
+                  <button class="selected" type="button" data-generation-count="1" aria-pressed="true">1</button>
+                  <button type="button" data-generation-count="2" aria-pressed="false">2</button>
+                  <button type="button" data-generation-count="4" aria-pressed="false">4</button>
+                </div>
                 <button id="copySnippetTopBtn" class="secondary">复制嵌入代码</button>
                 <button id="directGenerateBtn" class="primary">生成图片 <span aria-hidden="true">→</span></button>
               </div>
@@ -140,13 +147,7 @@
           </div>
         </div>
 
-        <div id="imageFrame" class="image-frame">
-          <div class="empty-canvas">
-            <span>Preview / 00</span>
-            <strong>图像会在这里出现</strong>
-            <p>确认左侧参数后，开始一次生成。</p>
-          </div>
-        </div>
+        <div id="imageFrame" class="image-frame"></div>
       </section>
     </main>
 
@@ -156,6 +157,24 @@
       <button id="nextResultBtn" class="preview-nav preview-next" type="button" aria-label="下一张">›</button>
       <div class="preview-stage result-preview-stage">
         <img id="resultPreviewImage" alt="生成图片预览" />
+      </div>
+    </div>
+
+    <div id="promptConvertModal" class="prompt-convert-modal hidden" role="dialog" aria-modal="true" aria-labelledby="promptConvertTitle">
+      <div class="prompt-convert-dialog">
+        <div class="prompt-convert-head">
+          <div>
+            <span class="eyebrow">Prompt helper</span>
+            <h2 id="promptConvertTitle">中文转 NAI 提示词</h2>
+          </div>
+          <button id="closePromptConvertBtn" class="prompt-convert-close" type="button" aria-label="关闭">×</button>
+        </div>
+        <label>
+          <span>中文画面描述</span>
+          <textarea id="promptConvertInput" rows="6" placeholder="例如：雨夜的霓虹街道上，一位银发少女撑着透明雨伞，电影感构图。"></textarea>
+        </label>
+        <p class="prompt-convert-note">转换不会扣除生成额度</p>
+        <button id="promptConvertSubmitBtn" class="primary wide" type="button">转换并填入</button>
       </div>
     </div>
 

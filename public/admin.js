@@ -21,6 +21,7 @@ const state = {
   imagePageSize: 1,
   imageMatched: 0,
   jobPage: 1,
+  promptApiConfigLoaded: false,
   toastTimer: null
 };
 
@@ -60,6 +61,12 @@ const ids = [
   'newUsersOutput',
   'maxCacheImages',
   'saveSettingsBtn',
+  'promptApiStatus',
+  'promptApiBaseUrl',
+  'promptApiKey',
+  'promptApiModel',
+  'fetchPromptApiModelsBtn',
+  'savePromptApiBtn',
   'accountName',
   'accountToken',
   'accountProxy',
@@ -135,6 +142,8 @@ function bindEvents() {
   el.refreshBtn.addEventListener('click', refreshAdmin);
   el.createUsersBtn.addEventListener('click', createUsers);
   el.saveSettingsBtn.addEventListener('click', saveSettings);
+  el.fetchPromptApiModelsBtn.addEventListener('click', fetchPromptApiModelList);
+  el.savePromptApiBtn.addEventListener('click', savePromptApiConfig);
   el.addAccountBtn.addEventListener('click', addAccount);
   el.exportAccountsBtn.addEventListener('click', exportAccounts);
   el.importAccountsBtn.addEventListener('click', () => importAccounts('append'));
@@ -309,6 +318,83 @@ async function saveSettings() {
   } catch (error) {
     showToast(normalizeErrorMessage(error), true);
   }
+}
+
+async function fetchPromptApiModelList() {
+  const baseUrl = el.promptApiBaseUrl.value.trim();
+  if (!baseUrl) return showToast('请输入 API 地址', true);
+  const buttonText = el.fetchPromptApiModelsBtn.textContent;
+  el.fetchPromptApiModelsBtn.disabled = true;
+  el.fetchPromptApiModelsBtn.textContent = '获取中...';
+  try {
+    const data = await api('/api/admin/prompt-api/models', {
+      method: 'POST',
+      admin: true,
+      timeoutMs: 30000,
+      body: {
+        baseUrl,
+        apiKey: el.promptApiKey.value.trim()
+      }
+    });
+    const current = el.promptApiModel.value;
+    const selected = data.models.includes(current) ? current : data.models[0] || '';
+    setPromptApiModelOptions(data.models, selected);
+    el.promptApiStatus.textContent = `已获取 ${data.models.length} 个模型`;
+    showToast(`已获取 ${data.models.length} 个模型`);
+  } catch (error) {
+    showToast(normalizeErrorMessage(error), true);
+  } finally {
+    el.fetchPromptApiModelsBtn.disabled = false;
+    el.fetchPromptApiModelsBtn.textContent = buttonText;
+  }
+}
+
+async function savePromptApiConfig() {
+  const baseUrl = el.promptApiBaseUrl.value.trim();
+  const model = el.promptApiModel.value.trim();
+  if (!baseUrl) return showToast('请输入 API 地址', true);
+  if (!model) return showToast('请先获取并选择模型', true);
+  const buttonText = el.savePromptApiBtn.textContent;
+  el.savePromptApiBtn.disabled = true;
+  el.savePromptApiBtn.textContent = '保存中...';
+  try {
+    const config = await api('/api/admin/prompt-api', {
+      method: 'PUT',
+      admin: true,
+      body: {
+        baseUrl,
+        apiKey: el.promptApiKey.value.trim(),
+        model
+      }
+    });
+    renderPromptApiConfig(config, true);
+    if (state.summary?.settings) state.summary.settings.promptApi = config;
+    showToast('提示词 API 配置已保存');
+  } catch (error) {
+    showToast(normalizeErrorMessage(error), true);
+  } finally {
+    el.savePromptApiBtn.disabled = false;
+    el.savePromptApiBtn.textContent = buttonText;
+  }
+}
+
+function renderPromptApiConfig(config = {}, force = false) {
+  if (state.promptApiConfigLoaded && !force) return;
+  state.promptApiConfigLoaded = true;
+  el.promptApiBaseUrl.value = config.baseUrl || '';
+  el.promptApiKey.value = '';
+  el.promptApiKey.placeholder = config.apiKeyConfigured ? '密钥已保存，留空保持不变' : '输入 API 密钥';
+  setPromptApiModelOptions(config.model ? [config.model] : [], config.model || '');
+  el.promptApiStatus.textContent = config.configured ? `已配置 · ${config.model}` : '尚未配置';
+}
+
+function setPromptApiModelOptions(models = [], selected = '') {
+  const options = Array.from(new Set([...models, selected].map((item) => String(item || '').trim()).filter(Boolean)));
+  el.promptApiModel.innerHTML = options.length
+    ? options.map((model) => `<option value="${escapeHtml(model)}">${escapeHtml(model)}</option>`).join('')
+    : '<option value="">请先获取模型</option>';
+  el.promptApiModel.value = selected || options[0] || '';
+  refreshSelect(el.promptApiModel);
 }
 
 async function addAccount() {
@@ -722,6 +808,7 @@ function renderSummary(summary, options = {}) {
   }
   el.accountCount.textContent = `${summary.accounts.length} 个账号`;
   el.maxCacheImages.value = summary.settings?.maxCacheImages ?? 500;
+  renderPromptApiConfig(summary.settings?.promptApi || {});
 
   renderAccounts(summary.accounts);
   renderUsageChart(summary.usageHourlyDays || []);

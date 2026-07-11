@@ -57,6 +57,11 @@ const defaultSettings = {
   accountConcurrency: 1,
   publicBaseUrl: '',
   mockWhenNoAccount: true,
+  promptApi: {
+    baseUrl: '',
+    apiKey: '',
+    model: ''
+  },
   defaultModel: 'nai-diffusion-4-5-full',
   defaultArtist: defaultArtist2_5D,
   defaultNegative:
@@ -1975,6 +1980,10 @@ export function normalizeDb(db = {}) {
       ...defaultSettings,
       ...(db.settings || {}),
       accountConcurrency: 1,
+      promptApi: {
+        ...defaultSettings.promptApi,
+        ...(db.settings?.promptApi || {})
+      },
       defaults: {
         ...defaultSettings.defaults,
         ...(db.settings?.defaults || {})

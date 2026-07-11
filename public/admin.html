@@ -178,27 +178,57 @@
             </div>
           </section>
 
-          <section class="panel migration-panel">
-            <div class="panel-title">
-              <div>
-                <span class="eyebrow">Migration</span>
-                <h2>数据包迁移</h2>
-                <span>包含密钥、额度、账号池和系统设置，不包含记录与图片缓存</span>
+          <div class="admin-side-stack">
+            <section class="panel prompt-api-panel">
+              <div class="panel-title">
+                <div>
+                  <span class="eyebrow">Prompt API</span>
+                  <h2>API 配置</h2>
+                  <span id="promptApiStatus">尚未配置</span>
+                </div>
               </div>
-            </div>
-            <div class="migration-actions">
-              <button id="exportPackageBtn" class="secondary">一键打包导出</button>
-              <label class="file-button">
-                选择数据包
-                <input id="packageFile" type="file" accept="application/json,.json" />
+              <label>
+                <span>API 地址</span>
+                <input id="promptApiBaseUrl" type="url" autocomplete="off" placeholder="https://api.example.com/v1" />
               </label>
-            </div>
-            <textarea id="packageImportText" class="codebox import-area" rows="7" placeholder="也可以把导出的 JSON 数据包粘贴到这里"></textarea>
-            <div class="button-row">
-              <button id="importPackageMergeBtn" class="secondary">合并导入</button>
-              <button id="importPackageReplaceBtn" class="danger">覆盖导入</button>
-            </div>
-          </section>
+              <label>
+                <span>API 密钥</span>
+                <input id="promptApiKey" type="password" autocomplete="new-password" placeholder="输入 API 密钥" />
+              </label>
+              <div class="prompt-api-model-row">
+                <label>
+                  <span>模型</span>
+                  <select id="promptApiModel">
+                    <option value="">请先获取模型</option>
+                  </select>
+                </label>
+                <button id="fetchPromptApiModelsBtn" class="secondary" type="button">获取模型</button>
+              </div>
+              <button id="savePromptApiBtn" class="primary wide" type="button">保存 API 配置</button>
+            </section>
+
+            <section class="panel migration-panel">
+              <div class="panel-title">
+                <div>
+                  <span class="eyebrow">Migration</span>
+                  <h2>数据包迁移</h2>
+                  <span>包含密钥、额度、账号池和系统设置，不包含记录与图片缓存</span>
+                </div>
+              </div>
+              <div class="migration-actions">
+                <button id="exportPackageBtn" class="secondary">一键打包导出</button>
+                <label class="file-button">
+                  选择数据包
+                  <input id="packageFile" type="file" accept="application/json,.json" />
+                </label>
+              </div>
+              <textarea id="packageImportText" class="codebox import-area" rows="7" placeholder="也可以把导出的 JSON 数据包粘贴到这里"></textarea>
+              <div class="button-row">
+                <button id="importPackageMergeBtn" class="secondary">合并导入</button>
+                <button id="importPackageReplaceBtn" class="danger">覆盖导入</button>
+              </div>
+            </section>
+          </div>
         </div>
 
         <div class="section-heading">

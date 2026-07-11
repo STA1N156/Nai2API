@@ -3,6 +3,7 @@ import { enhanceSelects } from './select-ui.js';
 const state = {
   settings: null,
   token: localStorage.getItem('nai.userToken') || '',
+  userBalance: null,
   toastTimer: null,
   pollTimer: null,
   queueViewTimer: null,
@@ -11,6 +12,7 @@ const state = {
   resultHistory: [],
   resultHistoryIndex: -1,
   generating: false,
+  generationCount: 1,
   previewScale: 1,
   previewPanX: 0,
   previewPanY: 0,
@@ -18,7 +20,8 @@ const state = {
   previewDragged: false,
   previewLastX: 0,
   previewLastY: 0,
-  lastPreviewWheelAt: 0
+  lastPreviewWheelAt: 0,
+  convertingPrompt: false
 };
 
 const ids = [
@@ -33,6 +36,11 @@ const ids = [
   'mergeSourceToken',
   'mergeTokenBtn',
   'promptInput',
+  'promptConvertBtn',
+  'promptConvertModal',
+  'promptConvertInput',
+  'promptConvertSubmitBtn',
+  'closePromptConvertBtn',
   'artistPresetInput',
   'artistInput',
   'samplerInput',
@@ -42,6 +50,7 @@ const ids = [
   'cfgInput',
   'negativeInput',
   'directGenerateBtn',
+  'generationCountControl',
   'copySnippetTopBtn',
   'imageFrame',
   'jobText',
@@ -162,7 +171,16 @@ function bindEvents() {
   el.saveTokenBtn.addEventListener('click', saveToken);
   el.toggleMergeBtn.addEventListener('click', () => setMergePanelOpen(el.mergeFields.hidden));
   el.mergeTokenBtn.addEventListener('click', mergeTokenBalance);
+  el.promptConvertBtn.addEventListener('click', openPromptConvert);
+  el.promptConvertSubmitBtn.addEventListener('click', convertPrompt);
+  el.closePromptConvertBtn.addEventListener('click', closePromptConvert);
+  el.promptConvertModal.addEventListener('click', (event) => {
+    if (event.target === el.promptConvertModal) closePromptConvert();
+  });
   el.directGenerateBtn.addEventListener('click', startJob);
+  el.generationCountControl.querySelectorAll('[data-generation-count]').forEach((button) => {
+    button.addEventListener('click', () => setGenerationCount(button.dataset.generationCount));
+  });
   el.copySnippetTopBtn.addEventListener('click', () => copyText(buildSnippet(), '嵌入代码已复制'));
   el.imageFrame.addEventListener('click', handleResultPreview);
   el.resultPreviewImage.addEventListener('click', toggleResultZoom);
@@ -186,6 +204,7 @@ function bindEvents() {
   });
   document.addEventListener('keydown', (event) => {
     if (event.key === 'Escape' && !el.resultPreview.classList.contains('hidden')) closeResultPreview();
+    if (event.key === 'Escape' && !el.promptConvertModal.classList.contains('hidden')) closePromptConvert();
   });
 
   [
@@ -204,6 +223,59 @@ function bindEvents() {
     syncArtistPresetSelection();
     updateUrlOutputs();
   });
+}
+
+function openPromptConvert() {
+  if (!state.settings?.promptApi?.configured) {
+    showToast('管理员尚未配置提示词 API', true);
+    return;
+  }
+  if (!el.userToken.value.trim()) {
+    showToast('请先连接密钥', true);
+    return;
+  }
+  el.promptConvertModal.classList.remove('hidden');
+  document.documentElement.classList.add('modal-open');
+  document.body.classList.add('modal-open');
+  requestAnimationFrame(() => el.promptConvertInput.focus());
+}
+
+function closePromptConvert() {
+  if (state.convertingPrompt) return;
+  el.promptConvertModal.classList.add('hidden');
+  document.documentElement.classList.remove('modal-open');
+  document.body.classList.remove('modal-open');
+}
+
+async function convertPrompt() {
+  const prompt = el.promptConvertInput.value.trim();
+  if (!prompt) {
+    showToast('请先输入中文画面描述', true);
+    el.promptConvertInput.focus();
+    return;
+  }
+
+  state.convertingPrompt = true;
+  el.promptConvertSubmitBtn.disabled = true;
+  el.promptConvertSubmitBtn.textContent = '正在转换...';
+  try {
+    const result = await api('/api/prompt/convert', {
+      method: 'POST',
+      body: { prompt, token: el.userToken.value.trim() },
+      timeoutMs: 60000
+    });
+    el.promptInput.value = result.prompt;
+    updateUrlOutputs();
+    state.convertingPrompt = false;
+    closePromptConvert();
+    showToast('已转换为 NAI 提示词');
+  } catch (error) {
+    showToast(error.message, true);
+  } finally {
+    state.convertingPrompt = false;
+    el.promptConvertSubmitBtn.disabled = false;
+    el.promptConvertSubmitBtn.textContent = '转换并填入';
+  }
 }
 
 function populateArtistPresetOptions() {
@@ -240,12 +312,14 @@ async function saveToken() {
     localStorage.setItem('nai.userToken', state.token);
     updateUrlOutputs();
     if (!state.token) {
+      state.userBalance = null;
       el.balanceText.textContent = '尚未连接';
       el.tokenStatusDot.classList.remove('connected');
       return;
     }
     await loadMe();
   } catch (error) {
+    state.userBalance = null;
     el.balanceText.textContent = '连接失败';
     el.tokenStatusDot.classList.remove('connected');
     showToast(error.message, true);
@@ -255,6 +329,7 @@ async function saveToken() {
 async function loadMe() {
   if (!state.token) return;
   const user = await api(`/api/me?token=${encodeURIComponent(state.token)}`);
+  state.userBalance = Number(user.balance);
   el.balanceText.textContent = `${user.balance} 点可用`;
   el.tokenStatusDot.classList.add('connected');
 }
@@ -284,6 +359,7 @@ async function mergeTokenBalance() {
       body: { token: sourceToken, targetToken }
     });
     state.token = result.target.token;
+    state.userBalance = Number(result.target.balance);
     el.userToken.value = state.token;
     el.mergeSourceToken.value = '';
     setMergePanelOpen(false);
@@ -400,6 +476,15 @@ async function directGenerate() {
 
 async function startJob() {
   if (state.generating) return;
+  const currentToken = el.userToken.value.trim();
+  if (state.token === currentToken && Number.isFinite(state.userBalance) && state.userBalance < totalGenerationCost()) {
+    showToast(`当前额度不足，需要 ${totalGenerationCost()} 点`, true);
+    return;
+  }
+  if (state.generationCount > 1) {
+    await startBatchJobs(state.generationCount);
+    return;
+  }
   setGenerateBusy(true);
   renderLoadingFrame();
   clearInterval(state.pollTimer);
@@ -407,21 +492,7 @@ async function startJob() {
     const params = collectParams();
     const job = await api('/api/jobs', {
       method: 'POST',
-      body: {
-        token: params.token,
-        tag: params.tag,
-        model: params.model,
-        artist: params.artist,
-        size: params.size,
-        cost: params.cost,
-        steps: Number(params.steps),
-        scale: Number(params.scale),
-        cfg: Number(params.cfg),
-        sampler: params.sampler,
-        negative: params.negative,
-        nocache: '1',
-        noise_schedule: params.noise_schedule
-      }
+      body: jobRequestBody(params)
     });
     resetQueueView(job);
     el.jobText.textContent = jobStatusText(job);
@@ -434,6 +505,82 @@ async function startJob() {
     setGenerateBusy(false);
     showToast(error.message, true);
   }
+}
+
+async function startBatchJobs(count) {
+  setGenerateBusy(true);
+  clearInterval(state.pollTimer);
+  renderBatchLoading(count);
+  const params = collectParams();
+  const results = await Promise.allSettled(
+    Array.from({ length: count }, (_, index) => runBatchJob(index, params))
+  );
+  const completed = results.filter((result) => result.status === 'fulfilled').length;
+  const failed = count - completed;
+  el.imageFrame.classList.remove('loading');
+  el.imageFrame.classList.add('result-ready', 'batch-ready');
+  el.jobText.textContent = failed ? `${completed} 张完成 · ${failed} 张失败` : `${completed} 张已完成`;
+  await loadMe().catch(() => {});
+  setGenerateBusy(false);
+  showToast(failed ? `${completed} 张生成成功，${failed} 张失败` : `${completed} 张图片已生成`, failed > 0);
+}
+
+async function runBatchJob(index, params) {
+  try {
+    updateBatchCard(index, '正在提交', 0);
+    const job = await api('/api/jobs', {
+      method: 'POST',
+      body: jobRequestBody(params)
+    });
+    updateBatchJobStatus(index, job);
+    return await pollBatchJob(job.id, index, params.token);
+  } catch (error) {
+    renderBatchError(index, error.message || '生成失败');
+    throw error;
+  }
+}
+
+async function pollBatchJob(id, index, token) {
+  while (state.generating) {
+    let job;
+    try {
+      job = await api(`/api/jobs/${id}?token=${encodeURIComponent(token)}`);
+    } catch (error) {
+      if (error.status >= 500 || /Unexpected end of JSON input/i.test(error.message)) {
+        updateBatchCard(index, '连接重试中');
+        await wait(jobPollIntervalMs);
+        continue;
+      }
+      throw error;
+    }
+
+    updateBatchJobStatus(index, job);
+    if (job.status === 'done') {
+      renderBatchImage(index, job.imageUrl);
+      return job.imageUrl;
+    }
+    if (job.status === 'failed') throw new Error(job.error || '任务失败');
+    await wait(jobPollIntervalMs);
+  }
+  throw new Error('生成已停止');
+}
+
+function jobRequestBody(params) {
+  return {
+    token: params.token,
+    tag: params.tag,
+    model: params.model,
+    artist: params.artist,
+    size: params.size,
+    cost: params.cost,
+    steps: Number(params.steps),
+    scale: Number(params.scale),
+    cfg: Number(params.cfg),
+    sampler: params.sampler,
+    negative: params.negative,
+    nocache: '1',
+    noise_schedule: params.noise_schedule
+  };
 }
 
 async function pollJob(id) {
@@ -475,7 +622,7 @@ function renderLoadingFrame() {
   clearQueueView();
   closeResultPreview();
   el.jobText.textContent = '生成中';
-  el.imageFrame.classList.remove('result-ready');
+  el.imageFrame.classList.remove('result-ready', 'batch-ready', 'batch-mode', 'batch-landscape');
   el.imageFrame.classList.add('loading');
   el.imageFrame.innerHTML = `<div class="loading-state" role="status" aria-live="polite">
     <div class="loading-orbit" aria-hidden="true"></div>
@@ -492,6 +639,77 @@ function renderLoadingFrame() {
       <span>等待成图</span>
     </div>
   </div>`;
+}
+
+function renderBatchLoading(count) {
+  clearQueueView();
+  closeResultPreview();
+  el.jobText.textContent = `0 / ${count} 完成`;
+  el.imageFrame.classList.remove('result-ready', 'batch-ready');
+  el.imageFrame.classList.add('loading', 'batch-mode');
+  el.imageFrame.classList.toggle('batch-landscape', el.sizeInput.value.includes('横图'));
+  el.imageFrame.innerHTML = `<div class="batch-result-grid" aria-live="polite">
+    ${Array.from({ length: count }, (_, index) => `<article class="batch-result-card is-loading" data-batch-index="${index}">
+      <div class="batch-card-state">
+        <div class="batch-card-orbit" aria-hidden="true"></div>
+        <strong class="batch-card-number">${String(index + 1).padStart(2, '0')}</strong>
+        <span class="batch-card-status">等待提交</span>
+        <div class="batch-card-progress" role="progressbar" aria-label="图片 ${index + 1} 生成进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span></span></div>
+      </div>
+    </article>`).join('')}
+  </div>`;
+}
+
+function updateBatchJobStatus(index, job) {
+  if (job.status === 'queued') {
+    const position = Number(job.queuePosition || 0);
+    const total = Number(job.queuedCount || 0);
+    updateBatchCard(index, position && total ? `排队中 · ${position} / ${total}` : '等待可用账号', 0);
+    return;
+  }
+  if (job.status === 'running') {
+    updateBatchCard(index, '', clampGenerationPercent(job.generationProgress?.percent));
+  }
+}
+
+function updateBatchCard(index, status, progress) {
+  const card = el.imageFrame.querySelector(`[data-batch-index="${index}"]`);
+  if (!card) return;
+  const statusText = card.querySelector('.batch-card-status');
+  const progressBar = card.querySelector('.batch-card-progress');
+  const bar = progressBar?.querySelector('span');
+  if (statusText) statusText.textContent = status;
+  if (progress !== undefined) {
+    const percent = Math.round(clampGenerationPercent(progress));
+    if (bar) bar.style.width = `${percent}%`;
+    if (progressBar) progressBar.setAttribute('aria-valuenow', String(percent));
+  }
+}
+
+function renderBatchImage(index, src) {
+  const card = el.imageFrame.querySelector(`[data-batch-index="${index}"]`);
+  if (!card) return;
+  pushResultHistory(src);
+  card.className = 'batch-result-card is-done';
+  card.innerHTML = `<button class="result-image-button batch-image-button" type="button" aria-label="放大预览图片 ${index + 1}">
+    <img src="${src}" alt="生成图片 ${index + 1}">
+    <span class="batch-image-index">${String(index + 1).padStart(2, '0')}</span>
+  </button>`;
+  updateBatchCompletedText();
+}
+
+function renderBatchError(index, message) {
+  const card = el.imageFrame.querySelector(`[data-batch-index="${index}"]`);
+  if (!card) return;
+  card.className = 'batch-result-card is-failed';
+  card.innerHTML = `<div class="batch-card-error"><strong class="batch-card-number">${String(index + 1).padStart(2, '0')}</strong><span></span></div>`;
+  card.querySelector('.batch-card-error span').textContent = message;
+}
+
+function updateBatchCompletedText() {
+  const total = el.imageFrame.querySelectorAll('.batch-result-card').length;
+  const completed = el.imageFrame.querySelectorAll('.batch-result-card.is-done').length;
+  el.jobText.textContent = `${completed} / ${total} 完成`;
 }
 
 function updateLoadingStatus(job) {
@@ -673,13 +891,13 @@ function clearQueueView() {
 }
 
 function renderFrameNotice(message, isError = false) {
-  el.imageFrame.classList.remove('result-ready', 'loading');
+  el.imageFrame.classList.remove('result-ready', 'loading', 'batch-ready', 'batch-mode', 'batch-landscape');
   el.imageFrame.innerHTML = `<span class="${isError ? 'frame-error' : ''}">${message}</span>`;
 }
 
 function renderResultImage(src) {
   pushResultHistory(src);
-  el.imageFrame.classList.remove('loading');
+  el.imageFrame.classList.remove('loading', 'batch-ready', 'batch-mode', 'batch-landscape');
   el.imageFrame.classList.add('result-ready');
   el.imageFrame.innerHTML = `<button class="result-image-button" type="button" aria-label="放大预览生成图片"><img src="${src}" alt="生成图片"></button>`;
 }
@@ -825,7 +1043,7 @@ function jobStatusText(job) {
   if (job.status === 'running') return '生成中';
   if (job.status === 'done') return '生成完成';
   if (job.status === 'failed') return '生成失败';
-  return job.status || '等待请求';
+  return job.status || '';
 }
 
 function queueStatusText(position, count) {
@@ -845,16 +1063,38 @@ function queueLoadingText(position, count) {
 function setGenerateBusy(isBusy) {
   state.generating = isBusy;
   el.directGenerateBtn.disabled = isBusy;
-  el.directGenerateBtn.textContent = isBusy ? '生成中...' : `生成图片（${generationCost()}点）`;
+  el.generationCountControl.querySelectorAll('button').forEach((button) => {
+    button.disabled = isBusy;
+  });
+  el.directGenerateBtn.textContent = isBusy ? '生成中...' : `生成图片（${totalGenerationCost()}点）`;
 }
 
 function updateGenerateCostLabel() {
-  el.directGenerateBtn.textContent = `生成图片（${generationCost()}点）`;
+  el.directGenerateBtn.textContent = `生成图片（${totalGenerationCost()}点）`;
+}
+
+function setGenerationCount(value) {
+  const count = [1, 2, 4].includes(Number(value)) ? Number(value) : 1;
+  state.generationCount = count;
+  el.generationCountControl.querySelectorAll('[data-generation-count]').forEach((button) => {
+    const selected = Number(button.dataset.generationCount) === count;
+    button.classList.toggle('selected', selected);
+    button.setAttribute('aria-pressed', String(selected));
+  });
+  updateGenerateCostLabel();
+}
+
+function totalGenerationCost() {
+  return generationCost() * state.generationCount;
 }
 
 function generationCost() {
   const selected = sizeOptions.find((option) => option.value === el.sizeInput.value);
   return selected?.cost || 1;
+}
+
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function api(path, options = {}) {

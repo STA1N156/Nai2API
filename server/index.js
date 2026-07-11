@@ -5,6 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { JsonStore, MAX_CACHE_IMAGES_LIMIT, createId, createPublicToken, defaultArtist2_5D, hashObject, legacyDefaultArtist, maskToken, normalizeDb } from './store.js';
 import { DIRECT_URL_MAX_STEPS, buildErrorImage, fetchNovelAiAccountQuota, generateNovelAiImage, normalizeNovelAiRequest, sizeCostMap } from './providers.js';
+import { adminPromptApiConfig, convertChinesePrompt, fetchPromptApiModels, isPromptApiConfigured, normalizePromptApiConfig, publicPromptApiConfig } from './prompt-api.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, '..');
@@ -172,7 +173,16 @@ async function route(req, res) {
 
   if (method === 'GET' && url.pathname === '/api/settings') {
     const settings = await store.readSettings();
-    sendJson(res, 200, settings);
+    sendJson(res, 200, publicRuntimeSettings(settings));
+    return;
+  }
+
+  if (method === 'POST' && url.pathname === '/api/prompt/convert') {
+    const body = await readJson(req);
+    const db = await store.readCollections(['settings', 'users']);
+    getUserOrThrow(db, String(body.token || tokenFrom(req, url) || '').trim());
+    const prompt = await convertChinesePrompt(db.settings.promptApi, body.prompt);
+    sendJson(res, 200, { prompt });
     return;
   }
 
@@ -205,7 +215,7 @@ async function route(req, res) {
     trimmedImages = await store.trimImageCache(settings.maxCacheImages, { force: true });
     await removeStoredImages(trimmedImages);
     scheduleQueueDrain();
-    sendJson(res, 200, settings);
+    sendJson(res, 200, adminRuntimeSettings(settings));
     return;
   }
 
@@ -275,7 +285,7 @@ async function route(req, res) {
     const accountStats1h = db.accountStats1h || Object.fromEntries(accountStatsMapSince(statsJobs, 60 * 60 * 1000));
     const queueDb = { ...db, jobs: queueJobs };
     const payload = {
-      settings: db.settings,
+      settings: adminRuntimeSettings(db.settings),
       cards: db.cards.map(publicCard),
       users: publicAdminUsers(db.users),
       accounts: db.accounts.map((account) => publicAccount(account, {
@@ -313,6 +323,44 @@ async function route(req, res) {
   if (method === 'GET' && url.pathname === '/api/admin/ping') {
     assertAdmin(req, url);
     sendJson(res, 200, { ok: true });
+    return;
+  }
+
+  if (method === 'GET' && url.pathname === '/api/admin/prompt-api') {
+    assertAdmin(req, url);
+    const settings = await store.readSettings();
+    sendJson(res, 200, adminPromptApiConfig(settings.promptApi));
+    return;
+  }
+
+  if (method === 'POST' && url.pathname === '/api/admin/prompt-api/models') {
+    assertAdmin(req, url);
+    const body = await readJson(req);
+    const settings = await store.readSettings();
+    const current = normalizePromptApiConfig(settings.promptApi);
+    const models = await fetchPromptApiModels({
+      baseUrl: body.baseUrl ?? current.baseUrl,
+      apiKey: String(body.apiKey || '').trim() || current.apiKey
+    });
+    sendJson(res, 200, { models });
+    return;
+  }
+
+  if (method === 'PUT' && url.pathname === '/api/admin/prompt-api') {
+    assertAdmin(req, url);
+    const body = await readJson(req);
+    const settings = await store.readSettings();
+    const current = normalizePromptApiConfig(settings.promptApi);
+    const promptApi = normalizePromptApiConfig({
+      baseUrl: body.baseUrl ?? current.baseUrl,
+      apiKey: String(body.apiKey || '').trim() || current.apiKey,
+      model: body.model ?? current.model
+    });
+    if (!isPromptApiConfigured(promptApi)) throw httpError(400, '请填写 API 地址、密钥并选择模型');
+    await store.update((db) => {
+      db.settings.promptApi = promptApi;
+    }, { collections: ['settings'] });
+    sendJson(res, 200, adminPromptApiConfig(promptApi));
     return;
   }
 
@@ -3630,6 +3678,20 @@ function mergeById(current, incoming) {
     map.set(key, { ...map.get(key), ...item, id: key });
   });
   return Array.from(map.values());
+}
+
+function publicRuntimeSettings(settings = {}) {
+  return {
+    ...settings,
+    promptApi: publicPromptApiConfig(settings.promptApi)
+  };
+}
+
+function adminRuntimeSettings(settings = {}) {
+  return {
+    ...settings,
+    promptApi: adminPromptApiConfig(settings.promptApi)
+  };
 }
 
 function collectValues(value) {
