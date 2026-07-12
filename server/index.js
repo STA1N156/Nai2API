@@ -5,7 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { JsonStore, MAX_CACHE_IMAGES_LIMIT, createId, createPublicToken, defaultArtist2_5D, hashObject, legacyDefaultArtist, maskToken, normalizeDb } from './store.js';
 import { DIRECT_URL_MAX_STEPS, buildErrorImage, fetchNovelAiAccountQuota, generateNovelAiImage, normalizeNovelAiRequest, sizeCostMap } from './providers.js';
-import { adminPromptApiConfig, convertChinesePrompt, fetchPromptApiModels, isPromptApiConfigured, normalizePromptApiConfig, publicPromptApiConfig } from './prompt-api.js';
+import { adminPromptApiConfig, convertChinesePrompt, fetchPromptApiModels, isPromptApiConfigured, normalizePromptApiConfig, promptApiModel, publicPromptApiConfig, repairImage } from './prompt-api.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, '..');
@@ -21,6 +21,7 @@ let queueDraining = false;
 let queueDrainRequested = false;
 const jobWaiters = new Map();
 const runningJobControls = new Map();
+const imageRepairTasks = new Map();
 const directGenerateTimeoutMs = Number(process.env.DIRECT_GENERATE_TIMEOUT_MS || 60_000);
 const openAiChatTimeoutMs = Number(process.env.OPENAI_CHAT_TIMEOUT_MS || 10 * 60_000);
 const openAiQueuePollMs = 650;
@@ -572,6 +573,24 @@ async function route(req, res) {
     if (!job) throw httpError(404, 'job not found.');
     if (job.userToken !== token && !isAdmin(req, url)) throw httpError(403, 'forbidden.');
     sendJson(res, 200, publicJob(job, snapshot));
+    return;
+  }
+
+  if (method === 'POST' && url.pathname.startsWith('/api/images/') && url.pathname.endsWith('/optimize')) {
+    const id = decodeURIComponent(url.pathname.split('/').at(-2) || '');
+    const body = await readJson(req);
+    const token = String(body.token || tokenFrom(req, url) || '').trim();
+    const image = await optimizeStoredImage(id, token);
+    sendJson(res, 200, { image: publicImage(image) });
+    return;
+  }
+
+  if (method === 'GET' && url.pathname.startsWith('/api/images/') && url.pathname.endsWith('/optimized')) {
+    const id = decodeURIComponent(url.pathname.split('/').at(-2) || '');
+    const token = tokenFrom(req, url);
+    const source = await ownedStoredImage(id, token);
+    const image = await store.findImageByCacheKey(`repair:${source.id}`);
+    sendJson(res, 200, { image: image ? publicImage(image) : null });
     return;
   }
 
@@ -3034,6 +3053,78 @@ function exportMigrationData(db) {
   };
 }
 
+async function optimizeStoredImage(id, token) {
+  const [source, settings] = await Promise.all([
+    ownedStoredImage(id, token),
+    store.readSettings()
+  ]);
+  if (source.optimizedFrom) throw httpError(409, '这张图片已经优化过了。');
+
+  const cacheKey = `repair:${source.id}`;
+  const cached = await store.findImageByCacheKey(cacheKey);
+  if (cached) return cached;
+  if (imageRepairTasks.has(source.id)) return imageRepairTasks.get(source.id);
+
+  const task = (async () => {
+    const original = await readStoredImage(source);
+    const repaired = await repairImage(settings.promptApi, {
+      buffer: original,
+      mimeType: source.mimeType,
+      width: source.width,
+      height: source.height
+    });
+    const imageId = createId('img');
+    const imageFile = await writeStoredImage(imageId, repaired);
+    const dimensions = pngDimensions(repaired.buffer) || { width: source.width, height: source.height };
+    try {
+      const saved = await store.update((db) => {
+        const image = {
+          ...source,
+          id: imageId,
+          accountId: '',
+          cacheKey,
+          model: promptApiModel,
+          width: dimensions.width,
+          height: dimensions.height,
+          cost: 0,
+          accountCost: 0,
+          mimeType: repaired.mimeType,
+          file: imageFile,
+          optimizedFrom: source.id,
+          createdAt: new Date().toISOString()
+        };
+        delete image.base64;
+        db.images.unshift(image);
+        return image;
+      }, { dirtyRows: (image) => ({ images: [image.id] }) });
+      const trimmed = await store.trimImageCache(null, { batchSize: imageCacheTrimBuffer() });
+      await removeStoredImages(trimmed);
+      return saved;
+    } catch (error) {
+      await removeStoredImages([{ id: imageId, file: imageFile }]);
+      throw error;
+    }
+  })();
+
+  imageRepairTasks.set(source.id, task);
+  try {
+    return await task;
+  } finally {
+    imageRepairTasks.delete(source.id);
+  }
+}
+
+async function ownedStoredImage(id, token) {
+  const [image, users] = await Promise.all([
+    store.findImage(id),
+    store.readCollections(['users'])
+  ]);
+  if (!image) throw httpError(404, 'image not found.');
+  getUserOrThrow(users, token);
+  if (image.token !== token) throw httpError(403, 'forbidden.');
+  return image;
+}
+
 async function writeStoredImage(id, image) {
   const imageFile = imageStorageName(id, image.mimeType);
   await writeFile(path.join(dataDir, imageFile), image.buffer);
@@ -3080,6 +3171,11 @@ function imageExtension(mimeType = '') {
   if (mimeType.includes('webp')) return 'webp';
   if (mimeType.includes('svg')) return 'svg';
   return 'png';
+}
+
+function pngDimensions(buffer) {
+  if (buffer.length < 24 || buffer.readUInt32BE(0) !== 0x89504e47 || buffer.toString('ascii', 12, 16) !== 'IHDR') return null;
+  return { width: buffer.readUInt32BE(16), height: buffer.readUInt32BE(20) };
 }
 
 function sanitizeMigrationData(payload) {
@@ -3468,6 +3564,7 @@ function publicImage(image) {
     routedSteps: image.routedSteps ?? image.requestedSteps ?? 0,
     cost: image.cost || 1,
     accountCost: image.accountCost || 0,
+    optimizedFrom: image.optimizedFrom || '',
     mock: Boolean(image.mock),
     mimeType: image.mimeType || '',
     createdAt: image.createdAt || ''

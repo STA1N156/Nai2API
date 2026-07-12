@@ -32,6 +32,26 @@ WEIGHTING
 
 For multiple characters, keep each character's appearance and actions unambiguous and adjacent. `;
 
+export const promptApiModel = 'gemini-3.1-flash-image';
+
+const imageRepairPrompt = `请对输入图片进行专业级 4K 修复与整体美化。输入图片是唯一的内容与风格参考。
+
+保留原图的主题、人物身份、角色特征、服装设计、画风、色彩倾向、镜头角度、画面比例和主要构图，不要无故改变人物或故事内容。
+
+全面检查并修复人体结构、姿势、关节、身体比例、手指、手脚、五官、头发、服饰以及物体结构错误；清除多余、缺失、融合、扭曲或互相穿透的肢体与物体。修复人物与背景粘连、物体悬空、遮挡错误、重复物体、透视错误、比例失衡、空间关系混乱、光影不统一、阴影与反射异常、材质不自然、模糊、噪点、压缩痕迹、涂抹感、断裂线条和细节缺失。
+
+必要时允许重新绘制或重构有问题的人体、手部、面部、服装、物体和局部场景，使结构正确自然，但重构范围应尽量小。如果原场景严重混乱，可以在保留主体、画面含义和整体风格的前提下重新组织背景、道具和空间关系，提升构图、层次与观感。
+
+将人体与背景修复列为最高优先级。人体必须符合可靠的骨架和肌肉连接关系，重点检查头身比、颈肩连接、胸腔与骨盆关系、肩胯方向、四肢长度、关节位置、手脚大小、重心、承重腿、接触点和动作受力，修正头大身小、躯干过长或过短、关节漂移、肢体粗细突变和不可能姿势。背景必须服务主体并具有清楚的前中后景，统一地平线、消失点、镜头高度、空间尺度、光源和阴影，让所有建筑、家具、道路、道具及装饰物具有合理结构、用途、摆放、支撑、接触和遮挡关系；必要时重构混乱背景，不保留没有意义的错误细节。
+
+补充合理的纹理、材质、环境细节、光影过渡和景深，使主体与背景自然融合。避免过度锐化、塑料质感、虚假纹理和杂乱细节。保持人物面部身份、发型、发色、瞳色、服装和主要配饰一致。写实图片保持自然真实，动漫或插画保持原有画风。
+
+消除明显的 AI 生成痕迹，让画面看起来像经过人工认真设计和修整的成品。主动清除塑料皮肤、蜡像质感、过度磨皮、假锐化、脏乱高频细节、无意义纹理、重复图案、融化结构、弯曲直线、伪文字、物体半融合、边缘光晕和局部精细度不一致。背景必须干净、和谐、有明确层次，避免元素无意义堆叠、重复、粘连和视觉噪音。头发应按头骨和发型自然生长，整理成方向明确、疏密有序的发束，修复乱线、断裂、粘连、穿插、融入背景、无来源碎发和意大利面状发丝，同时保留自然蓬松感与原有发型。
+
+对模糊区域进行保守合理的推断，不添加无关人物、文字、标志、水印、边框或装饰。最终输出干净、自然、结构正确、视觉和谐的 4K 成品，而不是简单放大。
+
+请先在内部分析整张图片，再完成修复。只输出修复后的图片，不输出说明、分析文字或对比图。`;
+
 export function normalizePromptApiConfig(value = {}) {
   return {
     baseUrl: normalizePromptApiBaseUrl(value.baseUrl || ''),
@@ -100,6 +120,48 @@ export async function fetchPromptApiModels(value, options = {}) {
   return models;
 }
 
+export async function repairImage(value, image, options = {}) {
+  const config = requirePromptApiCredentials(value);
+  const payload = await requestPromptApi(imageRepairEndpoint(config.baseUrl), {
+    method: 'POST',
+    apiKey: config.apiKey,
+    fetchImpl: options.fetchImpl,
+    serviceName: '图片优化 API',
+    sse: true,
+    timeoutMs: options.timeoutMs || 10 * 60_000,
+    body: {
+      contents: [{
+        role: 'user',
+        parts: [
+          { text: imageRepairPrompt },
+          { inlineData: { mimeType: image.mimeType || 'image/png', data: image.buffer.toString('base64') } }
+        ]
+      }],
+      generationConfig: {
+        candidateCount: 1,
+        responseModalities: ['IMAGE'],
+        imageConfig: {
+          aspectRatio: imageAspectRatio(image.width, image.height),
+          imageSize: '4K'
+        }
+      }
+    }
+  });
+  const part = imageResponseParts(payload).find((item) => item?.inlineData?.data || item?.inline_data?.data);
+  const inlineData = part?.inlineData || part?.inline_data;
+  if (!inlineData?.data) throw promptApiError(502, '图片优化 API 没有返回图片');
+  return {
+    mimeType: inlineData.mimeType || inlineData.mime_type || 'image/png',
+    buffer: Buffer.from(inlineData.data, 'base64')
+  };
+}
+
+export function imageAspectRatio(width, height) {
+  const ratio = Number(width || 0) / Number(height || 0);
+  if (!Number.isFinite(ratio) || Math.abs(ratio - 1) < 0.08) return '1:1';
+  return ratio > 1 ? '3:2' : '2:3';
+}
+
 export async function convertChinesePrompt(value, prompt, options = {}) {
   const config = normalizePromptApiConfig(value);
   if (!isPromptApiConfigured(config)) throw promptApiError(503, '管理员尚未完成提示词 API 配置');
@@ -129,6 +191,7 @@ export async function convertChinesePrompt(value, prompt, options = {}) {
 
 async function requestPromptApi(url, options = {}) {
   const fetchImpl = options.fetchImpl || fetch;
+  const serviceName = options.serviceName || '提示词 API';
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), options.timeoutMs || 15_000);
   try {
@@ -143,7 +206,7 @@ async function requestPromptApi(url, options = {}) {
       signal: controller.signal
     });
     const text = await response.text();
-    const payload = safeJson(text);
+    const payload = response.ok && options.sse ? parseSsePayload(text) : safeJson(text);
     if (!response.ok) {
       const detail = String(payload?.error?.message || payload?.message || '').trim();
       if (response.status === 401 || response.status === 403) throw promptApiError(502, 'API 密钥无效或没有权限');
@@ -153,8 +216,9 @@ async function requestPromptApi(url, options = {}) {
     return payload;
   } catch (error) {
     if (error?.statusCode) throw error;
-    if (error?.name === 'AbortError') throw promptApiError(504, '提示词 API 请求超时');
-    throw promptApiError(502, '无法连接提示词 API');
+    if (error?.name === 'AbortError') throw promptApiError(504, `${serviceName} 请求超时`);
+    const code = String(error?.cause?.code || error?.code || '').trim();
+    throw promptApiError(502, `无法连接${serviceName}${code ? `（${code}）` : ''}`);
   } finally {
     clearTimeout(timer);
   }
@@ -180,6 +244,26 @@ function promptApiContent(payload = {}) {
     .replace(/^(["'])|(["'])$/g, '')
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+function imageRepairEndpoint(baseUrl) {
+  const url = new URL(baseUrl);
+  return `${url.origin}/v1beta/models/${encodeURIComponent(promptApiModel)}:streamGenerateContent?alt=sse`;
+}
+
+function imageResponseParts(payload = {}) {
+  const response = payload.response || payload;
+  return response?.candidates?.[0]?.content?.parts || [];
+}
+
+function parseSsePayload(text) {
+  const parts = String(text || '')
+    .split(/\r?\n/)
+    .filter((line) => line.startsWith('data:'))
+    .map((line) => safeJson(line.slice(5).trim()))
+    .flatMap((payload) => payload?.candidates?.[0]?.content?.parts || []);
+  if (!parts.length) throw promptApiError(502, '图片含有NSFW内容，无法重构');
+  return { candidates: [{ content: { parts } }] };
 }
 
 function safeJson(text) {

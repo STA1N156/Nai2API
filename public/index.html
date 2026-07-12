@@ -155,8 +155,18 @@
       <button id="closeResultPreviewBtn" class="preview-close" type="button" aria-label="关闭预览">×</button>
       <button id="prevResultBtn" class="preview-nav preview-prev" type="button" aria-label="上一张">‹</button>
       <button id="nextResultBtn" class="preview-nav preview-next" type="button" aria-label="下一张">›</button>
-      <div class="preview-stage result-preview-stage">
+      <div id="resultPreviewStage" class="preview-stage result-preview-stage">
+        <div id="optimizeFluid" class="optimize-fluid" aria-hidden="true">
+          <canvas id="optimizeWaveCanvas"></canvas>
+          <strong>正在进行 4K 重构优化</strong>
+        </div>
         <img id="resultPreviewImage" alt="生成图片预览" />
+        <img id="comparisonPreviewImage" class="comparison-preview-image" alt="" aria-hidden="true" />
+        <div id="comparisonSlider" class="comparison-slider" hidden>
+          <span class="comparison-divider"><b aria-hidden="true">↔</b></span>
+          <input id="comparisonRange" type="range" min="0" max="100" value="20" aria-label="拖动查看优化前后对比" />
+        </div>
+        <button id="optimizeImageBtn" class="preview-optimize-button" type="button">重构优化</button>
       </div>
     </div>
 
