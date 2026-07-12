@@ -1164,7 +1164,7 @@ function stopOptimizeWave() {
 
 function toggleResultZoom(event) {
   event.stopPropagation();
-  if (state.previewOptimizedUrl) return;
+  if (state.optimizing || state.previewOptimizedUrl) return;
   if (state.previewDragged) {
     state.previewDragged = false;
     return;
@@ -1173,7 +1173,7 @@ function toggleResultZoom(event) {
 }
 
 function handlePreviewWheel(event) {
-  if (state.previewOptimizedUrl || isCoarsePointer() || el.resultPreview.classList.contains('hidden')) return;
+  if (state.optimizing || state.previewOptimizedUrl || isCoarsePointer() || el.resultPreview.classList.contains('hidden')) return;
   event.preventDefault();
   const now = performance.now();
   if (now - state.lastPreviewWheelAt < 22) return;
@@ -1197,7 +1197,7 @@ function setPreviewScale(value) {
 }
 
 function startPreviewDrag(event) {
-  if (state.previewOptimizedUrl || state.previewScale <= 1.01 || isCoarsePointer()) return;
+  if (state.optimizing || state.previewOptimizedUrl || state.previewScale <= 1.01 || isCoarsePointer()) return;
   event.preventDefault();
   state.previewDragging = true;
   state.previewDragged = false;
