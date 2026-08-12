@@ -565,6 +565,26 @@ async function route(req, res) {
     return;
   }
 
+  if (method === 'GET' && /^\/api\/jobs\/[^/]+\/content$/.test(url.pathname)) {
+    const id = decodeURIComponent(url.pathname.split('/').at(-2) || '');
+    const token = tokenFrom(req, url);
+    const snapshot = await store.findJobContext(id);
+    const job = snapshot?.job;
+    if (!job) throw httpError(404, 'job not found.');
+    if (job.userToken !== token && !isAdmin(req, url)) throw httpError(403, 'forbidden.');
+    if (job.status === 'done' && job.imageId) {
+      const image = await store.findImage(job.imageId);
+      if (image) {
+        await sendStoredImage(res, 200, image);
+        return;
+      }
+    }
+    if (job.status !== 'failed') throw httpError(409, 'job is not finished.');
+    const image = buildErrorImage(job.error || 'Generation failed');
+    sendImage(res, 200, image.mimeType, image.buffer, { 'x-error': '1' });
+    return;
+  }
+
   if (method === 'GET' && url.pathname.startsWith('/api/jobs/')) {
     const id = decodeURIComponent(url.pathname.split('/').pop() || '');
     const token = tokenFrom(req, url);
@@ -1931,10 +1951,32 @@ function mergeDirtyRows(target, source = {}) {
 
 async function createJob(token, body, options = {}) {
   await cleanupStaleActiveJobs('create job');
+  if (!isNoCache(body.nocache)) {
+    const settings = await store.readSettings();
+    const request = normalizeNovelAiRequest(body, settings, { maxSteps: DIRECT_URL_MAX_STEPS });
+    const cacheKey = requestCacheKey(token, request, body.seed);
+    const cached = await store.findImageByCacheKey(cacheKey);
+    if (cached) {
+      return createDirectJob(token, request, cacheKey, {
+        status: 'done',
+        accountId: cached.accountId || '',
+        imageId: cached.id,
+        cost: 0
+      });
+    }
+  }
   return store.update((db) => {
     const user = getUserOrThrow(db, token);
     const request = normalizeNovelAiRequest(body, db.settings, { maxSteps: DIRECT_URL_MAX_STEPS });
     const cacheKey = requestCacheKey(token, request, body.seed);
+    if (!isNoCache(body.nocache)) {
+      const activeMatch = db.jobs.find((job) => (
+        job.userToken === token
+        && job.cacheKey === cacheKey
+        && ['queued', 'running'].includes(job.status)
+      ));
+      if (activeMatch) return activeMatch;
+    }
     const cost = generationCost(request);
     const accountCost = accountGenerationCost(request);
     if (user.balance < cost) throw httpError(402, insufficientBalanceMessage);
