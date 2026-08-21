@@ -39,6 +39,10 @@ const openAiSamplers = [
   'k_dpmpp_2m',
   'k_dpmpp_sde'
 ];
+const openAiImageModels = [
+  { id: 'nai-diffusion-4-5-full', cost: 1 },
+  { id: 'nai-diffusion-5-full', cost: 5 }
+];
 const openAiSizeTiers = {
   '2K': {
     label: '[2K]',
@@ -737,22 +741,22 @@ function openAiModelsResponse() {
   return {
     object: 'list',
     data: [
-      ...openAiSamplers.map((sampler) => ({
-        id: `nai-diffusion-4-5-full:${sampler}`,
+      ...openAiImageModels.flatMap((model) => openAiSamplers.map((sampler) => ({
+        id: `${model.id}:${sampler}`,
         object: 'model',
         created,
         owned_by: 'nai2api',
-        cost: 1,
+        cost: model.cost,
         resolution_tier: 'standard'
-      })),
-      ...Object.entries(openAiSizeTiers).flatMap(([tierName, tier]) => openAiSamplers.map((sampler) => ({
-        id: `${tier.label}nai-diffusion-4-5-full:${sampler}`,
+      }))),
+      ...Object.entries(openAiSizeTiers).flatMap(([tierName, tier]) => openAiImageModels.flatMap((model) => openAiSamplers.map((sampler) => ({
+        id: `${tier.label}${model.id}:${sampler}`,
         object: 'model',
         created,
         owned_by: 'nai2api',
-        cost: tier.cost,
+        cost: Math.max(tier.cost, model.cost),
         resolution_tier: tierName
-      })))
+      }))))
     ]
   };
 }
@@ -782,7 +786,7 @@ function parseOpenAiImageRequest(body = {}, settings = {}) {
     negative,
     nocache: nai.nocache ?? body.nocache ?? '1',
     noise_schedule: nai.noise_schedule ?? nai.noiseSchedule ?? settings.defaults?.noiseSchedule ?? 'karras',
-    cost: modelParts.tier?.cost ?? generationCost()
+    cost: modelParts.tier?.cost ?? modelGenerationCost(modelParts.model)
   };
 
   return {
@@ -1214,6 +1218,9 @@ async function addAccount(body) {
       quotaFixed: null,
       quotaPurchased: null,
       quotaTier: null,
+      v5UsagePercent: null,
+      v5UsageIsNegative: false,
+      v5UsageTimeUntilNextPercent: null,
       quotaCheckedAt: '',
       quotaError: '',
       cooldownUntil: '',
@@ -1248,6 +1255,9 @@ async function importAccounts(body) {
       quotaFixed: numberOrNull(account.quotaFixed),
       quotaPurchased: numberOrNull(account.quotaPurchased),
       quotaTier: account.quotaTier ?? null,
+      v5UsagePercent: numberOrNull(account.v5UsagePercent),
+      v5UsageIsNegative: Boolean(account.v5UsageIsNegative),
+      v5UsageTimeUntilNextPercent: numberOrNull(account.v5UsageTimeUntilNextPercent),
       quotaCheckedAt: account.quotaCheckedAt || '',
       quotaError: account.quotaError || '',
       cooldownUntil: '',
@@ -1458,6 +1468,9 @@ function accountQuotaResult(id, quota, now) {
     quotaFixed: quota.fixed,
     quotaPurchased: quota.purchased,
     quotaTier: quota.tier,
+    v5UsagePercent: quota.v5UsagePercent,
+    v5UsageIsNegative: quota.v5UsageIsNegative,
+    v5UsageTimeUntilNextPercent: quota.v5UsageTimeUntilNextPercent,
     quotaCheckedAt: now,
     quotaError: '',
     disableAccount: noSubscription,
@@ -1476,6 +1489,9 @@ function accountQuotaErrorResult(id, error, now) {
     quotaFixed: null,
     quotaPurchased: null,
     quotaTier: null,
+    v5UsagePercent: null,
+    v5UsageIsNegative: false,
+    v5UsageTimeUntilNextPercent: null,
     quotaCheckedAt: now,
     quotaError: publicErrorMessage(message),
     disableAccount: banned || outOfTrial,
@@ -1488,6 +1504,9 @@ function applyAccountQuotaResult(account, result, now) {
   account.quotaFixed = result.quotaFixed;
   account.quotaPurchased = result.quotaPurchased;
   account.quotaTier = result.quotaTier;
+  account.v5UsagePercent = result.v5UsagePercent;
+  account.v5UsageIsNegative = result.v5UsageIsNegative;
+  account.v5UsageTimeUntilNextPercent = result.v5UsageTimeUntilNextPercent;
   account.quotaCheckedAt = result.quotaCheckedAt;
   account.quotaError = result.quotaError;
   if (result.ok) account.cooldownUntil = '';
@@ -1525,7 +1544,12 @@ function accountTestMessage(result, availability) {
   if (result.disableAccount && !result.ok) return `测试失败：${result.disableReason || '账号不可用'}，已自动禁用`;
   if (!result.ok) return `测试失败：${result.quotaError || '账号不可用'}`;
   const quotaText = availability.quotaPoints === null ? '点数未知' : `剩余 ${availability.quotaPoints} 点`;
-  const accountText = `${quotaText}，${accountTierText(result.quotaTier, '会员未知')}`;
+  const v5UsageText = result.v5UsagePercent === null
+    ? 'V5额度未知'
+    : result.v5UsageIsNegative
+      ? 'V5额度已耗尽'
+      : `V5剩余 ${result.v5UsagePercent}%`;
+  const accountText = `${quotaText}，${accountTierText(result.quotaTier, '会员未知')}，${v5UsageText}`;
   if (result.disableAccount) return `测试通过：${result.disableReason || '账号不可用'}，已自动禁用（${accountText}）`;
   if (!availability.enabled) return `测试通过：Token 有效，但这个账号已禁用（${accountText}）`;
   if (availability.coolingDown) return `测试通过：Token 有效，但账号正在冷却中（${accountText}）`;
@@ -3051,6 +3075,9 @@ function publicAccount(account, options = {}) {
     quotaPurchased: account.quotaPurchased ?? null,
     quotaTier: account.quotaTier ?? null,
     quotaTierText: accountTierText(account.quotaTier),
+    v5UsagePercent: account.v5UsagePercent ?? null,
+    v5UsageIsNegative: Boolean(account.v5UsageIsNegative),
+    v5UsageTimeUntilNextPercent: account.v5UsageTimeUntilNextPercent ?? null,
     quotaCheckedAt: account.quotaCheckedAt || '',
     quotaError: account.quotaError || '',
     cooldownUntil: account.cooldownUntil || '',
@@ -3074,6 +3101,9 @@ function exportAccount(account) {
     quotaFixed: account.quotaFixed ?? null,
     quotaPurchased: account.quotaPurchased ?? null,
     quotaTier: account.quotaTier ?? null,
+    v5UsagePercent: account.v5UsagePercent ?? null,
+    v5UsageIsNegative: Boolean(account.v5UsageIsNegative),
+    v5UsageTimeUntilNextPercent: account.v5UsageTimeUntilNextPercent ?? null,
     quotaCheckedAt: account.quotaCheckedAt || '',
     quotaError: account.quotaError || '',
     createdAt: account.createdAt || '',
@@ -3616,9 +3646,13 @@ function publicImage(image) {
 function generationCost(request = null) {
   const requestedCost = Number(request?.cost);
   const sizeCost = sizeCostMap[normalizeSizeName(request?.size)] || 1;
-  const costs = [sizeCost];
+  const costs = [sizeCost, modelGenerationCost(request?.model)];
   if (Number.isFinite(requestedCost) && requestedCost > 0) costs.push(Math.ceil(requestedCost));
   return Math.max(...costs);
+}
+
+function modelGenerationCost(model) {
+  return String(model || '') === 'nai-diffusion-5-full' ? 5 : 1;
 }
 
 function accountGenerationCost(request = null) {

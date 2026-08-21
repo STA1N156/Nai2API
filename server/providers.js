@@ -218,12 +218,16 @@ export async function fetchNovelAiAccountQuota(token, env = {}, options = {}) {
     ?? subscription.purchased_training_steps
   );
   const values = [fixed, purchased].filter((value) => value !== null);
+  const usage = subscription.usage || payload.usage || {};
 
   return {
     points: values.length ? values.reduce((sum, value) => sum + value, 0) : null,
     fixed,
     purchased,
     tier: subscription.tier ?? subscription.subscriptionTier ?? payload.tier ?? null,
+    v5UsagePercent: numberOrNull(usage.percent),
+    v5UsageIsNegative: Boolean(usage.isNegative ?? usage.is_negative),
+    v5UsageTimeUntilNextPercent: numberOrNull(usage.timeUntilNextPercent ?? usage.time_until_next_percent),
     raw: payload
   };
 }
@@ -753,7 +757,7 @@ function destroySocketQuietly(socket) {
 function noop() {}
 
 function buildNovelAiParameters(request) {
-  if (isV4Model(request.model)) {
+  if (isModernImageModel(request.model)) {
     return buildV4Parameters(request);
   }
 
@@ -841,14 +845,14 @@ function novelAiCorrelationId() {
 }
 
 function shouldUseNovelAiStream(request, env = {}, options = {}) {
-  if (options.forceStream === true) return isV4Model(request.model);
+  if (options.forceStream === true) return isModernImageModel(request.model);
   if (options.forceStream === false) return false;
   if (String(env.NOVELAI_STREAM_IMAGE || '').toLowerCase() === 'false') return false;
-  return isV4Model(request.model);
+  return isModernImageModel(request.model);
 }
 
-function isV4Model(model) {
-  return /^nai-diffusion-4/.test(String(model || ''));
+function isModernImageModel(model) {
+  return /^nai-diffusion-(?:4|5)/.test(String(model || ''));
 }
 
 function normalizeV4Sampler(sampler) {

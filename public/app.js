@@ -1,4 +1,4 @@
-import { enhanceSelects } from './select-ui.js';
+import { enhanceSelects, refreshSelect } from './select-ui.js';
 
 const state = {
   settings: null,
@@ -49,6 +49,7 @@ const ids = [
   'closePromptConvertBtn',
   'artistPresetInput',
   'artistInput',
+  'modelInput',
   'samplerInput',
   'sizeInput',
   'stepsInput',
@@ -120,15 +121,15 @@ year 2025, textless version, {{petite,loli}}, Petite figure, no text, The image 
 };
 
 const sizeOptions = [
-  { value: '竖图', label: '竖图(-1)', cost: 1 },
-  { value: '横图', label: '横图(-1)', cost: 1 },
-  { value: '方图', label: '方图(-1)', cost: 1 },
-  { value: '2K竖图', label: '2K竖图(-15)', cost: 15 },
-  { value: '2K横图', label: '2K横图(-15)', cost: 15 },
-  { value: '2K方图', label: '2K方图(-15)', cost: 15 },
-  { value: '4K竖图', label: '4K竖图(-25)', cost: 25 },
-  { value: '4K横图', label: '4K横图(-25)', cost: 25 },
-  { value: '4K方图', label: '4K方图(-25)', cost: 25 }
+  { value: '竖图', cost: 1 },
+  { value: '横图', cost: 1 },
+  { value: '方图', cost: 1 },
+  { value: '2K竖图', cost: 15 },
+  { value: '2K横图', cost: 15 },
+  { value: '2K方图', cost: 15 },
+  { value: '4K竖图', cost: 25 },
+  { value: '4K横图', cost: 25 },
+  { value: '4K方图', cost: 25 }
 ];
 
 const paramOrder = [
@@ -169,7 +170,6 @@ await boot().catch((error) => {
 
 async function boot() {
   populateArtistPresetOptions();
-  populateSizeOptions();
   bindEvents();
   el.userToken.value = state.token;
   await loadSettings();
@@ -233,6 +233,11 @@ function bindEvents() {
     el.negativeInput
   ].forEach((input) => input.addEventListener('input', updateUrlOutputs));
   el.artistPresetInput.addEventListener('change', applyArtistPreset);
+  el.modelInput.addEventListener('change', () => {
+    populateSizeOptions();
+    updateUrlOutputs();
+    updateGenerateCostLabel();
+  });
   el.sizeInput.addEventListener('change', updateGenerateCostLabel);
   el.artistInput.addEventListener('input', () => {
     syncArtistPresetSelection();
@@ -301,9 +306,12 @@ function populateArtistPresetOptions() {
 }
 
 function populateSizeOptions() {
+  const selectedValue = el.sizeInput.value;
   el.sizeInput.innerHTML = sizeOptions
-    .map((option) => `<option value="${option.value}">${option.label}</option>`)
+    .map((option) => `<option value="${option.value}">${option.value}（${Math.max(option.cost, selectedModelCost())}点）</option>`)
     .join('');
+  if (sizeOptions.some((option) => option.value === selectedValue)) el.sizeInput.value = selectedValue;
+  refreshSelect(el.sizeInput);
 }
 
 async function loadSettings() {
@@ -311,6 +319,11 @@ async function loadSettings() {
 }
 
 function applyDefaults() {
+  const defaultModel = state.settings.defaultModel || 'nai-diffusion-4-5-full';
+  el.modelInput.value = ['nai-diffusion-4-5-full', 'nai-diffusion-5-full'].includes(defaultModel)
+    ? defaultModel
+    : 'nai-diffusion-4-5-full';
+  populateSizeOptions();
   el.artistInput.value = artistPresets['2.5d'].value;
   syncArtistPresetSelection();
   el.negativeInput.value = state.settings.defaultNegative || '';
@@ -401,7 +414,7 @@ function collectParams() {
   return {
     token: el.userToken.value.trim(),
     tag: el.promptInput.value.trim(),
-    model: 'nai-diffusion-4-5-full',
+    model: el.modelInput.value,
     artist: el.artistInput.value.trim(),
     size: el.sizeInput.value,
     steps: normalizeSteps(el.stepsInput.value),
@@ -1312,7 +1325,11 @@ function totalGenerationCost() {
 
 function generationCost() {
   const selected = sizeOptions.find((option) => option.value === el.sizeInput.value);
-  return selected?.cost || 1;
+  return Math.max(selected?.cost || 1, selectedModelCost());
+}
+
+function selectedModelCost() {
+  return el.modelInput.value === 'nai-diffusion-5-full' ? 5 : 1;
 }
 
 function wait(ms) {

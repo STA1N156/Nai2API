@@ -129,7 +129,7 @@ Windows 本地也可以直接运行：
 ### 图片直链
 
 ```text
-GET /generate?token=STA1N-xxx&tag=1girl&size=竖图&steps=28&scale=6&cfg=0&sampler=k_dpmpp_2m_sde&negative=bad anatomy&nocache=0&noise_schedule=karras
+GET /generate?token=STA1N-xxx&tag=1girl&model=nai-diffusion-4-5-full&size=竖图&steps=28&scale=6&cfg=0&sampler=k_dpmpp_2m_sde&negative=bad anatomy&nocache=0&noise_schedule=karras
 ```
 
 常用参数：
@@ -138,6 +138,7 @@ GET /generate?token=STA1N-xxx&tag=1girl&size=竖图&steps=28&scale=6&cfg=0&sampl
 | --- | --- |
 | `token` | 用户密钥，必须是后台生成的 `STA1N-...` |
 | `tag` | 用户提示词 |
+| `model` | `nai-diffusion-4-5-full`（默认，1 点）或 `nai-diffusion-5-full`（5 点） |
 | `artist` | 质量前缀或画师前缀 |
 | `size` | `竖图`、`横图`、`方图` |
 | `steps` | 生成步数。图片 URL 请求最高按 28 路由。 |
@@ -175,16 +176,19 @@ Content-Type: application/json
 
 ```text
 [2K]nai-diffusion-4-5-full:k_dpmpp_2m_sde
+[2K]nai-diffusion-5-full:k_dpmpp_2m_sde
 [4K]nai-diffusion-4-5-full:k_dpmpp_2m_sde
+[4K]nai-diffusion-5-full:k_dpmpp_2m_sde
 ```
 
 OpenAI 兼容接口可用两档分辨率，网页前台暂不提供这两个选项：
 
-| 前缀 | 扣费 | 竖图 | 横图 | 方图 |
-| --- | ---: | --- | --- | --- |
-| 无前缀 | `1` 点 | `832 x 1216` | `1216 x 832` | `1024 x 1024` |
-| `[2K]` | `15` 点 | `1088 x 1600` | `1600 x 1088` | `1344 x 1344` |
-| `[4K]` | `25` 点 | `1344 x 1984` | `1984 x 1344` | `1728 x 1728` |
+| 模型 | 前缀 | 扣费 | 竖图 | 横图 | 方图 |
+| --- | --- | ---: | --- | --- | --- |
+| V4.5 Full | 无前缀 | `1` 点 | `832 x 1216` | `1216 x 832` | `1024 x 1024` |
+| V5 Full | 无前缀 | `5` 点 | `832 x 1216` | `1216 x 832` | `1024 x 1024` |
+| 两种模型 | `[2K]` | `15` 点 | `1088 x 1600` | `1600 x 1088` | `1344 x 1344` |
+| 两种模型 | `[4K]` | `25` 点 | `1344 x 1984` | `1984 x 1344` | `1728 x 1728` |
 
 非流式示例：
 

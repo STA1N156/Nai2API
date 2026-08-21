@@ -611,7 +611,7 @@ async function refreshSelectedAccountQuotas() {
       el.refreshAccountQuotaBtn.textContent = `刷新中 ${completed}/${total}，进行中 ${active}，并发 ${concurrency}`;
     };
     updateProgress();
-    showToast(`正在并发刷新点数和会员，每次 ${concurrency} 个账号`);
+    showToast(`正在并发刷新点数、会员和 V5 额度，每次 ${concurrency} 个账号`);
     await mapLimit(ids, 5, async (id) => {
       active += 1;
       state.refreshingAccounts.add(id);
@@ -640,14 +640,14 @@ async function refreshSelectedAccountQuotas() {
         syncSelectionControls();
       }
     });
-    showToast(`点数和会员状态已刷新：成功 ${ok} 个，失败 ${failed} 个`);
+    showToast(`点数、会员和 V5 额度已刷新：成功 ${ok} 个，失败 ${failed} 个`);
   } catch (error) {
     showToast(normalizeErrorMessage(error), true);
   } finally {
     state.refreshingQuotas = false;
     state.refreshingAccounts.clear();
     el.refreshAccountQuotaBtn.disabled = false;
-    el.refreshAccountQuotaBtn.textContent = '刷新点数/会员';
+    el.refreshAccountQuotaBtn.textContent = '刷新点数 / 会员 / V5额度';
     renderAccounts();
     syncSelectionControls();
   }
@@ -1298,6 +1298,13 @@ function renderAccount(account) {
       : `${formatNumber(account.quotaPoints)} 点`;
   const tierText = account.quotaError ? '会员查询失败' : accountTierText(account);
   const tierClass = account.quotaError ? 'tier-error' : accountTierClass(account);
+  const v5UsageText = account.quotaError
+    ? 'V5额度查询失败'
+    : account.v5UsagePercent === null || account.v5UsagePercent === undefined
+      ? 'V5额度未查询'
+      : account.v5UsageIsNegative
+        ? 'V5额度已耗尽'
+        : `V5剩余 ${formatNumber(account.v5UsagePercent)}%`;
   return `<article class="data-row selectable account-row">
     <input class="row-check account-select" type="checkbox" value="${escapeHtml(account.id)}" ${checked} />
     <div class="row-main">
@@ -1312,6 +1319,7 @@ function renderAccount(account) {
     </div>
     <div class="row-stats">
       <span><b>${escapeHtml(quotaText)}</b></span>
+      <span><b>${escapeHtml(v5UsageText)}</b></span>
       <span><b>${formatPercent(stats1h.successRate)}</b>% 1h成功率</span>
       <button class="row-action account-test-btn" type="button" data-account-id="${escapeHtml(account.id)}" ${testing || refreshing ? 'disabled' : ''}>${refreshing ? '刷新中' : testing ? '测试中' : '测试'}</button>
     </div>
