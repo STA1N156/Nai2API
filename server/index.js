@@ -239,8 +239,8 @@ async function route(req, res) {
 
   if (method === 'GET' && url.pathname === '/api/me') {
     const token = tokenFrom(req, url);
-    const db = await store.readCollections(['users']);
-    const user = getUserOrThrow(db, token);
+    const user = await store.readUserByToken(token);
+    if (!user || user.enabled === false) throw httpError(401, 'invalid token.');
     sendJson(res, 200, publicUser(user));
     return;
   }
@@ -257,9 +257,8 @@ async function route(req, res) {
   if (url.pathname === '/api/api/getUser' && ['GET', 'POST'].includes(method)) {
     const body = method === 'POST' ? await readJson(req) : {};
     const token = String(body.toUserId || body.token || url.searchParams.get('toUserId') || url.searchParams.get('token') || '').trim();
-    const db = await store.readCollections(['users']);
-    const user = db.users.find((item) => item.token === token && item.enabled !== false);
-    if (!user) {
+    const user = await store.readUserByToken(token);
+    if (!user || user.enabled === false) {
       sendJson(res, 200, {
         status: 'error',
         type: token.toUpperCase().startsWith('STA1N') ? 'sta1n' : 'std',
@@ -297,16 +296,14 @@ async function route(req, res) {
     const queueDb = { ...db, jobs: queueJobs };
     const payload = {
       settings: adminRuntimeSettings(db.settings),
-      cards: db.cards.map(publicCard),
-      users: publicAdminUsers(db.users),
+      userCount: Number(db.userCount || 0),
       accounts: db.accounts.map((account) => publicAccount(account, {
         revealToken: revealTokens,
         stats1h: accountStats1h[account.id] || finalizeStats({})
       })),
-      images: db.images.slice(0, 12).map(publicImage),
-      imageCount: db.imageCount ?? db.images.length,
-      imageTotal: db.imageCount ?? db.images.length,
-      cacheImageCount: db.imageCount ?? db.images.length,
+      imageCount: db.imageCount ?? 0,
+      imageTotal: db.imageCount ?? 0,
+      cacheImageCount: db.imageCount ?? 0,
       requestStats1m: db.requestStats1m || requestStatsSince(statsJobs, 60 * 1000),
       jobStats1h: db.jobStats1h || jobStatsSince(statsJobs, 60 * 60 * 1000),
       generationSpeed1h: db.generationSpeed1h || {
@@ -315,8 +312,7 @@ async function route(req, res) {
       },
       usageHourlyDays: db.usageHourlyDays || hourlyUsageStatsByDay(statsJobs),
       errorLogs: errorLogs(errorLogJobs, db, 100),
-      jobs: db.jobs.slice(0, 50).map((job) => publicJob(job, queueDb)),
-      ledger: db.ledger.slice(0, 80)
+      jobs: db.jobs.slice(0, 50).map((job) => publicJob(job, queueDb))
     };
     const computeMs = Date.now() - computeStartedAt;
     const sendStartedAt = Date.now();
@@ -326,11 +322,11 @@ async function route(req, res) {
       readMs,
       computeMs,
       sendMs,
-      users: db.users.length,
+      users: db.userCount,
       accounts: db.accounts.length,
       statsRows: db.statsRowsRead ?? statsJobs.length,
       recentJobs: db.jobs.length,
-      images: db.imageCount ?? db.images.length
+      images: db.imageCount ?? 0
     });
     return;
   }
@@ -391,6 +387,16 @@ async function route(req, res) {
     const body = await readJson(req);
     const cards = await createCards(body);
     sendJson(res, 201, { cards: cards.map(publicCard) });
+    return;
+  }
+
+  if (method === 'GET' && url.pathname === '/api/admin/users') {
+    assertAdmin(req, url);
+    const limit = clamp(Number(url.searchParams.get('limit') || 300), 1, 500);
+    const offset = clamp(Number(url.searchParams.get('offset') || 0), 0, Number.MAX_SAFE_INTEGER);
+    const q = String(url.searchParams.get('q') || '').trim().toLowerCase();
+    const page = await store.readUserPage({ limit, offset, q });
+    sendJson(res, 200, { ...page, users: publicAdminUsers(page.users) });
     return;
   }
 
@@ -3828,6 +3834,11 @@ function isAbortError(error) {
 }
 
 function selectUsers(db, body) {
+  if (body.zeroBalance === true) {
+    const users = db.users.filter((user) => Number(user.balance || 0) <= 0 && !user.mergedInto && !user.mergedAt && !user.mergedFrom?.length);
+    if (!users.length) throw httpError(404, '没有可清理的 0 额度密钥。');
+    return users;
+  }
   const ids = new Set(collectValues(body.ids || body.users));
   const tokens = new Set(collectValues(body.tokens || body.token));
   if (!ids.size && !tokens.size) throw httpError(400, 'user ids or tokens are required.');

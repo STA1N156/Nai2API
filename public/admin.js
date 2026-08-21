@@ -15,6 +15,9 @@ const state = {
   requestLogExpanded: false,
   errorLogExpanded: false,
   summary: null,
+  userTotal: 0,
+  userMatched: 0,
+  userRequestSequence: 0,
   images: [],
   imageTotal: 0,
   imagePage: 1,
@@ -192,7 +195,7 @@ function bindEvents() {
   el.imagePrevBtn.addEventListener('click', () => changeImagePage(-1));
   el.imageNextBtn.addEventListener('click', () => changeImagePage(1));
   el.clearImagesBtn.addEventListener('click', clearImages);
-  el.userSearch.addEventListener('input', () => renderUsers(state.summary?.users || []));
+  el.userSearch.addEventListener('input', debounce(() => refreshUsers(false), 260));
   el.imageSearch.addEventListener('input', debounce(() => {
     state.imagePage = 1;
     refreshImages(false);
@@ -282,12 +285,37 @@ function setAuthenticated(isAuthenticated) {
 async function reloadDashboard() {
   const summary = await loadSummary();
   renderSummary(summary, { renderImages: false });
+  refreshUsers(false);
 }
 
 async function loadSummary() {
-  state.summary = await api('/api/admin/summary?revealTokens=1', { admin: true });
+  const users = state.summary?.users || [];
+  state.summary = {
+    ...await api('/api/admin/summary?revealTokens=1', { admin: true }),
+    users
+  };
+  state.userTotal = Number(state.summary.userCount ?? state.userTotal ?? users.length);
   pruneSelections();
   return state.summary;
+}
+
+async function refreshUsers(withToast = false) {
+  const sequence = ++state.userRequestSequence;
+  try {
+    const params = new URLSearchParams({ limit: String(userRenderLimit), offset: '0' });
+    const q = el.userSearch.value.trim();
+    if (q) params.set('q', q);
+    const page = await api(`/api/admin/users?${params.toString()}`, { admin: true });
+    if (!state.summary || sequence !== state.userRequestSequence) return;
+    state.summary.users = page.users || [];
+    state.userTotal = Number(page.total || 0);
+    state.userMatched = Number(page.matched ?? state.userTotal);
+    pruneSelections();
+    renderUsers(state.summary.users);
+    if (withToast) showToast('密钥列表已刷新');
+  } catch (error) {
+    showToast(normalizeErrorMessage(error), true);
+  }
 }
 
 async function createUsers() {
@@ -529,16 +557,11 @@ async function deleteSelectedUsers() {
 
 async function deleteZeroBalanceUsers() {
   try {
-    const users = state.summary?.users || [];
-    const ids = users
-      .filter((user) => Number(user.balance || 0) <= 0 && !hasMergeTrace(user))
-      .map((user) => user.id);
-    if (!ids.length) return showToast('没有 0 额度密钥可清理', true);
-    if (!confirm(`确定删除 ${ids.length} 个 0 额度密钥？`)) return;
+    if (!confirm('确定删除全部没有融合记录的 0 额度密钥？')) return;
     const result = await api('/api/admin/users', {
       method: 'DELETE',
       admin: true,
-      body: { ids }
+      body: { zeroBalance: true }
     });
     state.selectedUsers.clear();
     showToast(`已删除 ${result.deleted} 个 0 额度密钥`);
@@ -546,10 +569,6 @@ async function deleteZeroBalanceUsers() {
   } catch (error) {
     showToast(normalizeErrorMessage(error), true);
   }
-}
-
-function hasMergeTrace(user) {
-  return Boolean(user?.mergedInto || user?.mergedAt || user?.mergedFrom?.length);
 }
 
 async function adjustSelectedUsers(mode) {
@@ -1223,11 +1242,10 @@ function requestLogJobs(jobs = []) {
 }
 
 function renderUsers(users) {
-  const filtered = filteredUsers(users);
   const visible = visibleUsers(users);
   el.userCountText.textContent = el.userSearch.value.trim()
-    ? `${filtered.length} / ${users.length} 个密钥`
-    : `${users.length} 个密钥`;
+    ? `${state.userMatched} / ${state.userTotal} 个密钥`
+    : `${state.userTotal} 个密钥`;
   el.userList.innerHTML = visible.length
     ? visible.map(renderUser).join('')
     : '<div class="empty small">没有匹配的密钥</div>';

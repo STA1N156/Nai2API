@@ -2,6 +2,7 @@ import { existsSync, statSync } from 'node:fs';
 import { mkdir, readFile, unlink } from 'node:fs/promises';
 import crypto from 'node:crypto';
 import path from 'node:path';
+import { Worker } from 'node:worker_threads';
 import Database from 'better-sqlite3';
 
 export const MAX_CACHE_IMAGES_LIMIT = 4000000;
@@ -49,6 +50,7 @@ const recordColumns = [
   'resolution_tier',
   'search_text'
 ];
+const jobMetricColumns = ['cost', 'stats_excluded', 'error_loggable'];
 
 const defaultSettings = {
   serviceName: 'Nai2API',
@@ -106,6 +108,10 @@ export class JsonStore {
     this.pendingPersistScope = null;
     this.pendingPersistTimer = null;
     this.partialCollections = new Set();
+    this.statsReader = null;
+    this.adminReader = null;
+    this.adminStatsCache = null;
+    this.adminStatsPromise = null;
   }
 
   async init() {
@@ -115,6 +121,7 @@ export class JsonStore {
     this.openSqlite();
     this.createSchema();
     this.prepareStatements();
+    this.openReadWorkers();
 
     if (!this.hasSqliteData()) {
       runtimeLog(`No SQLite data found. Checking legacy JSON in ${this.dataDir}`);
@@ -298,6 +305,7 @@ export class JsonStore {
     this.rowState.jobs = snapshot.rowState.jobs;
     this.orderKeys.jobs = snapshot.orderKeys.jobs;
     this.partialCollections.delete('jobs');
+    this.adminStatsCache = null;
 
     const removed = Number(result?.changes || 0);
     runtimeLog(`SQLite request logs cleared ${removed} job record(s), before=${before}, remaining=${remaining}, duration=${Date.now() - startedAt}ms`);
@@ -471,41 +479,22 @@ export class JsonStore {
     const q = String(options.q || '').trim().toLowerCase();
     const tier = String(options.tier || '').trim().toLowerCase();
     const model = String(options.model || '').trim();
-    const filters = [];
-    const filterParams = {};
-    const pageParams = { limit, offset };
-    if (tier) {
-      filters.push('resolution_tier = @tier');
-      filterParams.tier = tier;
-      pageParams.tier = tier;
-    }
-    if (model) {
-      filters.push('model = @model');
-      filterParams.model = model;
-      pageParams.model = model;
-    }
-    if (q) {
-      filters.push('search_text LIKE @q');
-      filterParams.q = `%${q}%`;
-      pageParams.q = `%${q}%`;
-    }
-    const whereSql = filters.length ? `WHERE ${filters.join(' AND ')}` : '';
-    const total = Number(this.sqlite.prepare('SELECT COUNT(*) AS count FROM images').get().count || 0);
-    const matched = Number(this.sqlite.prepare(`SELECT COUNT(*) AS count FROM images ${whereSql}`).get(filterParams).count || 0);
-    const rows = this.sqlite.prepare(`
-      SELECT data FROM images
-      ${whereSql}
-      ORDER BY order_value DESC
-      LIMIT @limit OFFSET @offset
-    `).all(pageParams);
-    return {
-      images: rows.map((row) => safeJson(row.data, null)).filter(Boolean),
-      total,
-      matched,
-      offset,
-      limit,
-      maxCacheImages: this.db.settings.maxCacheImages
-    };
+    const page = await this.adminReader.request('imagePage', { limit, offset, q, tier, model }, 15_000);
+    return { ...page, maxCacheImages: this.db.settings.maxCacheImages };
+  }
+
+  async readUserPage(options = {}) {
+    await this.ensureLoaded();
+    const limit = Math.max(1, Math.min(500, Math.floor(Number(options.limit || 300))));
+    const offset = Math.max(0, Math.floor(Number(options.offset || 0)));
+    const q = String(options.q || '').trim().toLowerCase();
+    return this.adminReader.request('userPage', { limit, offset, q }, 15_000);
+  }
+
+  async readUserByToken(token) {
+    await this.ensureLoaded();
+    const user = this.db.users.find((item) => item.token === token);
+    return user ? structuredClone(user) : null;
   }
 
   async readCounts() {
@@ -520,173 +509,53 @@ export class JsonStore {
   async readAdminSummary() {
     await this.ensureLoaded();
     const statsCutoff = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+    const imageCount = this.countRecords('images');
     return {
       settings: structuredClone(this.db.settings),
-      cards: this.selectItems('cards'),
-      users: this.selectItems('users'),
-      accounts: this.selectItems('accounts'),
+      userCount: this.db.users.length,
+      accounts: structuredClone(this.db.accounts),
       jobs: this.selectItems('jobs', "WHERE status = 'failed' ORDER BY order_value DESC LIMIT 50"),
-      ...this.readAdminSummaryStats(),
-      statsRowsRead: 0,
+      ...await this.readAdminSummaryStats(),
       errorJobs: this.selectItems('jobs', `
-        WHERE status = 'failed'
+        WHERE error_loggable = 1
           AND updated_at >= @cutoff
-          AND account_id IS NOT NULL
-          AND account_id != ''
-          AND data NOT LIKE '%all NovelAI accounts are busy%'
-          AND data NOT LIKE '%server busy%'
-          AND data NOT LIKE '%NovelAI returned 429%'
-          AND data NOT LIKE '%statusCode"%429%'
-          AND data NOT LIKE '%Concurrent generation is locked%'
-          AND data NOT LIKE '%concurrent generation%'
         ORDER BY updated_at DESC
-        LIMIT 500
+        LIMIT 100
       `, { cutoff: statsCutoff }),
       queueJobs: this.selectItems('jobs', `
         WHERE status IN ('queued', 'running')
-        ORDER BY COALESCE(created_at, '') ASC
+        ORDER BY created_at ASC
       `),
-      images: this.selectItems('images', 'ORDER BY order_value DESC LIMIT 12'),
-      imageCount: this.countRecords('images'),
-      imageTotal: this.countRecords('images'),
-      cacheImageCount: this.countRecords('images'),
-      ledger: this.selectItems('ledger', 'ORDER BY order_value DESC LIMIT 80')
+      imageCount,
+      imageTotal: imageCount,
+      cacheImageCount: imageCount
     };
   }
 
-  readAdminSummaryStats() {
+  async readAdminSummaryStats() {
     const now = Date.now();
-    const oneMinuteAgo = new Date(now - 60 * 1000).toISOString();
-    const oneHourAgo = new Date(now - 60 * 60 * 1000).toISOString();
-    return {
-      requestStats1m: this.readRequestStatsSince(oneMinuteAgo),
-      jobStats1h: this.readJobStatsSince(oneHourAgo),
-      generationSpeed1h: this.readGenerationSpeedSince(oneHourAgo),
-      accountStats1h: this.readAccountStatsSince(oneHourAgo),
-      usageHourlyDays: this.readUsageHourlyDays(now, usageChartDays)
-    };
-  }
-
-  readRequestStatsSince(sinceIso) {
-    const row = this.sqlite.prepare(`
-      SELECT COUNT(*) AS total
-      FROM jobs
-      WHERE created_at >= @since
-    `).get({ since: sinceIso });
-    return { total: Number(row?.total || 0) };
-  }
-
-  readJobStatsSince(sinceIso) {
-    const rows = this.sqlite.prepare(`
-      SELECT status, COUNT(*) AS count
-      FROM jobs
-      WHERE status IN ('done', 'failed')
-        AND created_at >= @since
-        AND ${nonQuotaFailureSql()}
-      GROUP BY status
-    `).all({ since: sinceIso });
-    return finalizeSqlStats(rows);
-  }
-
-  readGenerationSpeedSince(sinceIso) {
-    const rows = this.sqlite.prepare(`
-      SELECT
-        CASE
-          WHEN model LIKE 'nai-diffusion-5%' THEN 'v5'
-          WHEN model LIKE 'nai-diffusion-4-5%' THEN 'v45'
-          ELSE ''
-        END AS version,
-        AVG((julianday(updated_at) - julianday(created_at)) * 86400.0) AS seconds,
-        COUNT(*) AS count
-      FROM jobs
-      WHERE status = 'done'
-        AND updated_at >= @since
-        AND created_at IS NOT NULL
-        AND updated_at IS NOT NULL
-        AND model LIKE 'nai-diffusion-%'
-      GROUP BY version
-    `).all({ since: sinceIso });
-    const result = {
-      v45: { seconds: null, count: 0 },
-      v5: { seconds: null, count: 0 }
-    };
-    for (const row of rows) {
-      if (!result[row.version]) continue;
-      const seconds = Number(row.seconds);
-      result[row.version] = {
-        seconds: Number.isFinite(seconds) && seconds >= 0 ? seconds : null,
-        count: Number(row.count || 0)
-      };
+    if (this.adminStatsCache) {
+      if (now - this.adminStatsCache.at >= 30_000 && !this.adminStatsPromise) this.refreshAdminStats(now);
+      return structuredClone(this.adminStatsCache.value);
     }
-    return result;
+    return this.refreshAdminStats(now);
   }
 
-  readAccountStatsSince(sinceIso) {
-    const rows = this.sqlite.prepare(`
-      SELECT account_id AS accountId, status, COUNT(*) AS count
-      FROM jobs
-      WHERE status IN ('done', 'failed')
-        AND account_id IS NOT NULL
-        AND account_id != ''
-        AND created_at >= @since
-        AND ${nonQuotaFailureSql()}
-      GROUP BY account_id, status
-    `).all({ since: sinceIso });
-    const stats = {};
-    for (const row of rows) {
-      const accountId = row.accountId || '';
-      if (!accountId) continue;
-      if (!stats[accountId]) stats[accountId] = { done: 0, failed: 0 };
-      if (row.status === 'done') stats[accountId].done += Number(row.count || 0);
-      if (row.status === 'failed') stats[accountId].failed += Number(row.count || 0);
-    }
-    for (const accountId of Object.keys(stats)) stats[accountId] = finalizeStatsObject(stats[accountId]);
-    return stats;
-  }
-
-  readUsageHourlyDays(now = Date.now(), days = usageChartDays) {
-    const buckets = usageBuckets(now, days);
-    const cutoff = new Date(now - days * 24 * 60 * 60 * 1000).toISOString();
-    const rows = this.sqlite.prepare(`
-      SELECT
-        strftime('%Y-%m-%d', datetime(updated_at, '+${beijingOffsetHours} hours')) AS date,
-        CAST(strftime('%H', datetime(updated_at, '+${beijingOffsetHours} hours')) AS INTEGER) AS hour,
-        status,
-        COUNT(*) AS count,
-        SUM(CASE WHEN status = 'done' THEN COALESCE(CAST(json_extract(data, '$.cost') AS REAL), 0) ELSE 0 END) AS credits
-      FROM jobs
-      WHERE status IN ('done', 'failed')
-        AND updated_at >= @cutoff
-      GROUP BY date, hour, status
-    `).all({ cutoff });
-    for (const row of rows) {
-      const bucket = buckets.map.get(row.date);
-      if (!bucket) continue;
-      const hour = bucket.hours[Number(row.hour || 0)];
-      if (!hour) continue;
-      const count = Number(row.count || 0);
-      const credits = Number(row.credits || 0);
-      if (row.status === 'done') {
-        bucket.done += count;
-        hour.done += count;
-        bucket.credits += credits;
-        hour.credits += credits;
+  async refreshAdminStats(now = Date.now()) {
+    if (this.adminStatsPromise) return this.adminStatsPromise;
+    this.adminStatsPromise = (async () => {
+      try {
+        const value = await this.statsReader.request('adminStats', { now, days: usageChartDays }, 3_000);
+        this.adminStatsCache = { at: now, value };
+        return structuredClone(value);
+      } catch (error) {
+        runtimeLog(`Admin stats worker unavailable: ${error.message}`);
+        return this.adminStatsCache ? structuredClone(this.adminStatsCache.value) : emptyAdminStats(now);
+      } finally {
+        this.adminStatsPromise = null;
       }
-      if (row.status === 'failed') {
-        bucket.failed += count;
-        hour.failed += count;
-      }
-    }
-    return buckets.keys.map((key) => {
-      const bucket = buckets.map.get(key);
-      bucket.total = bucket.done + bucket.failed;
-      bucket.successRate = bucket.total ? bucket.done / bucket.total : 0;
-      bucket.hours.forEach((hour) => {
-        hour.total = hour.done + hour.failed;
-        hour.successRate = hour.total ? hour.done / hour.total : 0;
-      });
-      return bucket;
-    });
+    })();
+    return this.adminStatsPromise;
   }
 
   async ensureLoaded() {
@@ -694,6 +563,7 @@ export class JsonStore {
     this.openSqlite();
     this.createSchema();
     this.prepareStatements();
+    this.openReadWorkers();
     this.db = this.hasSqliteData() ? this.loadFromSqlite() : trimDb(normalizeDb(defaultDb));
     if (!this.hasSqliteData()) this.replaceAll(this.db);
   }
@@ -750,12 +620,19 @@ export class JsonStore {
     this.flushPendingPersistSync();
   }
 
-  close() {
-    if (!this.sqlite) return;
-    this.flushPendingPersistSync();
-    this.sqlite.close();
+  async close() {
+    if (this.sqlite) this.flushPendingPersistSync();
+    await Promise.allSettled([this.statsReader?.close(), this.adminReader?.close()].filter(Boolean));
+    this.statsReader = null;
+    this.adminReader = null;
+    this.sqlite?.close();
     this.sqlite = null;
     this.statements = null;
+  }
+
+  openReadWorkers() {
+    this.statsReader ||= new SqliteReadWorker(this.dbPath, 'stats');
+    this.adminReader ||= new SqliteReadWorker(this.dbPath, 'admin');
   }
 
   schedulePersist(scope) {
@@ -812,7 +689,7 @@ export class JsonStore {
       FROM jobs
       WHERE status IN ('queued', 'running')
         AND id != @id
-        AND COALESCE(created_at, '') <= @createdAt
+        AND created_at <= @createdAt
     `).get({ id: job.id, createdAt: job.createdAt || '' });
     const total = Math.max(1, Number(job.queueTotal || 0) || Number(active?.count || 0) || 1);
     return {
@@ -909,34 +786,37 @@ export class JsonStore {
 
         CREATE INDEX IF NOT EXISTS idx_${table}_order
           ON ${table} (order_value DESC);
-        CREATE INDEX IF NOT EXISTS idx_${table}_status_created
-          ON ${table} (status, created_at);
-        CREATE INDEX IF NOT EXISTS idx_${table}_status_updated
-          ON ${table} (status, updated_at);
-        CREATE INDEX IF NOT EXISTS idx_${table}_account_created
-          ON ${table} (account_id, created_at);
-        CREATE INDEX IF NOT EXISTS idx_${table}_token
-          ON ${table} (token);
       `);
     }
+
+    ensureColumn(this.sqlite, 'jobs', 'cost', 'REAL NOT NULL DEFAULT 0');
+    ensureColumn(this.sqlite, 'jobs', 'stats_excluded', 'INTEGER NOT NULL DEFAULT 0');
+    ensureColumn(this.sqlite, 'jobs', 'error_loggable', 'INTEGER NOT NULL DEFAULT 0');
+    dropRedundantIndexes(this.sqlite);
 
     this.sqlite.exec(`
       CREATE INDEX IF NOT EXISTS idx_images_cache_key
         ON images (cache_key);
       CREATE INDEX IF NOT EXISTS idx_images_tier_order
         ON images (resolution_tier, order_value DESC);
-      CREATE INDEX IF NOT EXISTS idx_images_search
-        ON images (search_text);
+      CREATE INDEX IF NOT EXISTS idx_images_model_order
+        ON images (model, order_value DESC);
+      CREATE INDEX IF NOT EXISTS idx_images_tier_model_order
+        ON images (resolution_tier, model, order_value DESC);
       CREATE INDEX IF NOT EXISTS idx_jobs_user_token
         ON jobs (user_token);
       CREATE INDEX IF NOT EXISTS idx_jobs_image_id
         ON jobs (image_id);
-      CREATE INDEX IF NOT EXISTS idx_jobs_created
-        ON jobs (created_at);
-      CREATE INDEX IF NOT EXISTS idx_jobs_updated
-        ON jobs (updated_at);
-      CREATE INDEX IF NOT EXISTS idx_jobs_account_status_created
-        ON jobs (account_id, status, created_at);
+      CREATE INDEX IF NOT EXISTS idx_jobs_created_stats
+        ON jobs (created_at, status, stats_excluded, account_id);
+      CREATE INDEX IF NOT EXISTS idx_jobs_updated_stats
+        ON jobs (updated_at, status, model, created_at, cost);
+      CREATE INDEX IF NOT EXISTS idx_jobs_active_created
+        ON jobs (created_at) WHERE status IN ('queued', 'running');
+      CREATE INDEX IF NOT EXISTS idx_jobs_failed_order
+        ON jobs (order_value DESC) WHERE status = 'failed';
+      CREATE INDEX IF NOT EXISTS idx_jobs_error_log_updated
+        ON jobs (updated_at DESC) WHERE error_loggable = 1;
       CREATE INDEX IF NOT EXISTS idx_users_token
         ON users (token);
       CREATE INDEX IF NOT EXISTS idx_accounts_route_id
@@ -947,11 +827,6 @@ export class JsonStore {
 
   prepareStatements() {
     if (this.statements) return;
-    const valueList = recordColumns.map((column) => `@${column}`).join(', ');
-    const updateList = recordColumns
-      .filter((column) => column !== 'id')
-      .map((column) => `${column} = excluded.${column}`)
-      .join(', ');
     this.statements = {
       hasSettings: this.sqlite.prepare('SELECT 1 FROM app_settings WHERE key = ? LIMIT 1'),
       hasGenericRecords: this.sqlite.prepare('SELECT 1 FROM app_records LIMIT 1'),
@@ -971,13 +846,19 @@ export class JsonStore {
     };
 
     for (const [collection, table] of Object.entries(collectionTables)) {
+      const columns = collection === 'jobs' ? [...recordColumns, ...jobMetricColumns] : recordColumns;
+      const valueList = columns.map((column) => `@${column}`).join(', ');
+      const updateList = columns
+        .filter((column) => column !== 'id')
+        .map((column) => `${column} = excluded.${column}`)
+        .join(', ');
       this.statements.hasTypedRecords[collection] = this.sqlite.prepare(`SELECT 1 FROM ${table} LIMIT 1`);
       this.statements.selectRecords[collection] = this.sqlite.prepare(`SELECT id, order_value AS orderValue, data FROM ${table} ORDER BY order_value DESC`);
       this.statements.selectById[collection] = this.sqlite.prepare(`SELECT data FROM ${table} WHERE id = ? LIMIT 1`);
       this.statements.countRecords[collection] = this.sqlite.prepare(`SELECT COUNT(*) AS count FROM ${table}`);
       this.statements.deleteAllRecords[collection] = this.sqlite.prepare(`DELETE FROM ${table}`);
       this.statements.upsertRecord[collection] = this.sqlite.prepare(`
-        INSERT INTO ${table} (${recordColumns.join(', ')})
+        INSERT INTO ${table} (${columns.join(', ')})
         VALUES (${valueList})
         ON CONFLICT(id) DO UPDATE SET ${updateList}
       `);
@@ -1092,6 +973,7 @@ export class JsonStore {
       }
     });
     writeAll();
+    this.adminStatsCache = null;
     this.settingsState = snapshot.settingsData;
     this.rowState = snapshot.rowState;
     this.orderKeys = snapshot.orderKeys;
@@ -1145,6 +1027,7 @@ export class JsonStore {
       }
     });
     applyChanges();
+    if ([...changes.deletes, ...changes.upserts].some((change) => change.collection === 'jobs')) this.adminStatsCache = null;
     if (scope.includeSettings) this.settingsState = snapshot.settingsData;
     for (const collection of (scope.full ? collections : scope.collections)) {
       this.rowState[collection] = snapshot.rowState[collection];
@@ -1239,6 +1122,7 @@ export class JsonStore {
       }
     });
     applyChanges();
+    if ([...changes.deletes, ...changes.upserts].some((change) => change.collection === 'jobs')) this.adminStatsCache = null;
 
     if (changes.settingsChanged) this.settingsState = changes.nextSettings;
     for (const change of changes.deletes) {
@@ -1583,7 +1467,10 @@ function sqlRecord(collection, item, order, data) {
     prompt: item.prompt || item.request?.tag || null,
     full_prompt: item.fullPrompt || item.request?.prompt || null,
     resolution_tier: null,
-    search_text: ''
+    search_text: '',
+    cost: 0,
+    stats_excluded: 0,
+    error_loggable: 0
   };
 
   if (collection === 'cards') {
@@ -1606,6 +1493,9 @@ function sqlRecord(collection, item, order, data) {
     row.prompt = item.request?.tag || item.prompt || null;
     row.full_prompt = item.request?.prompt || item.fullPrompt || null;
     row.model = item.request?.model || item.model || null;
+    row.cost = Math.max(0, numberOrNull(item.cost) || 0);
+    row.stats_excluded = isStatsExcludedJob(item) ? 1 : 0;
+    row.error_loggable = isErrorLoggableJob(item) ? 1 : 0;
   }
   if (collection === 'images') {
     row.token = item.token || null;
@@ -1649,6 +1539,17 @@ function searchableText(item, row) {
 function numberOrNull(value) {
   const number = Number(value);
   return Number.isFinite(number) ? number : null;
+}
+
+function isStatsExcludedJob(job = {}) {
+  if (job.status !== 'failed') return false;
+  return /insufficient balance|额度不足|余额不足/i.test(`${job.error || ''}\n${job.errorDetail || ''}`);
+}
+
+function isErrorLoggableJob(job = {}) {
+  if (job.status !== 'failed' || !job.accountId) return false;
+  const text = `${job.error || ''}\n${job.errorDetail || ''}`;
+  return !/all NovelAI accounts are busy|server busy|NovelAI returned 429|statusCode"\s*:\s*429|Concurrent generation is locked|concurrent generation|direct generate timeout|AbortError|operation was aborted|job deadline expired|stale timeout|queued job exceeded|running job exceeded|invalid user token|invalid STA1N|密钥额度不足|用户额度不足/i.test(text);
 }
 
 function ensureItemIds(collection, items) {
@@ -1749,35 +1650,120 @@ function trimImageCacheDeleteLimit(value) {
   return Math.max(1, Math.floor(number));
 }
 
-function nonQuotaFailureSql() {
-  return `NOT (
-    status = 'failed'
-    AND (
-      data LIKE '%insufficient balance%'
-      OR data LIKE '%额度不足%'
-      OR data LIKE '%余额不足%'
-    )
-  )`;
+function ensureColumn(sqlite, table, column, definition) {
+  const columns = sqlite.prepare(`PRAGMA table_info(${table})`).all();
+  if (columns.some((item) => item.name === column)) return;
+  sqlite.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
 }
 
-function finalizeSqlStats(rows = []) {
-  const stats = rows.reduce((current, row) => {
-    if (row.status === 'done') current.done += Number(row.count || 0);
-    if (row.status === 'failed') current.failed += Number(row.count || 0);
-    return current;
-  }, { done: 0, failed: 0 });
-  return finalizeStatsObject(stats);
+function dropRedundantIndexes(sqlite) {
+  const names = [
+    ...collections.flatMap((table) => [
+      `idx_${table}_status_created`,
+      `idx_${table}_status_updated`,
+      `idx_${table}_account_created`,
+      ...(table === 'users' ? [] : [`idx_${table}_token`])
+    ]),
+    'idx_images_search',
+    'idx_jobs_created',
+    'idx_jobs_updated',
+    'idx_jobs_account_status_created',
+    'idx_jobs_status_order',
+    'idx_jobs_updated_speed',
+    'idx_jobs_updated_usage',
+    'idx_users_search_order'
+  ];
+  sqlite.exec(names.map((name) => `DROP INDEX IF EXISTS ${name};`).join('\n'));
 }
 
-function finalizeStatsObject(stats = {}) {
-  const done = Number(stats.done || 0);
-  const failed = Number(stats.failed || 0);
-  const total = done + failed;
+class SqliteReadWorker {
+  constructor(dbPath, name) {
+    this.dbPath = dbPath;
+    this.name = name;
+    this.worker = null;
+    this.sequence = 0;
+    this.pending = new Map();
+    this.closed = false;
+  }
+
+  request(type, payload, timeoutMs) {
+    if (this.closed) return Promise.reject(new Error(`${this.name} reader is closed`));
+    this.open();
+    const id = ++this.sequence;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.fail(new Error(`${this.name} reader timed out`));
+      }, timeoutMs);
+      this.pending.set(id, { resolve, reject, timer });
+      this.worker.postMessage({ id, type, payload });
+    });
+  }
+
+  open() {
+    if (this.worker) return;
+    const worker = new Worker(new URL('./sqlite-read-worker.js', import.meta.url), {
+      workerData: { dbPath: this.dbPath },
+      execArgv: process.execArgv.filter((value) => !value.startsWith('--input-type'))
+    });
+    worker.unref();
+    worker.on('message', (message) => {
+      const request = this.pending.get(message.id);
+      if (!request) return;
+      clearTimeout(request.timer);
+      this.pending.delete(message.id);
+      if (message.error) request.reject(new Error(message.error));
+      else request.resolve(message.result);
+    });
+    worker.on('error', (error) => this.fail(error));
+    worker.on('exit', (code) => {
+      if (this.worker !== worker) return;
+      this.worker = null;
+      if (code && !this.closed) this.fail(new Error(`${this.name} reader exited with code ${code}`));
+    });
+    this.worker = worker;
+  }
+
+  fail(error) {
+    for (const request of this.pending.values()) {
+      clearTimeout(request.timer);
+      request.reject(error);
+    }
+    this.pending.clear();
+    this.reset();
+  }
+
+  reset() {
+    const worker = this.worker;
+    this.worker = null;
+    worker?.terminate().catch(() => {});
+  }
+
+  close() {
+    this.closed = true;
+    const error = new Error(`${this.name} reader closed`);
+    for (const request of this.pending.values()) {
+      clearTimeout(request.timer);
+      request.reject(error);
+    }
+    this.pending.clear();
+    const worker = this.worker;
+    this.worker = null;
+    return worker?.terminate().catch(() => {});
+  }
+}
+
+function emptyAdminStats(now = Date.now()) {
+  const buckets = usageBuckets(now, usageChartDays);
   return {
-    done,
-    failed,
-    total,
-    successRate: total ? done / total : 0
+    requestStats1m: { total: 0 },
+    jobStats1h: { done: 0, failed: 0, total: 0, successRate: 0 },
+    generationSpeed1h: {
+      v45: { seconds: null, count: 0 },
+      v5: { seconds: null, count: 0 }
+    },
+    accountStats1h: {},
+    usageHourlyDays: buckets.keys.map((key) => buckets.map.get(key)),
+    statsRowsRead: 0
   };
 }
 
