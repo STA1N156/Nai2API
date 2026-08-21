@@ -27,6 +27,8 @@ const state = {
 
 const jobPageSize = 10;
 const userRenderLimit = 300;
+const accountQuotaTimeoutMs = 15_000;
+const adminAutoRefreshIntervalMs = 5 * 60 * 1000;
 
 const ids = [
   'loginPanel',
@@ -101,6 +103,7 @@ const ids = [
   'deleteUsersBtn',
   'imageSearch',
   'imageTier',
+  'imageModel',
   'imageRows',
   'refreshImagesBtn',
   'clearImagesBtn',
@@ -130,6 +133,10 @@ enhanceSelects();
 bindEvents();
 setAuthenticated(false);
 bootAdmin();
+setInterval(() => {
+  if (!state.adminToken || el.dashboard.classList.contains('hidden') || state.loggingIn) return;
+  reloadDashboard().catch((error) => showToast(normalizeErrorMessage(error), true));
+}, adminAutoRefreshIntervalMs);
 
 async function bootAdmin() {
   el.adminToken.value = state.adminToken;
@@ -190,6 +197,10 @@ function bindEvents() {
     refreshImages(false);
   }, 260));
   el.imageTier.addEventListener('change', () => {
+    state.imagePage = 1;
+    refreshImages();
+  });
+  el.imageModel.addEventListener('change', () => {
     state.imagePage = 1;
     refreshImages();
   });
@@ -623,7 +634,7 @@ async function refreshSelectedAccountQuotas() {
           method: 'POST',
           admin: true,
           body: { ids: [id] },
-          timeoutMs: 12000
+          timeoutMs: accountQuotaTimeoutMs
         });
         ok += Number(result.ok || 0);
         failed += Number(result.failed || 0);
@@ -734,6 +745,7 @@ async function refreshImages(withToast = true) {
     const q = el.imageSearch.value.trim();
     if (q) params.set('q', q);
     if (el.imageTier.value) params.set('tier', el.imageTier.value);
+    if (el.imageModel.value) params.set('model', el.imageModel.value);
     const data = await api(`/api/admin/images?${params.toString()}`, { admin: true });
     const matched = data.matched ?? 0;
     const pageCount = Math.max(1, Math.ceil(matched / limit));
@@ -823,7 +835,7 @@ function renderSummary(summary, options = {}) {
 }
 
 function renderSummaryImages(summary) {
-  if (state.imagePage !== 1 || el.imageSearch.value.trim() || el.imageTier.value) return;
+  if (state.imagePage !== 1 || el.imageSearch.value.trim() || el.imageTier.value || el.imageModel.value) return;
   const images = Array.isArray(summary.images) ? summary.images : [];
   const total = summaryImageTotal(summary) ?? state.imageTotal ?? 0;
   state.images = images;
@@ -1226,11 +1238,11 @@ function renderImages(data) {
   const offset = data?.offset ?? (state.imagePage - 1) * state.imagePageSize;
   const start = matched ? offset + 1 : 0;
   const end = offset + state.images.length;
-  const tierText = el.imageTier.value ? ` · ${el.imageTier.value}` : '';
-  el.imageCountText.textContent = el.imageSearch.value.trim() || el.imageTier.value
+  const filterText = [el.imageTier.value, imageModelVersion(el.imageModel.value)].filter(Boolean).join(' · ');
+  el.imageCountText.textContent = el.imageSearch.value.trim() || el.imageTier.value || el.imageModel.value
     ? `${start}-${end} / ${matched} · ${rows} 行`
     : `${start}-${end} / ${total} · ${rows} 行`;
-  if (tierText) el.imageCountText.textContent += tierText;
+  if (filterText) el.imageCountText.textContent += ` · ${filterText}`;
   el.metricImages.textContent = Number.isFinite(total) ? total : '统计中';
   el.imageList.innerHTML = state.images.length
     ? state.images.map(renderImage).join('')
@@ -1420,7 +1432,7 @@ function renderImage(image) {
     <div class="image-card-body">
       <strong title="${escapeHtml(image.prompt || image.id)}">${escapeHtml(image.prompt || image.id)}</strong>
       <div class="image-meta-line">
-        <span>${escapeHtml(image.width)}x${escapeHtml(image.height)}</span>
+        <span>${escapeHtml(image.width)}x${escapeHtml(image.height)} · ${escapeHtml(imageModelVersion(image.model))}</span>
         <span>${escapeHtml(stepText || image.model)}</span>
       </div>
       <div class="image-meta-line">
@@ -1429,6 +1441,13 @@ function renderImage(image) {
       </div>
     </div>
   </article>`;
+}
+
+function imageModelVersion(model) {
+  const value = String(model || '');
+  if (value.includes('nai-diffusion-5')) return 'V5';
+  if (value.includes('nai-diffusion-4-5')) return 'V4.5';
+  return '';
 }
 
 function jobStatusText(status) {

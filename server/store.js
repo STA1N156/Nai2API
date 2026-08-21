@@ -470,6 +470,7 @@ export class JsonStore {
     const offset = Math.max(0, Math.floor(Number(options.offset || 0)));
     const q = String(options.q || '').trim().toLowerCase();
     const tier = String(options.tier || '').trim().toLowerCase();
+    const model = String(options.model || '').trim();
     const filters = [];
     const filterParams = {};
     const pageParams = { limit, offset };
@@ -477,6 +478,11 @@ export class JsonStore {
       filters.push('resolution_tier = @tier');
       filterParams.tier = tier;
       pageParams.tier = tier;
+    }
+    if (model) {
+      filters.push('model = @model');
+      filterParams.model = model;
+      pageParams.model = model;
     }
     if (q) {
       filters.push('search_text LIKE @q');

@@ -19,6 +19,9 @@ const store = new JsonStore(dataDir);
 let queueDrainTimer = null;
 let queueDraining = false;
 let queueDrainRequested = false;
+let accountQuotaRefreshTimer = null;
+let accountQuotaRefreshPromise = null;
+let accountQuotaAutoRefreshStarted = false;
 const jobWaiters = new Map();
 const runningJobControls = new Map();
 const imageRepairTasks = new Map();
@@ -31,6 +34,8 @@ const jobStreamProgressPersistState = new Map();
 const beijingOffsetMs = 8 * 60 * 60 * 1000;
 const usageChartDays = 7;
 const errorLogRetentionMs = usageChartDays * 24 * 60 * 60 * 1000;
+const accountQuotaRefreshIntervalMs = 5 * 60 * 1000;
+const accountQuotaRequestTimeoutMs = 15 * 1000;
 const openAiSamplers = [
   'k_euler_ancestral',
   'k_euler',
@@ -94,6 +99,7 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(port, host, () => {
   console.log(`Nai2API listening on http://${host}:${port}`);
+  startAccountQuotaAutoRefresh();
   logStartupQueueState().catch((error) => console.error('[runtime] failed to inspect startup queue:', error)).finally(() => {
     scheduleQueueDrain();
   });
@@ -424,8 +430,9 @@ async function route(req, res) {
     const offset = clamp(Number(url.searchParams.get('offset') || 0), 0, Number.MAX_SAFE_INTEGER);
     const q = String(url.searchParams.get('q') || '').trim().toLowerCase();
     const tier = String(url.searchParams.get('tier') || '').trim();
+    const model = String(url.searchParams.get('model') || '').trim();
     const queryStartedAt = Date.now();
-    const page = await store.readImagePage({ limit, offset, q, tier });
+    const page = await store.readImagePage({ limit, offset, q, tier, model });
     const queryMs = Date.now() - queryStartedAt;
     const sendStartedAt = Date.now();
     sendJson(res, 200, {
@@ -1425,6 +1432,38 @@ async function refreshAccountQuotas(body) {
   };
 }
 
+function startAccountQuotaAutoRefresh() {
+  if (accountQuotaAutoRefreshStarted) return;
+  accountQuotaAutoRefreshStarted = true;
+  const run = async () => {
+    try {
+      const result = await refreshEnabledAccountQuotas();
+      if (result.checked) console.log(`[runtime] account quota refresh: checked=${result.checked} ok=${result.ok} failed=${result.failed}`);
+    } catch (error) {
+      console.error('[runtime] account quota refresh failed:', error);
+    } finally {
+      accountQuotaRefreshTimer = setTimeout(run, accountQuotaRefreshIntervalMs);
+      accountQuotaRefreshTimer.unref?.();
+    }
+  };
+  run();
+}
+
+async function refreshEnabledAccountQuotas() {
+  if (accountQuotaRefreshPromise) return accountQuotaRefreshPromise;
+  accountQuotaRefreshPromise = (async () => {
+    const db = await store.readCollections(['accounts']);
+    const ids = db.accounts.filter((account) => account.enabled !== false).map((account) => account.id);
+    if (!ids.length) return { checked: 0, ok: 0, failed: 0, accounts: [] };
+    return refreshAccountQuotas({ ids });
+  })();
+  try {
+    return await accountQuotaRefreshPromise;
+  } finally {
+    accountQuotaRefreshPromise = null;
+  }
+}
+
 async function testAccount(id) {
   const db = await store.readCollections(['settings', 'accounts']);
   const target = db.accounts.find((account) => account.id === id);
@@ -1598,7 +1637,7 @@ function disableNovelAiAccount(account) {
 
 async function fetchNovelAiAccountQuotaWithTimeout(token, proxyUrl = '') {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 8000);
+  const timer = setTimeout(() => controller.abort(), accountQuotaRequestTimeoutMs);
   try {
     return await fetchNovelAiAccountQuota(token, process.env, {
       signal: controller.signal,
@@ -2308,9 +2347,9 @@ async function reserveQueuedJob(jobId) {
       job.completedAt = job.updatedAt;
       return { skip: true, jobId: job.id };
     }
-    const account = selectAccount(db.accounts, db.settings, { cost: accountCost });
+    const account = selectAccount(db.accounts, db.settings, { cost: accountCost, request: job.request });
     if (!account && hasEnabledAccounts(db.accounts)) {
-      if (!hasAccountWithEnoughQuota(db.accounts, accountCost)) {
+      if (!hasAccountWithEnoughQuota(db.accounts, accountCost, job.request)) {
         refundJob(db, job, 'NovelAI账号点数不足');
         job.status = 'failed';
         job.error = 'NovelAI账号点数不足';
@@ -2462,7 +2501,7 @@ async function generateWithAccountRetry(reservation, request, options = {}) {
       logNovelAiGenerateError(error, request, current.account, current.job);
       if (options.signal?.aborted || isAbortError(error)) throw error;
       if (!firstError) firstError = error;
-      const next = await retryReservationWithNextAccount(current, error, tried, options);
+      const next = await retryReservationWithNextAccount(current, error, tried, { ...options, request });
       if (!next) {
         current.account = null;
         reservation.account = null;
@@ -2500,7 +2539,7 @@ async function retryReservationWithNextAccount(reservation, error, tried, option
 
     if (options.deadline && Date.now() >= options.deadline) return null;
     const accountCost = reservationAccountCost(reservation, reservation.job?.request);
-    const account = selectAccount(db.accounts, db.settings, { excludeIds: tried, cost: accountCost });
+    const account = selectAccount(db.accounts, db.settings, { excludeIds: tried, cost: accountCost, request: options.request });
     if (!account) return null;
     account.inFlight = Number(account.inFlight || 0) + 1;
     account.lastUsedAt = new Date().toISOString();
@@ -2560,9 +2599,9 @@ async function reserveCreditAndAccount(token, request, cacheKey) {
     const cost = generationCost(request);
     const accountCost = accountGenerationCost(request);
     if (user.balance < cost) throw httpError(402, insufficientBalanceMessage);
-    const account = selectAccount(db.accounts, db.settings, { cost: accountCost });
+    const account = selectAccount(db.accounts, db.settings, { cost: accountCost, request });
     if (!account && hasEnabledAccounts(db.accounts)) {
-      if (!hasAccountWithEnoughQuota(db.accounts, accountCost)) throw httpError(503, 'NovelAI账号点数不足');
+      if (!hasAccountWithEnoughQuota(db.accounts, accountCost, request)) throw httpError(503, 'NovelAI账号点数不足');
       throw httpError(429, 'all NovelAI accounts are busy, retry shortly.');
     }
     if (account) {
@@ -2601,9 +2640,9 @@ async function tryReserveCreditAndAccount(token, request, cacheKey) {
     const cost = generationCost(request);
     const accountCost = accountGenerationCost(request);
     if (user.balance < cost) throw httpError(402, insufficientBalanceMessage);
-    const account = selectAccount(db.accounts, db.settings, { cost: accountCost });
+    const account = selectAccount(db.accounts, db.settings, { cost: accountCost, request });
     if (!account && hasEnabledAccounts(db.accounts)) {
-      if (!hasAccountWithEnoughQuota(db.accounts, accountCost)) throw httpError(503, 'NovelAI账号点数不足');
+      if (!hasAccountWithEnoughQuota(db.accounts, accountCost, request)) throw httpError(503, 'NovelAI账号点数不足');
       return { busy: true };
     }
     if (account) {
@@ -2794,10 +2833,22 @@ function selectAccount(accounts, settings = {}, options = {}) {
     return quota === null || quota >= cost;
   });
   if (!available.length) return null;
-  return available.sort((a, b) => {
+  let candidates = available;
+  let preferQuota = cost > 0;
+  if (isV5StandardAccountRequest(options.request, cost)) {
+    const freeAccounts = available.filter(hasV5FreeQuota);
+    if (freeAccounts.length) {
+      candidates = freeAccounts;
+    } else {
+      candidates = available.filter(hasPaidQuota);
+      preferQuota = true;
+    }
+  }
+  if (!candidates.length) return null;
+  return candidates.sort((a, b) => {
     const quotaA = accountQuotaPoints(a);
     const quotaB = accountQuotaPoints(b);
-    if (cost > 0 && (quotaA !== null || quotaB !== null)) {
+    if (preferQuota && (quotaA !== null || quotaB !== null)) {
       if (quotaA === null) return 1;
       if (quotaB === null) return -1;
       if (quotaA !== quotaB) return quotaB - quotaA;
@@ -2813,6 +2864,20 @@ function accountQuotaPoints(account) {
   if (account?.quotaPoints === null || account?.quotaPoints === undefined || account?.quotaPoints === '') return null;
   const value = Number(account?.quotaPoints);
   return Number.isFinite(value) ? value : null;
+}
+
+function isV5StandardAccountRequest(request = {}, cost = 0) {
+  return normalizeAccountCost(cost) === 0 && String(request?.model || '').startsWith('nai-diffusion-5');
+}
+
+function hasV5FreeQuota(account) {
+  const percent = numberOrNull(account?.v5UsagePercent);
+  return percent !== null && percent > 0 && !account?.v5UsageIsNegative;
+}
+
+function hasPaidQuota(account) {
+  const quota = accountQuotaPoints(account);
+  return quota === null || quota > 0;
 }
 
 function maxAccountConcurrency(settings = {}) {
@@ -2906,10 +2971,11 @@ function hasEnabledAccounts(accounts) {
   return accounts.some((account) => account.enabled !== false);
 }
 
-function hasAccountWithEnoughQuota(accounts, cost = 1) {
+function hasAccountWithEnoughQuota(accounts, cost = 1, request = {}) {
   const required = normalizeAccountCost(cost);
   return accounts.some((account) => {
     if (account.enabled === false) return false;
+    if (isV5StandardAccountRequest(request, required)) return hasV5FreeQuota(account) || hasPaidQuota(account);
     const quota = accountQuotaPoints(account);
     return quota === null || quota >= required;
   });
@@ -4250,6 +4316,7 @@ function installShutdownHandlers(serverInstance) {
     if (shuttingDown) return;
     shuttingDown = true;
     console.log(`[runtime] ${signal} received. Flushing SQLite changes before shutdown.`);
+    if (accountQuotaRefreshTimer) clearTimeout(accountQuotaRefreshTimer);
     try {
       store.flushSync();
     } catch (error) {
