@@ -309,6 +309,10 @@ async function route(req, res) {
       cacheImageCount: db.imageCount ?? db.images.length,
       requestStats1m: db.requestStats1m || requestStatsSince(statsJobs, 60 * 1000),
       jobStats1h: db.jobStats1h || jobStatsSince(statsJobs, 60 * 60 * 1000),
+      generationSpeed1h: db.generationSpeed1h || {
+        v45: { seconds: null, count: 0 },
+        v5: { seconds: null, count: 0 }
+      },
       usageHourlyDays: db.usageHourlyDays || hourlyUsageStatsByDay(statsJobs),
       errorLogs: errorLogs(errorLogJobs, db, 100),
       jobs: db.jobs.slice(0, 50).map((job) => publicJob(job, queueDb)),
@@ -3490,6 +3494,7 @@ function hourlyUsageStatsByDay(jobs, days = usageChartDays) {
     done: 0,
     failed: 0,
     total: 0,
+    credits: 0,
     successRate: 0,
     hours: Array.from({ length: 24 }, (_, hour) => ({
       hour,
@@ -3497,6 +3502,7 @@ function hourlyUsageStatsByDay(jobs, days = usageChartDays) {
       done: 0,
       failed: 0,
       total: 0,
+      credits: 0,
       successRate: 0
     }))
   }]));
@@ -3510,7 +3516,12 @@ function hourlyUsageStatsByDay(jobs, days = usageChartDays) {
     if (!bucket) return;
     const hourBucket = bucket.hours[beijingHour(timestamp)];
     if (!hourBucket) return;
-    if (job.status === 'done') bucket.done += 1;
+    if (job.status === 'done') {
+      const credits = Math.max(0, Number(job.cost || 0));
+      bucket.done += 1;
+      bucket.credits += credits;
+      hourBucket.credits += credits;
+    }
     if (job.status === 'failed') bucket.failed += 1;
     if (job.status === 'done') hourBucket.done += 1;
     if (job.status === 'failed') hourBucket.failed += 1;

@@ -561,6 +561,7 @@ export class JsonStore {
     return {
       requestStats1m: this.readRequestStatsSince(oneMinuteAgo),
       jobStats1h: this.readJobStatsSince(oneHourAgo),
+      generationSpeed1h: this.readGenerationSpeedSince(oneHourAgo),
       accountStats1h: this.readAccountStatsSince(oneHourAgo),
       usageHourlyDays: this.readUsageHourlyDays(now, usageChartDays)
     };
@@ -585,6 +586,39 @@ export class JsonStore {
       GROUP BY status
     `).all({ since: sinceIso });
     return finalizeSqlStats(rows);
+  }
+
+  readGenerationSpeedSince(sinceIso) {
+    const rows = this.sqlite.prepare(`
+      SELECT
+        CASE
+          WHEN model LIKE 'nai-diffusion-5%' THEN 'v5'
+          WHEN model LIKE 'nai-diffusion-4-5%' THEN 'v45'
+          ELSE ''
+        END AS version,
+        AVG((julianday(updated_at) - julianday(created_at)) * 86400.0) AS seconds,
+        COUNT(*) AS count
+      FROM jobs
+      WHERE status = 'done'
+        AND updated_at >= @since
+        AND created_at IS NOT NULL
+        AND updated_at IS NOT NULL
+        AND model LIKE 'nai-diffusion-%'
+      GROUP BY version
+    `).all({ since: sinceIso });
+    const result = {
+      v45: { seconds: null, count: 0 },
+      v5: { seconds: null, count: 0 }
+    };
+    for (const row of rows) {
+      if (!result[row.version]) continue;
+      const seconds = Number(row.seconds);
+      result[row.version] = {
+        seconds: Number.isFinite(seconds) && seconds >= 0 ? seconds : null,
+        count: Number(row.count || 0)
+      };
+    }
+    return result;
   }
 
   readAccountStatsSince(sinceIso) {
@@ -618,7 +652,8 @@ export class JsonStore {
         strftime('%Y-%m-%d', datetime(updated_at, '+${beijingOffsetHours} hours')) AS date,
         CAST(strftime('%H', datetime(updated_at, '+${beijingOffsetHours} hours')) AS INTEGER) AS hour,
         status,
-        COUNT(*) AS count
+        COUNT(*) AS count,
+        SUM(CASE WHEN status = 'done' THEN COALESCE(CAST(json_extract(data, '$.cost') AS REAL), 0) ELSE 0 END) AS credits
       FROM jobs
       WHERE status IN ('done', 'failed')
         AND updated_at >= @cutoff
@@ -630,9 +665,12 @@ export class JsonStore {
       const hour = bucket.hours[Number(row.hour || 0)];
       if (!hour) continue;
       const count = Number(row.count || 0);
+      const credits = Number(row.credits || 0);
       if (row.status === 'done') {
         bucket.done += count;
         hour.done += count;
+        bucket.credits += credits;
+        hour.credits += credits;
       }
       if (row.status === 'failed') {
         bucket.failed += count;
@@ -1758,6 +1796,7 @@ function usageBuckets(now = Date.now(), days = usageChartDays) {
       done: 0,
       failed: 0,
       total: 0,
+      credits: 0,
       successRate: 0,
       hours: Array.from({ length: 24 }, (_, hour) => ({
         hour,
@@ -1765,6 +1804,7 @@ function usageBuckets(now = Date.now(), days = usageChartDays) {
         done: 0,
         failed: 0,
         total: 0,
+        credits: 0,
         successRate: 0
       }))
     }]))

@@ -37,6 +37,7 @@ const ids = [
   'enterAdminBtn',
   'refreshBtn',
   'metricUsers',
+  'metricSpeed1h',
   'metricCredits',
   'metricAccounts',
   'metricImages',
@@ -809,6 +810,7 @@ function renderSummary(summary, options = {}) {
   const jobPageCount = Math.max(1, Math.ceil(summary.jobs.length / jobPageSize));
   if (state.jobPage > jobPageCount) state.jobPage = jobPageCount;
   el.metricUsers.textContent = formatNumber(summary.requestStats1m?.total || 0);
+  el.metricSpeed1h.textContent = formatGenerationSpeed(summary.generationSpeed1h);
   el.metricCredits.textContent = `${formatPercent(requestStats.successRate)}%`;
   el.metricAccounts.textContent = enabledAccounts;
   const imageTotal = summaryImageTotal(summary);
@@ -973,10 +975,12 @@ function renderUsageChart(days) {
   const totalRequests = Number(selectedDay.total || 0);
   const totalDone = Number(selectedDay.done || 0);
   const totalFailed = Number(selectedDay.failed || 0);
+  const totalCredits = Number(selectedDay.credits || 0);
   const failureRate = totalRequests ? totalFailed / totalRequests : 0;
   el.usageChartSummary.textContent = `北京时间，${selectedDay.date} 00:00-23:00 · ${formatNumber(totalRequests)} 次请求 · 失败率 ${formatPercent(failureRate)}%`;
   el.usageChart.innerHTML = `<div class="chart-stat-row">
     <span><b>${formatNumber(totalRequests)}</b> 当天请求</span>
+    <span><b>${formatNumber(totalCredits)}</b> 当天点数消耗</span>
     <span><b>${formatNumber(totalDone)}</b> 成功</span>
     <span><b>${formatNumber(totalFailed)}</b> 失败</span>
     <span><b>${formatPercent(failureRate)}%</b> 当天失败率</span>
@@ -1677,6 +1681,14 @@ function formatDuration(value) {
 
 function formatPercent(value) {
   return (Number(value || 0) * 100).toFixed(2);
+}
+
+function formatGenerationSpeed(stats = {}) {
+  return ['v45', 'v5'].map((version) => {
+    const item = stats?.[version] || {};
+    const seconds = Number(item.seconds);
+    return Number(item.count || 0) > 0 && Number.isFinite(seconds) ? seconds.toFixed(1) : '-';
+  }).join(' / ');
 }
 
 function formatNumber(value) {

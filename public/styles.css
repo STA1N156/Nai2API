@@ -1412,7 +1412,7 @@ textarea.locked {
 }
 
 .metric-grid {
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
 }
 
 .metric-card {
@@ -1439,6 +1439,14 @@ textarea.locked {
 
 .metric-card:nth-child(4) {
   animation-delay: 150ms;
+}
+
+.metric-card:nth-child(5) {
+  animation-delay: 200ms;
+}
+
+#metricSpeed1h {
+  font-size: clamp(22px, 3vw, 38px);
 }
 
 .metric-card::after {
