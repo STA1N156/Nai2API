@@ -5,10 +5,6 @@ const state = {
   token: localStorage.getItem('nai.userToken') || '',
   userBalance: null,
   toastTimer: null,
-  pollTimer: null,
-  queueViewTimer: null,
-  queueView: null,
-  queueViewCompleteTimer: null,
   resultHistory: [],
   resultHistoryIndex: -1,
   optimizedPairs: new Map(),
@@ -81,8 +77,7 @@ const maxSteps = 28;
 const maxUrlSteps = 28;
 const defaultSteps = 28;
 const jobPollIntervalMs = 450;
-const queueStepIntervalMs = 75;
-const queueCompleteStepIntervalMs = 15;
+const queuedPollIntervalMs = 1000;
 const artistPresets = {
   fresh: {
     label: '韩漫小清新风',
@@ -515,19 +510,16 @@ async function startJob() {
   }
   setGenerateBusy(true);
   renderLoadingFrame();
-  clearInterval(state.pollTimer);
   try {
     const params = collectParams();
     const job = await api('/api/jobs', {
       method: 'POST',
       body: jobRequestBody(params)
     });
-    resetQueueView(job);
     el.jobText.textContent = jobStatusText(job);
     updateLoadingStatus(job);
-    state.pollTimer = setInterval(() => pollJob(job.id), jobPollIntervalMs);
     loadMe().catch(() => {});
-    await pollJob(job.id);
+    await pollJob(job.id, params.token);
   } catch (error) {
     renderFrameNotice('生成失败', true);
     setGenerateBusy(false);
@@ -537,7 +529,6 @@ async function startJob() {
 
 async function startBatchJobs(count) {
   setGenerateBusy(true);
-  clearInterval(state.pollTimer);
   renderBatchLoading(count);
   const params = collectParams();
   const results = await Promise.allSettled(
@@ -574,7 +565,7 @@ async function pollBatchJob(id, index, token) {
     try {
       job = await api(`/api/jobs/${id}?token=${encodeURIComponent(token)}`);
     } catch (error) {
-      if (error.status >= 500 || /Unexpected end of JSON input/i.test(error.message)) {
+      if (!error.status || error.status >= 500) {
         updateBatchCard(index, '连接重试中');
         await wait(jobPollIntervalMs);
         continue;
@@ -588,7 +579,7 @@ async function pollBatchJob(id, index, token) {
       return job.imageUrl;
     }
     if (job.status === 'failed') throw new Error(job.error || '任务失败');
-    await wait(jobPollIntervalMs);
+    await wait(job.status === 'queued' ? queuedPollIntervalMs : jobPollIntervalMs);
   }
   throw new Error('生成已停止');
 }
@@ -611,43 +602,35 @@ function jobRequestBody(params) {
   };
 }
 
-async function pollJob(id) {
-  let job;
-  try {
-    job = await api(`/api/jobs/${id}?token=${encodeURIComponent(el.userToken.value.trim())}`);
-  } catch (error) {
-    if (error.status >= 500 || /Unexpected end of JSON input/i.test(error.message)) {
-      el.jobText.textContent = '连接重试中';
+async function pollJob(id, token) {
+  // One request at a time: an older response must never overwrite a newer state.
+  while (state.generating) {
+    let job;
+    try {
+      job = await api(`/api/jobs/${id}?token=${encodeURIComponent(token)}`);
+    } catch (error) {
+      if (!error.status || error.status >= 500) {
+        el.jobText.textContent = '连接重试中';
+        await wait(queuedPollIntervalMs);
+        continue;
+      }
+      throw error;
+    }
+    el.jobText.textContent = jobStatusText(job);
+    updateLoadingStatus(job);
+    if (job.status === 'done') {
+      renderResultImage(job.imageUrl);
+      await loadMe().catch(() => {});
+      showToast('图片已生成');
+      setGenerateBusy(false);
       return;
     }
-    clearInterval(state.pollTimer);
-    renderFrameNotice('生成失败', true);
-    showToast(error.message, true);
-    setGenerateBusy(false);
-    return;
-  }
-
-  el.jobText.textContent = jobStatusText(job);
-  updateLoadingStatus(job);
-  if (job.status === 'done') {
-    clearInterval(state.pollTimer);
-    clearQueueView();
-    renderResultImage(job.imageUrl);
-    await loadMe().catch(() => {});
-    showToast('图片已生成');
-    setGenerateBusy(false);
-  }
-  if (job.status === 'failed') {
-    clearInterval(state.pollTimer);
-    clearQueueView();
-    renderFrameNotice('生成失败', true);
-    showToast(job.error || '任务失败', true);
-    setGenerateBusy(false);
+    if (job.status === 'failed') throw new Error(job.error || '任务失败');
+    await wait(job.status === 'queued' ? queuedPollIntervalMs : jobPollIntervalMs);
   }
 }
 
 function renderLoadingFrame() {
-  clearQueueView();
   closeResultPreview();
   el.jobText.textContent = '生成中';
   el.imageFrame.classList.remove('result-ready', 'batch-ready', 'batch-mode', 'batch-landscape');
@@ -670,7 +653,6 @@ function renderLoadingFrame() {
 }
 
 function renderBatchLoading(count) {
-  clearQueueView();
   closeResultPreview();
   el.jobText.textContent = `0 / ${count} 完成`;
   el.imageFrame.classList.remove('result-ready', 'batch-ready');
@@ -744,18 +726,12 @@ function updateLoadingStatus(job) {
   const target = document.querySelector('#loadingStatusText');
   if (!target) return;
   if (job.status === 'queued') {
-    const view = updateQueueView(job);
-    const count = Number(view.count || 0);
-    const position = Number(view.position || 0);
-    target.textContent = queueLoadingText(position, count);
-    el.jobText.textContent = queueStatusText(position, count);
+    target.textContent = queueLoadingText(job.queuePosition, job.queuedCount);
     setGenerationStreamProgress(null, false);
     setLoadingStep(1);
     return;
   }
   if (job.status === 'running') {
-    if (finishQueueView(job)) return;
-    clearQueueView();
     target.textContent = '账号已分配，NovelAI 正在生成';
     setGenerationStreamProgress(job.generationProgress, true);
     setLoadingStep(2);
@@ -765,39 +741,6 @@ function updateLoadingStatus(job) {
     target.textContent = '生成完成，正在载入图片';
     setGenerationStreamProgress({ percent: 100 }, false);
   }
-}
-
-function resetQueueView(job = {}) {
-  clearQueueView();
-  const total = Number(job.queuedCount || 0);
-  const position = Number(job.queuePosition || 0);
-  if (job.status !== 'queued' || !total || !position) return;
-  const target = Math.max(1, position);
-  state.queueView = {
-    position: 1,
-    target,
-    count: Math.max(1, total),
-    completing: false,
-    fastForward: target > 1
-  };
-}
-
-function updateQueueView(job = {}) {
-  const total = Math.max(1, Number(job.queuedCount || 1));
-  const target = Math.max(1, Number(job.queuePosition || 1));
-  let restartFastForward = false;
-  if (!state.queueView) {
-    state.queueView = { position: 1, target, count: total, completing: false, fastForward: target > 1 };
-    restartFastForward = state.queueView.fastForward;
-  } else {
-    const wasFastForward = Boolean(state.queueView.fastForward || state.queueView.completing);
-    state.queueView.count = Math.max(Number(state.queueView.count || 0), total);
-    state.queueView.target = Math.max(Number(state.queueView.target || 0), target);
-    state.queueView.fastForward = state.queueView.position < state.queueView.target;
-    restartFastForward = !wasFastForward && state.queueView.fastForward;
-  }
-  ensureQueueViewTimer(restartFastForward);
-  return state.queueView;
 }
 
 function applyArtistPreset() {
@@ -824,68 +767,6 @@ function setArtistInputLocked(isLocked) {
   el.artistInput.classList.toggle('locked', isLocked);
 }
 
-function finishQueueView(job = {}) {
-  if (!state.queueView) return false;
-  const total = Math.max(
-    Number(state.queueView.count || 0),
-    Number(job.queuedCount || 0),
-    Number(job.queuePosition || 0)
-  );
-  if (total <= 1 || state.queueView.position >= total) {
-    clearQueueView();
-    return false;
-  }
-  state.queueView.count = total;
-  state.queueView.target = total;
-  state.queueView.completing = true;
-  if (state.queueViewTimer) {
-    clearInterval(state.queueViewTimer);
-    state.queueViewTimer = null;
-  }
-  ensureQueueViewTimer(true);
-  renderQueueText();
-  return true;
-}
-
-function ensureQueueViewTimer(restart = false) {
-  if (restart && state.queueViewTimer) {
-    clearInterval(state.queueViewTimer);
-    state.queueViewTimer = null;
-  }
-  if (state.queueViewTimer) return;
-  state.queueViewTimer = setInterval(() => {
-    if (!state.queueView) {
-      clearQueueView();
-      return;
-    }
-    if (state.queueView.position < state.queueView.target) {
-      state.queueView.position += 1;
-      renderQueueText();
-      if (state.queueView.position >= state.queueView.target) {
-        state.queueView.fastForward = false;
-      }
-      return;
-    }
-    if (state.queueView.completing) {
-      const target = document.querySelector('#loadingStatusText');
-      state.queueView.completing = false;
-      clearQueueView();
-      if (target) target.textContent = '账号已分配，NovelAI 正在生成';
-      el.jobText.textContent = '生成中';
-      setGenerationStreamProgress({ percent: 0 }, true);
-      setLoadingStep(2);
-    }
-  }, state.queueView?.completing || state.queueView?.fastForward ? queueCompleteStepIntervalMs : queueStepIntervalMs);
-}
-
-function renderQueueText() {
-  const target = document.querySelector('#loadingStatusText');
-  if (!target || !state.queueView) return;
-  const { position, count } = state.queueView;
-  el.jobText.textContent = queueStatusText(position, count);
-  target.textContent = queueLoadingText(position, count);
-}
-
 function setLoadingStep(activeIndex) {
   document.querySelectorAll('.loading-steps span').forEach((item, index) => {
     item.classList.toggle('active', index <= activeIndex);
@@ -908,14 +789,6 @@ function clampGenerationPercent(value) {
   const number = Number(value || 0);
   if (!Number.isFinite(number)) return 0;
   return Math.max(0, Math.min(100, number));
-}
-
-function clearQueueView() {
-  if (state.queueViewTimer) clearInterval(state.queueViewTimer);
-  if (state.queueViewCompleteTimer) clearTimeout(state.queueViewCompleteTimer);
-  state.queueViewTimer = null;
-  state.queueViewCompleteTimer = null;
-  state.queueView = null;
 }
 
 function renderFrameNotice(message, isError = false) {
@@ -1269,11 +1142,7 @@ function closeResultPreview() {
 
 function jobStatusText(job) {
   if (job.status === 'queued') {
-    const view = state.queueView || {
-      count: Number(job.queuedCount || 0),
-      position: Number(job.queuePosition || 0)
-    };
-    return queueStatusText(view.position, view.count);
+    return queueStatusText(job.queuePosition, job.queuedCount);
   }
   if (job.status === 'running') return '生成中';
   if (job.status === 'done') return '生成完成';

@@ -112,6 +112,7 @@ export class JsonStore {
     this.adminReader = null;
     this.adminStatsCache = null;
     this.adminStatsPromise = null;
+    this.lastImageTrimAt = 0;
   }
 
   async init() {
@@ -173,7 +174,7 @@ export class JsonStore {
     await this.ensureLoaded();
     const rows = this.sqlite.prepare(`
       SELECT status, source, COUNT(*) AS count
-      FROM jobs
+      FROM jobs INDEXED BY idx_jobs_active_created
       WHERE status IN ('queued', 'running')
       GROUP BY status, source
     `).all();
@@ -197,6 +198,8 @@ export class JsonStore {
 
   async trimImageCache(maxCacheImages = null, options = {}) {
     await this.ensureLoaded();
+    if (options.force !== true && Date.now() - this.lastImageTrimAt < 1000) return [];
+    this.lastImageTrimAt = Date.now();
     this.flushPendingPersistSync();
 
     const maxCache = clampNumber(maxCacheImages ?? this.db.settings.maxCacheImages, 0, MAX_CACHE_IMAGES_LIMIT);
@@ -285,30 +288,41 @@ export class JsonStore {
 
   async clearRequestLogs() {
     await this.ensureLoaded();
-    this.flushPendingPersistSync();
-
     const startedAt = Date.now();
-    const before = this.countRecords('jobs');
-    const result = this.sqlite.prepare(`
-      DELETE FROM jobs
-      WHERE status NOT IN ('queued', 'running')
-    `).run();
-    const remaining = this.countRecords('jobs');
-
-    this.db.jobs = (this.db.jobs || []).filter((job) => ['queued', 'running'].includes(job.status));
-    const snapshot = buildSnapshotState(this.db, this.orderKeys, {
-      collections: ['jobs'],
-      includeSettings: false,
-      baseRowState: this.rowState,
-      baseOrderKeys: this.orderKeys
+    const upperRow = await this.update(() => {
+      this.flushPendingPersistSync();
+      return this.sqlite.prepare('SELECT MAX(rowid) AS value FROM jobs').get().value || 0;
+    }, { shouldPersist: () => false });
+    const selectBatch = this.sqlite.prepare(`
+      SELECT rowid AS cursor, id, status FROM jobs
+      WHERE rowid > ? AND rowid <= ? ORDER BY rowid LIMIT 200
+    `);
+    const deleteBatch = this.sqlite.transaction((ids) => {
+      for (const id of ids) this.statements.deleteRecord.jobs.run(id);
     });
-    this.rowState.jobs = snapshot.rowState.jobs;
-    this.orderKeys.jobs = snapshot.orderKeys.jobs;
-    this.partialCollections.delete('jobs');
+    let cursor = 0;
+    let removed = 0;
+    while (cursor < upperRow) {
+      await this.update((db) => {
+        this.flushPendingPersistSync();
+        const rows = selectBatch.all(cursor, upperRow);
+        cursor = rows.at(-1)?.cursor || upperRow;
+        const ids = new Set(rows.filter((row) => row.status && !['queued', 'running'].includes(row.status)).map((row) => row.id));
+        deleteBatch(ids);
+        db.jobs = db.jobs.filter((job) => !ids.has(job.id));
+        for (const id of ids) {
+          this.rowState.jobs.delete(id);
+          this.orderKeys.jobs.delete(id);
+        }
+        removed += ids.size;
+      }, { shouldPersist: () => false });
+      // Let generation, polling and balance writes run between small transactions.
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    this.refreshPartialCollectionState('jobs');
     this.adminStatsCache = null;
-
-    const removed = Number(result?.changes || 0);
-    runtimeLog(`SQLite request logs cleared ${removed} job record(s), before=${before}, remaining=${remaining}, duration=${Date.now() - startedAt}ms`);
+    const remaining = this.countRecords('jobs');
+    runtimeLog(`SQLite request logs cleared ${removed} job record(s), remaining=${remaining}, duration=${Date.now() - startedAt}ms`);
     return { removed, remaining };
   }
 
@@ -522,10 +536,6 @@ export class JsonStore {
         ORDER BY updated_at DESC
         LIMIT 100
       `, { cutoff: statsCutoff }),
-      queueJobs: this.selectItems('jobs', `
-        WHERE status IN ('queued', 'running')
-        ORDER BY created_at ASC
-      `),
       imageCount,
       imageTotal: imageCount,
       cacheImageCount: imageCount
@@ -533,6 +543,7 @@ export class JsonStore {
   }
 
   async readAdminSummaryStats() {
+    // Job writes must not invalidate this cache: traffic would disable caching entirely.
     const now = Date.now();
     if (this.adminStatsCache) {
       if (now - this.adminStatsCache.at >= 30_000 && !this.adminStatsPromise) this.refreshAdminStats(now);
@@ -678,24 +689,8 @@ export class JsonStore {
   }
 
   jobQueueProgress(job) {
-    if (!job || !['queued', 'running'].includes(job.status)) return { progress: 0, total: 0 };
-    const active = this.sqlite.prepare(`
-      SELECT COUNT(*) AS count
-      FROM jobs
-      WHERE status IN ('queued', 'running')
-    `).get();
-    const activeAhead = this.sqlite.prepare(`
-      SELECT COUNT(*) AS count
-      FROM jobs
-      WHERE status IN ('queued', 'running')
-        AND id != @id
-        AND created_at <= @createdAt
-    `).get({ id: job.id, createdAt: job.createdAt || '' });
-    const total = Math.max(1, Number(job.queueTotal || 0) || Number(active?.count || 0) || 1);
-    return {
-      progress: Math.min(total, Number(activeAhead?.count || 0) + 1),
-      total
-    };
+    // Use the exact in-memory order used by the scheduler, including unflushed writes.
+    return jobQueueProgress(job, this.db.jobs);
   }
 
   selectJobStatRows(clause = 'ORDER BY order_value DESC', params = {}) {
@@ -920,16 +915,18 @@ export class JsonStore {
     const table = collectionTables[collection];
     if (!table) return [];
     if (collection === 'jobs') {
-      return this.sqlite.prepare(`
-        SELECT id, order_value AS orderValue, data FROM ${table}
+      // Read the small active index separately; OR makes SQLite scan all history.
+      const active = this.sqlite.prepare(`
+        SELECT id, order_value AS orderValue, data FROM ${table} INDEXED BY idx_jobs_active_created
         WHERE status IN ('queued', 'running')
-           OR id IN (
-             SELECT id FROM ${table}
-             ORDER BY order_value DESC
-             LIMIT @limit
-           )
+      `).all();
+      const recent = this.sqlite.prepare(`
+        SELECT id, order_value AS orderValue, data FROM ${table}
         ORDER BY order_value DESC
+        LIMIT @limit
       `).all({ limit: runtimeCacheLimit('jobs') });
+      return [...new Map([...active, ...recent].map((row) => [row.id, row])).values()]
+        .sort((a, b) => b.orderValue - a.orderValue);
     }
     if (collection === 'images' || collection === 'ledger') {
       return this.sqlite.prepare(`
@@ -1027,7 +1024,6 @@ export class JsonStore {
       }
     });
     applyChanges();
-    if ([...changes.deletes, ...changes.upserts].some((change) => change.collection === 'jobs')) this.adminStatsCache = null;
     if (scope.includeSettings) this.settingsState = snapshot.settingsData;
     for (const collection of (scope.full ? collections : scope.collections)) {
       this.rowState[collection] = snapshot.rowState[collection];
@@ -1122,7 +1118,6 @@ export class JsonStore {
       }
     });
     applyChanges();
-    if ([...changes.deletes, ...changes.upserts].some((change) => change.collection === 'jobs')) this.adminStatsCache = null;
 
     if (changes.settingsChanged) this.settingsState = changes.nextSettings;
     for (const change of changes.deletes) {
@@ -1645,8 +1640,8 @@ function uniqueStrings(values = []) {
 }
 
 function trimImageCacheDeleteLimit(value) {
-  const number = Number(value ?? 300);
-  if (!Number.isFinite(number) || number <= 0) return 300;
+  const number = Number(value ?? 25);
+  if (!Number.isFinite(number) || number <= 0) return 25;
   return Math.max(1, Math.floor(number));
 }
 
@@ -1903,29 +1898,21 @@ function imageResolutionTier(image) {
 }
 
 function jobQueueProgress(job, jobs) {
-  if (job.status === 'running' && Number(job.queueTotal || 0) > 1) {
-    const total = Number(job.queueTotal || 0);
+  if (!job || !['queued', 'running'].includes(job.status)) return { progress: 0, total: 0 };
+  if (job.status === 'running') {
+    const total = Math.max(1, Number(job.queueTotal) || 1);
     return { progress: total, total };
   }
   const now = Date.now();
-  if (!isQueueActiveJob(job, now)) return { progress: 0, total: 0 };
-  const activeJobs = (Array.isArray(jobs) ? jobs : []).filter((item) => isQueueActiveJob(item, now));
-  const total = Math.max(1, Number(job.queueTotal || 0) || activeJobs.length || 1);
-  const createdAt = Date.parse(job.createdAt || '') || 0;
-  const activeAhead = activeJobs.filter((item) => {
-    if (item.id === job.id) return false;
-    const itemTime = Date.parse(item.createdAt || '') || 0;
-    return itemTime <= createdAt;
-  }).length;
-  return {
-    progress: Math.max(1, Math.min(total, total - activeAhead)),
-    total
-  };
-}
-
-function activeJobCount(jobs) {
-  const now = Date.now();
-  return (Array.isArray(jobs) ? jobs : []).filter((job) => isQueueActiveJob(job, now)).length;
+  let ahead = 0;
+  for (let index = jobs.length - 1; index >= 0; index--) {
+    const item = jobs[index];
+    if (item.id === job.id) break;
+    if (isQueueActiveJob(item, now)) ahead++;
+  }
+  const total = Math.max(1, Number(job.queueTotal) || ahead + 1);
+  // A free queue position is not a reserved account; only running may reach N/N.
+  return { progress: Math.max(1, Math.min(Math.max(1, total - 1), total - ahead)), total };
 }
 
 function isQueueActiveJob(job, now = Date.now()) {

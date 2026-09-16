@@ -290,10 +290,8 @@ async function route(req, res) {
     const revealTokens = url.searchParams.get('revealTokens') === '1';
     const statsJobs = db.statsJobs || db.jobs || [];
     const errorLogJobs = db.errorJobs || statsJobs;
-    const queueJobs = db.queueJobs || statsJobs;
     const computeStartedAt = Date.now();
     const accountStats1h = db.accountStats1h || Object.fromEntries(accountStatsMapSince(statsJobs, 60 * 60 * 1000));
-    const queueDb = { ...db, jobs: queueJobs };
     const payload = {
       settings: adminRuntimeSettings(db.settings),
       userCount: Number(db.userCount || 0),
@@ -312,7 +310,7 @@ async function route(req, res) {
       },
       usageHourlyDays: db.usageHourlyDays || hourlyUsageStatsByDay(statsJobs),
       errorLogs: errorLogs(errorLogJobs, db, 100),
-      jobs: db.jobs.slice(0, 50).map((job) => publicJob(job, queueDb))
+      jobs: db.jobs.slice(0, 50).map((job) => publicJob(job, db))
     };
     const computeMs = Date.now() - computeStartedAt;
     const sendStartedAt = Date.now();
@@ -3339,11 +3337,7 @@ function sanitizeMigrationData(payload) {
 }
 
 function publicJob(job, db = null) {
-  const queue = db?.queue || (db && job.status === 'queued'
-    ? stableQueueProgress(job, db.jobs)
-    : job.status === 'running' && Number(job.queueTotal || 0) > 1
-      ? { progress: Number(job.queueTotal || 0), total: Number(job.queueTotal || 0) }
-      : { progress: 0, total: 0 });
+  const queue = db?.queue || store.jobQueueProgress(job);
   const request = job.request || {};
   const account = db?.account || (db && job.accountId ? db.accounts.find((item) => item.id === job.accountId) : null);
   return {
@@ -3395,23 +3389,6 @@ function publicGenerationProgress(job = {}) {
     total: Number(progress.total || job.request?.steps || 0),
     active: true,
     updatedAt: progress.updatedAt || ''
-  };
-}
-
-function stableQueueProgress(job, jobs) {
-  const now = Date.now();
-  const activeJobs = (Array.isArray(jobs) ? jobs : []).filter((item) => isQueueActiveJob(item, now));
-  if (!isQueueActiveJob(job, now)) return { progress: 0, total: 0 };
-  const total = Math.max(1, Number(job.queueTotal || 0) || activeJobs.length || 1);
-  const createdAt = Date.parse(job.createdAt || '') || 0;
-  const activeAhead = activeJobs.filter((item) => {
-    if (item.id === job.id) return false;
-    const itemTime = Date.parse(item.createdAt || '') || 0;
-    return itemTime <= createdAt;
-  }).length;
-  return {
-    progress: Math.max(1, Math.min(total, total - activeAhead)),
-    total
   };
 }
 
