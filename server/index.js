@@ -46,7 +46,7 @@ const openAiSamplers = [
 ];
 const openAiImageModels = [
   { id: 'nai-diffusion-4-5-full', cost: 1 },
-  { id: 'nai-diffusion-5-full', cost: 5 }
+  { id: 'nai-diffusion-5-full', cost: 8 }
 ];
 const openAiSizeTiers = {
   '2K': {
@@ -284,7 +284,7 @@ async function route(req, res) {
     const startedAt = Date.now();
     assertAdmin(req, url);
     const readStartedAt = Date.now();
-    const db = await store.readAdminSummary();
+    const db = await store.readAdminSummary({ fresh: url.searchParams.get('fresh') === '1' });
     const readMs = Date.now() - readStartedAt;
     resetStaleAccountLoads(db.accounts);
     const revealTokens = url.searchParams.get('revealTokens') === '1';
@@ -3712,7 +3712,7 @@ function generationCost(request = null) {
 }
 
 function modelGenerationCost(model) {
-  return String(model || '') === 'nai-diffusion-5-full' ? 5 : 1;
+  return String(model || '') === 'nai-diffusion-5-full' ? 8 : 1;
 }
 
 function accountGenerationCost(request = null) {

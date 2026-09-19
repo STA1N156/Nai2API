@@ -15,6 +15,8 @@ const state = {
   requestLogExpanded: false,
   errorLogExpanded: false,
   summary: null,
+  summaryRequestSequence: 0,
+  refreshingSummary: false,
   userTotal: 0,
   userMatched: 0,
   userRequestSequence: 0,
@@ -138,7 +140,7 @@ bindEvents();
 setAuthenticated(false);
 bootAdmin();
 setInterval(() => {
-  if (!state.adminToken || el.dashboard.classList.contains('hidden') || state.loggingIn) return;
+  if (!state.adminToken || el.dashboard.classList.contains('hidden') || state.loggingIn || state.refreshingSummary) return;
   reloadDashboard().catch((error) => showToast(normalizeErrorMessage(error), true));
 }, adminAutoRefreshIntervalMs);
 
@@ -240,10 +242,10 @@ async function enterAdmin(options = {}) {
     if (!state.adminToken) return showToast('请输入 Admin Token', true);
     await api('/api/admin/ping', { admin: true, timeoutMs: 8000 });
     localStorage.setItem('nai.adminToken', state.adminToken);
-    setAuthenticated(true);
     if (!options.silent) showToast('正在加载后台数据...');
     try {
-      await reloadDashboard();
+      await reloadDashboard({ fresh: true });
+      setAuthenticated(true);
       await refreshImages(false);
       if (!options.silent) showToast('已进入后台');
     } catch (error) {
@@ -267,12 +269,21 @@ function setLoginBusy(isBusy) {
 }
 
 async function refreshAdmin() {
+  if (state.refreshingSummary) return;
+  if (!state.adminToken) return showToast('请先进入后台', true);
+  state.refreshingSummary = true;
+  const buttonText = el.refreshBtn.textContent;
+  el.refreshBtn.disabled = true;
+  el.refreshBtn.textContent = '刷新中...';
   try {
-    if (!state.adminToken) return showToast('请先进入后台', true);
-    await reloadDashboard();
+    await reloadDashboard({ fresh: true });
     showToast('监控已刷新');
   } catch (error) {
     showToast(normalizeErrorMessage(error), true);
+  } finally {
+    state.refreshingSummary = false;
+    el.refreshBtn.disabled = false;
+    el.refreshBtn.textContent = buttonText;
   }
 }
 
@@ -282,16 +293,19 @@ function setAuthenticated(isAuthenticated) {
   el.refreshBtn.classList.toggle('hidden', !isAuthenticated);
 }
 
-async function reloadDashboard() {
-  const summary = await loadSummary();
+async function reloadDashboard(options = {}) {
+  const summary = await loadSummary(options);
   renderSummary(summary, { renderImages: false });
   refreshUsers(false);
 }
 
-async function loadSummary() {
+async function loadSummary({ fresh = false } = {}) {
+  const sequence = ++state.summaryRequestSequence;
+  const summary = await api(`/api/admin/summary?revealTokens=1${fresh ? '&fresh=1' : ''}`, { admin: true });
+  if (sequence !== state.summaryRequestSequence && state.summary) return state.summary;
   const users = state.summary?.users || [];
   state.summary = {
-    ...await api('/api/admin/summary?revealTokens=1', { admin: true }),
+    ...summary,
     users
   };
   state.userTotal = Number(state.summary.userCount ?? state.userTotal ?? users.length);

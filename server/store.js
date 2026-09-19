@@ -112,6 +112,7 @@ export class JsonStore {
     this.adminReader = null;
     this.adminStatsCache = null;
     this.adminStatsPromise = null;
+    this.adminFreshStatsPromise = null;
     this.lastImageTrimAt = 0;
   }
 
@@ -520,8 +521,9 @@ export class JsonStore {
     };
   }
 
-  async readAdminSummary() {
+  async readAdminSummary(options = {}) {
     await this.ensureLoaded();
+    const stats = await this.readAdminSummaryStats(options);
     const statsCutoff = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
     const imageCount = this.countRecords('images');
     return {
@@ -529,7 +531,7 @@ export class JsonStore {
       userCount: this.db.users.length,
       accounts: structuredClone(this.db.accounts),
       jobs: this.selectItems('jobs', "WHERE status = 'failed' ORDER BY order_value DESC LIMIT 50"),
-      ...await this.readAdminSummaryStats(),
+      ...stats,
       errorJobs: this.selectItems('jobs', `
         WHERE error_loggable = 1
           AND updated_at >= @cutoff
@@ -542,30 +544,49 @@ export class JsonStore {
     };
   }
 
-  async readAdminSummaryStats() {
+  async readAdminSummaryStats({ fresh = false } = {}) {
+    if (fresh) return this.readFreshAdminStats();
     // Job writes must not invalidate this cache: traffic would disable caching entirely.
     const now = Date.now();
     if (this.adminStatsCache) {
-      if (now - this.adminStatsCache.at >= 30_000 && !this.adminStatsPromise) this.refreshAdminStats(now);
+      if (now - this.adminStatsCache.at >= 30_000 && !this.adminStatsPromise && !this.adminFreshStatsPromise) {
+        this.refreshAdminStats(now).catch(() => {});
+      }
       return structuredClone(this.adminStatsCache.value);
     }
-    return this.refreshAdminStats(now);
+    return (this.adminFreshStatsPromise || this.refreshAdminStats(now)).catch(() => emptyAdminStats(now));
+  }
+
+  async readFreshAdminStats() {
+    if (!this.adminFreshStatsPromise) {
+      this.adminFreshStatsPromise = (async () => {
+        try {
+          // An older background read may predate pending writes; run a new read after it.
+          await this.adminStatsPromise?.catch(() => {});
+          await this.queue.catch(() => {});
+          this.flushPendingPersistSync();
+          return await this.refreshAdminStats();
+        } finally {
+          this.adminFreshStatsPromise = null;
+        }
+      })();
+    }
+    return this.adminFreshStatsPromise;
   }
 
   async refreshAdminStats(now = Date.now()) {
     if (this.adminStatsPromise) return this.adminStatsPromise;
-    this.adminStatsPromise = (async () => {
-      try {
-        const value = await this.statsReader.request('adminStats', { now, days: usageChartDays }, 3_000);
+    this.adminStatsPromise = Promise.resolve()
+      .then(() => this.statsReader.request('adminStats', { now, days: usageChartDays }, 3_000))
+      .then((value) => {
         this.adminStatsCache = { at: now, value };
         return structuredClone(value);
-      } catch (error) {
+      }).catch((error) => {
         runtimeLog(`Admin stats worker unavailable: ${error.message}`);
-        return this.adminStatsCache ? structuredClone(this.adminStatsCache.value) : emptyAdminStats(now);
-      } finally {
+        throw error;
+      }).finally(() => {
         this.adminStatsPromise = null;
-      }
-    })();
+      });
     return this.adminStatsPromise;
   }
 

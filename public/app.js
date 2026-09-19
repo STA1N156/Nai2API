@@ -1198,7 +1198,7 @@ function generationCost() {
 }
 
 function selectedModelCost() {
-  return el.modelInput.value === 'nai-diffusion-5-full' ? 5 : 1;
+  return el.modelInput.value === 'nai-diffusion-5-full' ? 8 : 1;
 }
 
 function wait(ms) {

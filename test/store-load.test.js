@@ -110,6 +110,114 @@ test('generation writes do not invalidate the 30-second statistics cache', async
   assert.equal(store.sqlite.prepare('SELECT cost FROM jobs WHERE id = ?').get('charged').cost, 5);
 });
 
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((ok, fail) => { resolve = ok; reject = fail; });
+  return { promise, resolve, reject };
+}
+
+test('fresh requests wait for one shared new read while automatic requests keep using cache', async (t) => {
+  const store = await temporaryStore(t);
+  store.adminStatsCache = { at: 0, value: { requests: 0 } };
+  const started = deferred();
+  const result = deferred();
+  let requests = 0;
+  store.statsReader.request = async () => {
+    requests++;
+    started.resolve();
+    return result.promise;
+  };
+  const first = store.readAdminSummaryStats({ fresh: true });
+  const second = store.readAdminSummaryStats({ fresh: true });
+  await started.promise;
+  let completed = false;
+  first.then(() => { completed = true; });
+  assert.deepEqual(await store.readAdminSummaryStats(), { requests: 0 });
+  assert.equal(completed, false);
+  assert.equal(requests, 1);
+  result.resolve({ requests: 1 });
+  assert.deepEqual(await Promise.all([first, second]), [{ requests: 1 }, { requests: 1 }]);
+  assert.deepEqual(await store.readAdminSummaryStats(), { requests: 1 });
+  assert.equal(store.adminFreshStatsPromise, null);
+  assert.equal(requests, 1);
+});
+
+test('fresh summary flushes only pending changes and includes them in actual worker statistics', async (t) => {
+  const store = await temporaryStore(t);
+  const now = new Date().toISOString();
+  await store.update((db) => {
+    db.users.push({ id: 'user', token: 'test-only', balance: 92 });
+    db.accounts.push({ id: 'account', v5Quota: 42 });
+    db.ledger.push({ id: 'charge', amount: -8 });
+    db.jobs.push({ id: 'new', status: 'running', cost: 8, model: 'nai-diffusion-5-full', createdAt: now, updatedAt: now });
+  });
+  const before = await store.readAdminSummary();
+  assert.equal(before.jobStats1h.done, 0);
+  await store.update((db) => { db.jobs[0].status = 'done'; }, { dirtyRows: { jobs: ['new'] } });
+  assert.equal(store.selectItemById('jobs', 'new').status, 'running');
+  assert.equal((await store.readAdminSummary()).jobStats1h.done, 0);
+  const persist = store.persistIncremental.bind(store);
+  store.persistIncremental = (db, scope) => {
+    assert.ok(scope?.hasDirtyRows, 'fresh reads must not persist the entire database');
+    return persist(db, scope);
+  };
+  const latest = await store.readAdminSummary({ fresh: true });
+  assert.equal(latest.jobStats1h.done, 1);
+  assert.equal(latest.requestStats1m.total, 1);
+  assert.equal(latest.generationSpeed1h.v5.count, 1);
+  assert.equal(store.selectItemById('jobs', 'new').status, 'done');
+  assert.equal(store.selectItemById('jobs', 'new').cost, 8);
+  assert.equal(store.selectItemById('users', 'user').balance, 92);
+  assert.equal(store.selectItemById('accounts', 'account').v5Quota, 42);
+  assert.equal(store.selectItemById('ledger', 'charge').amount, -8);
+  assert.equal(store.pendingPersistScope, null);
+});
+
+test('fresh reads wait for older background work and queued writes before starting a new snapshot', async (t) => {
+  const store = await temporaryStore(t);
+  store.adminStatsCache = { at: 0, value: { requests: 0 } };
+  const background = deferred();
+  const updateReady = deferred();
+  let requests = 0;
+  store.statsReader.request = async () => {
+    requests++;
+    if (requests === 1) return background.promise;
+    assert.equal(store.selectItemById('jobs', 'queued-write').cost, 8);
+    return { requests };
+  };
+  assert.deepEqual(await store.readAdminSummaryStats(), { requests: 0 });
+  const update = store.update(async (db) => {
+    await updateReady.promise;
+    db.jobs.push({ id: 'queued-write', status: 'done', cost: 8 });
+  }, { dirtyRows: { jobs: ['queued-write'] } });
+  const fresh = store.readAdminSummaryStats({ fresh: true });
+  background.resolve({ requests: 1 });
+  await store.adminStatsPromise;
+  assert.equal(requests, 1);
+  updateReady.resolve();
+  await update;
+  assert.deepEqual(await fresh, { requests: 2 });
+});
+
+test('fresh read failures are reported, automatic reads retain cache, and retries work', async (t) => {
+  const store = await temporaryStore(t);
+  store.adminStatsCache = { at: 0, value: { requests: 1 } };
+  store.statsReader.request = async () => { throw new Error('test statistics unavailable'); };
+  assert.deepEqual(await store.readAdminSummaryStats(), { requests: 1 });
+  await assert.rejects(store.readAdminSummaryStats({ fresh: true }), /test statistics unavailable/);
+  assert.equal(store.adminStatsPromise, null);
+  assert.equal(store.adminFreshStatsPromise, null);
+  assert.deepEqual(store.adminStatsCache.value, { requests: 1 });
+  store.statsReader.request = () => { throw new Error('test worker failed to start'); };
+  await assert.rejects(store.readAdminSummaryStats({ fresh: true }), /test worker failed to start/);
+  assert.equal(store.adminStatsPromise, null);
+  assert.equal(store.adminFreshStatsPromise, null);
+  store.statsReader.request = async () => ({ requests: 2 });
+  assert.deepEqual(await store.readAdminSummaryStats({ fresh: true }), { requests: 2 });
+  assert.deepEqual(await store.readAdminSummaryStats(), { requests: 2 });
+});
+
 test('log clearing yields between batches and preserves active jobs and concurrent charges', async (t) => {
   const store = await temporaryStore(t);
   await store.update((db) => {
