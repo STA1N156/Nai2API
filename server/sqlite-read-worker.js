@@ -29,6 +29,13 @@ function readAdminStats({ now = Date.now(), days = 7 } = {}) {
     FROM jobs INDEXED BY idx_jobs_created_stats
     WHERE created_at >= ?
   `).get(oneMinuteAgo);
+  // Generation prices start at 1; zero/fractional-cost completions are cached deliveries.
+  const generationRow = sqlite.prepare(`
+    SELECT COUNT(*) AS total
+    FROM jobs INDEXED BY idx_jobs_updated_stats
+    WHERE updated_at >= @since AND updated_at <= @now
+      AND status = 'done' AND cost >= 1
+  `).get({ since: oneMinuteAgo, now: new Date(now).toISOString() });
   const accountRows = sqlite.prepare(`
     SELECT status, account_id AS accountId, stats_excluded AS statsExcluded, COUNT(*) AS count
     FROM jobs INDEXED BY idx_jobs_created_stats
@@ -57,7 +64,7 @@ function readAdminStats({ now = Date.now(), days = 7 } = {}) {
       strftime('%Y-%m-%d', datetime(updated_at, '+8 hours')) AS date,
       CAST(strftime('%H', datetime(updated_at, '+8 hours')) AS INTEGER) AS hour,
       status,
-      COUNT(*) AS count,
+      SUM(CASE WHEN status = 'failed' OR cost >= 1 THEN 1 ELSE 0 END) AS count,
       SUM(CASE WHEN status = 'done' THEN cost ELSE 0 END) AS credits
     FROM jobs INDEXED BY idx_jobs_updated_stats
     WHERE updated_at >= @cutoff
@@ -97,11 +104,12 @@ function readAdminStats({ now = Date.now(), days = 7 } = {}) {
 
   return {
     requestStats1m: { total: Number(requestRow?.total || 0) },
+    generationStats1m: { total: Number(generationRow?.total || 0) },
     jobStats1h: finalizeStats(jobStats),
     generationSpeed1h: speed,
     accountStats1h: accountStats,
     usageHourlyDays: buildUsageDays(usageRows, now, days),
-    statsRowsRead: accountRows.length + speedRows.length + usageRows.length + 1
+    statsRowsRead: accountRows.length + speedRows.length + usageRows.length + 2
   };
 }
 

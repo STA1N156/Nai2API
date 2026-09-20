@@ -154,6 +154,7 @@ test('fresh summary flushes only pending changes and includes them in actual wor
   });
   const before = await store.readAdminSummary();
   assert.equal(before.jobStats1h.done, 0);
+  assert.equal(before.generationStats1m.total, 0);
   await store.update((db) => { db.jobs[0].status = 'done'; }, { dirtyRows: { jobs: ['new'] } });
   assert.equal(store.selectItemById('jobs', 'new').status, 'running');
   assert.equal((await store.readAdminSummary()).jobStats1h.done, 0);
@@ -165,6 +166,7 @@ test('fresh summary flushes only pending changes and includes them in actual wor
   const latest = await store.readAdminSummary({ fresh: true });
   assert.equal(latest.jobStats1h.done, 1);
   assert.equal(latest.requestStats1m.total, 1);
+  assert.equal(latest.generationStats1m.total, 1);
   assert.equal(latest.generationSpeed1h.v5.count, 1);
   assert.equal(store.selectItemById('jobs', 'new').status, 'done');
   assert.equal(store.selectItemById('jobs', 'new').cost, 8);

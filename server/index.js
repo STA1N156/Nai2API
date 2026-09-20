@@ -17,6 +17,7 @@ const host = process.env.HOST || '0.0.0.0';
 const adminToken = process.env.ADMIN_TOKEN || '123456';
 const store = new JsonStore(dataDir);
 let queueDrainTimer = null;
+let queueDrainAt = 0;
 let queueDraining = false;
 let queueDrainRequested = false;
 let accountQuotaRefreshTimer = null;
@@ -303,6 +304,7 @@ async function route(req, res) {
       imageTotal: db.imageCount ?? 0,
       cacheImageCount: db.imageCount ?? 0,
       requestStats1m: db.requestStats1m || requestStatsSince(statsJobs, 60 * 1000),
+      generationStats1m: db.generationStats1m || { total: 0 },
       jobStats1h: db.jobStats1h || jobStatsSince(statsJobs, 60 * 60 * 1000),
       generationSpeed1h: db.generationSpeed1h || {
         v45: { seconds: null, count: 0 },
@@ -2917,12 +2919,20 @@ function nextAccountReadyDelay(accounts, settings = {}) {
 }
 
 function scheduleQueueDrain(delay = 0) {
-  if (queueDrainTimer || queueDraining) {
+  if (queueDraining) {
     queueDrainRequested = true;
     return;
   }
+  const runAt = Date.now() + delay;
+  if (queueDrainTimer) {
+    // A freed account can advance dispatch, but later retries must never postpone it.
+    if (runAt >= queueDrainAt) return;
+    clearTimeout(queueDrainTimer);
+  }
+  queueDrainAt = runAt;
   queueDrainTimer = setTimeout(() => {
     queueDrainTimer = null;
+    queueDrainAt = 0;
     drainQueuedJobs();
   }, delay);
 }
@@ -3501,12 +3511,13 @@ function hourlyUsageStatsByDay(jobs, days = usageChartDays) {
     if (!hourBucket) return;
     if (job.status === 'done') {
       const credits = Math.max(0, Number(job.cost || 0));
-      bucket.done += 1;
+      const generated = credits >= 1 ? 1 : 0;
+      bucket.done += generated;
+      hourBucket.done += generated;
       bucket.credits += credits;
       hourBucket.credits += credits;
     }
     if (job.status === 'failed') bucket.failed += 1;
-    if (job.status === 'done') hourBucket.done += 1;
     if (job.status === 'failed') hourBucket.failed += 1;
   });
 

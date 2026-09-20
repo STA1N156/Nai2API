@@ -1772,6 +1772,7 @@ function emptyAdminStats(now = Date.now()) {
   const buckets = usageBuckets(now, usageChartDays);
   return {
     requestStats1m: { total: 0 },
+    generationStats1m: { total: 0 },
     jobStats1h: { done: 0, failed: 0, total: 0, successRate: 0 },
     generationSpeed1h: {
       v45: { seconds: null, count: 0 },

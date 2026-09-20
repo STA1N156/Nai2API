@@ -41,7 +41,7 @@ const ids = [
   'adminToken',
   'enterAdminBtn',
   'refreshBtn',
-  'metricUsers',
+  'metricGenerated1m',
   'metricSpeed1h',
   'metricCredits',
   'metricAccounts',
@@ -842,7 +842,7 @@ function renderSummary(summary, options = {}) {
   const requestStats = requestStats1h(summary);
   const jobPageCount = Math.max(1, Math.ceil(summary.jobs.length / jobPageSize));
   if (state.jobPage > jobPageCount) state.jobPage = jobPageCount;
-  el.metricUsers.textContent = formatNumber(summary.requestStats1m?.total || 0);
+  el.metricGenerated1m.textContent = formatNumber(summary.generationStats1m?.total || 0);
   el.metricSpeed1h.textContent = formatGenerationSpeed(summary.generationSpeed1h);
   el.metricCredits.textContent = `${formatPercent(requestStats.successRate)}%`;
   el.metricAccounts.textContent = enabledAccounts;
