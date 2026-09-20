@@ -8,12 +8,7 @@ const state = {
   toastTimer: null,
   resultHistory: [],
   resultHistoryIndex: -1,
-  optimizedPairs: new Map(),
   previewOriginalUrl: '',
-  previewOptimizedUrl: '',
-  optimizedLookupId: 0,
-  optimizeWaveFrame: null,
-  optimizing: false,
   generating: false,
   previewFeed: null,
   previewJobs: new Map(),
@@ -66,12 +61,10 @@ const ids = [
   'nextResultBtn',
   'resultPreviewStage',
   'resultPreviewImage',
-  'comparisonPreviewImage',
-  'comparisonSlider',
-  'comparisonRange',
-  'optimizeImageBtn',
-  'optimizeFluid',
-  'optimizeWaveCanvas',
+  'parameterHelpDialog',
+  'parameterHelpTitle',
+  'parameterHelpText',
+  'parameterHelpSource',
   'toast'
 ];
 const el = Object.fromEntries(ids.map((id) => [id, document.querySelector(`#${id}`)]));
@@ -160,6 +153,29 @@ const snippetParamOrder = [
   'noise_schedule'
 ];
 
+const parameterHelp = {
+  steps: {
+    title: '迭代步数',
+    text: '模型逐步完成图片的迭代次数，更多步数通常需要更久，花费更多，高步数可能会提升画面精细程度，也可能适得其反。\n\n支持 1–50 步，超过 28 步会进入更高的扣费档位，具体点数以“生成图片”按钮显示为准。',
+    source: 'https://docs.novelai.net/en/image/stepsguidance/'
+  },
+  sampler: {
+    title: '采样器',
+    text: '决定模型如何把噪点逐步变成图片，会影响细节、质感和生成用时。不同采样器各有特点，并不是名字越复杂就越好。\n\n不熟悉时可以先用 DPM++ 2M SDE，不必频繁切换。更换采样器后，即使提示词相同，结果也可能不同。',
+    source: 'https://docs.novelai.net/en/image/sampling/'
+  },
+  scale: {
+    title: '提示词引导强度',
+    text: '控制提示词对画面的影响。数值较高通常更强调提示词，但太高也可能让颜色过重、细节生硬。较低时画面通常更柔和。\n\n范围为 1–20，可以从 5–6 开始微调。它不是分辨率，也不是越高越好。',
+    source: 'https://docs.novelai.net/en/image/stepsguidance/#prompt-guidance'
+  },
+  cfg: {
+    title: '引导重缩放',
+    text: '这里实际对应 CFG Rescale，和提示词引导强度不是同一个参数。它用于缓和较高引导强度可能造成的颜色过重、过饱和等问题。\n\n范围为 0–1，0 表示不启用。可以先保持 0；颜色太浓时再少量增加并对比效果。它也会改变画面观感，不是清晰度开关。',
+    source: 'https://docs.novelai.net/en/image/stepsguidance/#prompt-guidance-rescale'
+  }
+};
+
 await boot().catch((error) => {
   console.error(error);
   renderFrameNotice('连接服务超时，请刷新重试', true);
@@ -179,6 +195,20 @@ async function boot() {
 }
 
 function bindEvents() {
+  document.querySelectorAll('[data-parameter-help]').forEach(button => {
+    button.addEventListener('click', () => {
+      const help = parameterHelp[button.dataset.parameterHelp];
+      el.parameterHelpTitle.textContent = help.title;
+      el.parameterHelpText.textContent = help.text;
+      el.parameterHelpSource.href = help.source;
+      el.parameterHelpDialog.showModal();
+    });
+  });
+  el.parameterHelpDialog.addEventListener('click', event => {
+    if (event.target !== el.parameterHelpDialog) return;
+    const rect = el.parameterHelpDialog.getBoundingClientRect();
+    if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) el.parameterHelpDialog.close();
+  });
   el.saveTokenBtn.addEventListener('click', saveToken);
   el.toggleMergeBtn.addEventListener('click', () => setMergePanelOpen(el.mergeFields.hidden));
   el.mergeTokenBtn.addEventListener('click', mergeTokenBalance);
@@ -195,8 +225,6 @@ function bindEvents() {
   el.copySnippetTopBtn.addEventListener('click', () => copyText(buildSnippet(), '嵌入代码已复制'));
   el.imageFrame.addEventListener('click', handleResultPreview);
   el.resultPreviewImage.addEventListener('click', toggleResultZoom);
-  el.optimizeImageBtn.addEventListener('click', optimizeCurrentImage);
-  el.comparisonRange.addEventListener('input', updateComparisonPosition);
   el.resultPreviewImage.addEventListener('pointerdown', startPreviewDrag);
   el.resultPreview.addEventListener('pointermove', movePreviewDrag);
   el.resultPreview.addEventListener('pointerup', stopPreviewDrag);
@@ -225,18 +253,14 @@ function bindEvents() {
     el.promptInput,
     el.samplerInput,
     el.sizeInput,
-    el.scaleInput,
-    el.cfgInput,
     el.negativeInput
   ].forEach((input) => input.addEventListener('input', updateUrlOutputs));
-  el.stepsInput.addEventListener('input', () => {
-    populateSizeOptions();
-    updateUrlOutputs();
-  });
-  el.stepsInput.addEventListener('change', () => {
-    el.stepsInput.value = normalizeSteps(el.stepsInput.value);
-    populateSizeOptions();
-    updateUrlOutputs();
+  [el.stepsInput, el.scaleInput, el.cfgInput].forEach(input => {
+    input.addEventListener('input', () => {
+      updateParameterValue(input);
+      if (input === el.stepsInput) populateSizeOptions();
+      updateUrlOutputs();
+    });
   });
   el.artistPresetInput.addEventListener('change', applyArtistPreset);
   el.modelInput.addEventListener('change', () => {
@@ -244,11 +268,17 @@ function bindEvents() {
     updateUrlOutputs();
     updateGenerateCostLabel();
   });
-  el.sizeInput.addEventListener('change', updateGenerateCostLabel);
+  el.sizeInput.addEventListener('change', () => {
+    updateGenerateCostLabel();
+  });
   el.artistInput.addEventListener('input', () => {
     syncArtistPresetSelection();
     updateUrlOutputs();
   });
+}
+
+function updateParameterValue(input) {
+  input.nextElementSibling.value = input.value;
 }
 
 function openPromptConvert() {
@@ -338,6 +368,7 @@ function applyDefaults() {
   el.sizeInput.value = state.settings.defaults?.size || '竖图';
   el.scaleInput.value = state.settings.defaults?.scale || 6;
   el.cfgInput.value = state.settings.defaults?.cfg || 0;
+  [el.stepsInput, el.scaleInput, el.cfgInput].forEach(updateParameterValue);
 }
 
 async function saveToken() {
@@ -901,126 +932,17 @@ function showResultHistory(index) {
   if (!state.resultHistory.length) return;
   state.resultHistoryIndex = Math.max(0, Math.min(state.resultHistory.length - 1, Number(index || 0)));
   state.previewOriginalUrl = state.resultHistory[state.resultHistoryIndex];
-  state.previewOptimizedUrl = state.optimizedPairs.get(state.previewOriginalUrl) || '';
-  if (state.previewOptimizedUrl) {
-    activateComparison(state.previewOriginalUrl, state.previewOptimizedUrl);
-  } else {
-    clearComparison();
-    el.resultPreviewImage.src = state.previewOriginalUrl;
-  }
+  el.resultPreviewImage.src = state.previewOriginalUrl;
   setPreviewScale(1);
   updateResultHistoryNav();
-  updateOptimizeButton();
-  loadOptimizedPreview(state.previewOriginalUrl);
 }
 
 function updateResultHistoryNav() {
   const hasMultiple = state.resultHistory.length > 1;
   el.prevResultBtn.hidden = !hasMultiple;
   el.nextResultBtn.hidden = !hasMultiple;
-  el.prevResultBtn.disabled = state.optimizing || state.resultHistoryIndex <= 0;
-  el.nextResultBtn.disabled = state.optimizing || state.resultHistoryIndex >= state.resultHistory.length - 1;
-}
-
-async function optimizeCurrentImage(event) {
-  event?.stopPropagation();
-  if (state.optimizing || state.previewOptimizedUrl) return;
-  const token = el.userToken.value.trim();
-  const sourceUrl = state.previewOriginalUrl;
-  const imageId = resultImageId(sourceUrl);
-  if (!token) return showToast('请先连接密钥', true);
-  if (!imageId) return showToast('当前图片无法进行重构优化', true);
-
-  state.optimizing = true;
-  setPreviewScale(1);
-  el.resultPreviewStage.classList.add('optimizing');
-  startOptimizeWave();
-  el.optimizeImageBtn.disabled = true;
-  el.optimizeImageBtn.textContent = '优化中';
-  updateResultHistoryNav();
-  try {
-    const result = await api(`/api/images/${encodeURIComponent(imageId)}/optimize`, {
-      method: 'POST',
-      body: { token },
-      timeoutMs: 10 * 60_000
-    });
-    const optimizedUrl = normalizeResultUrl(result.image.imageUrl);
-    await preloadImage(optimizedUrl);
-    state.optimizedPairs.set(sourceUrl, optimizedUrl);
-    state.previewOptimizedUrl = optimizedUrl;
-    el.resultPreviewStage.classList.add('optimized-reveal');
-    activateComparison(sourceUrl, optimizedUrl);
-    requestAnimationFrame(() => el.resultPreviewStage.classList.remove('optimizing'));
-    setTimeout(() => el.resultPreviewStage.classList.remove('optimized-reveal'), 1100);
-    showToast('4K 重构优化完成');
-  } catch (error) {
-    el.resultPreviewStage.classList.remove('optimizing');
-    showToast(error.message || '图片优化失败', true);
-  } finally {
-    state.optimizing = false;
-    stopOptimizeWave();
-    updateResultHistoryNav();
-    updateOptimizeButton();
-  }
-}
-
-async function loadOptimizedPreview(sourceUrl) {
-  if (!sourceUrl || state.optimizedPairs.has(sourceUrl)) return;
-  const token = el.userToken.value.trim();
-  const imageId = resultImageId(sourceUrl);
-  if (!token || !imageId) return;
-  const lookupId = ++state.optimizedLookupId;
-  try {
-    const result = await api(`/api/images/${encodeURIComponent(imageId)}/optimized`, { token });
-    if (!result.image) return;
-    const optimizedUrl = normalizeResultUrl(result.image.imageUrl);
-    await preloadImage(optimizedUrl);
-    state.optimizedPairs.set(sourceUrl, optimizedUrl);
-    if (lookupId !== state.optimizedLookupId || state.previewOriginalUrl !== sourceUrl || el.resultPreview.classList.contains('hidden')) return;
-    state.previewOptimizedUrl = optimizedUrl;
-    activateComparison(sourceUrl, optimizedUrl);
-  } catch {
-    // 查询失败不影响原图预览和正常生图。
-  }
-}
-
-function activateComparison(originalUrl, optimizedUrl) {
-  setPreviewScale(1);
-  el.resultPreviewImage.src = optimizedUrl;
-  el.comparisonPreviewImage.src = originalUrl;
-  el.comparisonRange.value = '20';
-  el.resultPreviewStage.classList.add('comparison-active');
-  el.comparisonSlider.hidden = false;
-  updateComparisonPosition();
-  updateOptimizeButton();
-}
-
-function clearComparison() {
-  el.resultPreviewStage.classList.remove('comparison-active');
-  el.resultPreviewStage.style.removeProperty('--comparison-position');
-  el.comparisonSlider.hidden = true;
-  el.comparisonPreviewImage.removeAttribute('src');
-}
-
-function updateComparisonPosition() {
-  const position = Math.max(0, Math.min(100, Number(el.comparisonRange.value) || 0));
-  el.resultPreviewStage.style.setProperty('--comparison-position', `${position}%`);
-}
-
-function resultImageId(src) {
-  try {
-    const parts = new URL(src, location.href).pathname.split('/');
-    return parts[1] === 'api' && parts[2] === 'images' && parts[4] === 'content' ? decodeURIComponent(parts[3] || '') : '';
-  } catch {
-    return '';
-  }
-}
-
-function updateOptimizeButton() {
-  const hasComparison = Boolean(state.previewOptimizedUrl);
-  el.optimizeImageBtn.hidden = hasComparison || !resultImageId(state.previewOriginalUrl);
-  el.optimizeImageBtn.disabled = state.optimizing;
-  el.optimizeImageBtn.textContent = state.optimizing ? '优化中' : '重构优化';
+  el.prevResultBtn.disabled = state.resultHistoryIndex <= 0;
+  el.nextResultBtn.disabled = state.resultHistoryIndex >= state.resultHistory.length - 1;
 }
 
 function preloadImage(src) {
@@ -1032,78 +954,8 @@ function preloadImage(src) {
   });
 }
 
-function startOptimizeWave() {
-  stopOptimizeWave();
-  const canvas = el.optimizeWaveCanvas;
-  const context = canvas.getContext('2d');
-  const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-  let startedAt = null;
-  const draw = (time = 0) => {
-    if (startedAt === null) startedAt = time;
-    const width = canvas.clientWidth;
-    const height = canvas.clientHeight;
-    if (!width || !height) return;
-    const pixelRatio = Math.min(window.devicePixelRatio || 1, 2);
-    const targetWidth = Math.round(width * pixelRatio);
-    const targetHeight = Math.round(height * pixelRatio);
-    if (canvas.width !== targetWidth || canvas.height !== targetHeight) {
-      canvas.width = targetWidth;
-      canvas.height = targetHeight;
-    }
-    context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
-    context.clearRect(0, 0, width, height);
-
-    const spacing = 18;
-    const waveWidth = Math.max(54, Math.min(width, height) * 0.12);
-    const centerX = width / 2;
-    const centerY = height / 2;
-    const maxRadius = Math.hypot(centerX, centerY);
-    const travelDistance = maxRadius + waveWidth * 7;
-    const progress = reduceMotion
-      ? -waveWidth * 2
-      : ((time - startedAt) * 0.19) % travelDistance - waveWidth * 2;
-    const elapsed = (time - startedAt) / 1000;
-    for (let y = -spacing; y <= height + spacing; y += spacing) {
-      for (let x = -spacing; x <= width + spacing; x += spacing) {
-        const offsetX = x - centerX;
-        const offsetY = y - centerY;
-        const radiusFromCenter = Math.hypot(offsetX, offsetY);
-        const distance = radiusFromCenter - progress;
-        const phase = distance / waveWidth;
-        const envelope = Math.exp(-phase * phase * 0.5);
-        const motion = (1 - phase * phase) * envelope;
-        const flow = Math.sin(x * 0.012 + y * 0.009 - elapsed * 1.35) * envelope;
-        const texture = Math.sin(x * 0.031 + y * 0.023) * 0.07;
-        const lift = motion * 5.4;
-        const dotRadius = 0.9 + texture + envelope * 1.55 + motion * 0.18;
-        const alpha = 0.3 + envelope * 0.45 + motion * 0.05;
-        const directionX = radiusFromCenter ? offsetX / radiusFromCenter : 0;
-        const directionY = radiusFromCenter ? offsetY / radiusFromCenter : 0;
-        const driftX = directionX * lift - directionY * flow * 1.25;
-        const driftY = directionY * lift + directionX * flow * 1.25;
-        context.beginPath();
-        context.arc(x + driftX, y + driftY, Math.max(0.55, dotRadius), 0, Math.PI * 2);
-        context.fillStyle = `rgba(224, 228, 225, ${alpha})`;
-        context.fill();
-      }
-    }
-
-    if (!reduceMotion && state.optimizing) state.optimizeWaveFrame = requestAnimationFrame(draw);
-  };
-  state.optimizeWaveFrame = requestAnimationFrame(draw);
-}
-
-function stopOptimizeWave() {
-  if (state.optimizeWaveFrame) cancelAnimationFrame(state.optimizeWaveFrame);
-  state.optimizeWaveFrame = null;
-  const canvas = el.optimizeWaveCanvas;
-  const context = canvas?.getContext('2d');
-  if (context) context.clearRect(0, 0, canvas.width, canvas.height);
-}
-
 function toggleResultZoom(event) {
   event.stopPropagation();
-  if (state.optimizing || state.previewOptimizedUrl) return;
   if (state.previewDragged) {
     state.previewDragged = false;
     return;
@@ -1112,7 +964,7 @@ function toggleResultZoom(event) {
 }
 
 function handlePreviewWheel(event) {
-  if (state.optimizing || state.previewOptimizedUrl || isCoarsePointer() || el.resultPreview.classList.contains('hidden')) return;
+  if (isCoarsePointer() || el.resultPreview.classList.contains('hidden')) return;
   event.preventDefault();
   const now = performance.now();
   if (now - state.lastPreviewWheelAt < 22) return;
@@ -1136,7 +988,7 @@ function setPreviewScale(value) {
 }
 
 function startPreviewDrag(event) {
-  if (state.optimizing || state.previewOptimizedUrl || state.previewScale <= 1.01 || isCoarsePointer()) return;
+  if (state.previewScale <= 1.01 || isCoarsePointer()) return;
   event.preventDefault();
   state.previewDragging = true;
   state.previewDragged = false;
@@ -1183,11 +1035,6 @@ function closeResultPreview() {
   state.previewDragging = false;
   state.previewDragged = false;
   el.resultPreviewImage.removeAttribute('src');
-  el.resultPreviewStage.classList.remove('optimizing', 'optimized-reveal', 'comparison-active');
-  el.resultPreviewStage.style.removeProperty('--comparison-position');
-  el.comparisonPreviewImage.removeAttribute('src');
-  el.comparisonSlider.hidden = true;
-  stopOptimizeWave();
   updateResultHistoryNav();
   document.documentElement.classList.remove('modal-open');
   document.body.classList.remove('modal-open');

@@ -29,7 +29,7 @@ test('image preload waits for decode and returns the same ready-to-display image
     decode() { return decode.promise; }
   }
   const context = vm.createContext({ Image });
-  vm.runInContext(section('function preloadImage(', 'function startOptimizeWave('), context);
+  vm.runInContext(section('function preloadImage(', 'function toggleResultZoom('), context);
   const result = context.preloadImage('/final.png');
   let ready = false;
   result.then(() => { ready = true; });

@@ -61,23 +61,12 @@
             <span>02</span>
             <strong>生成参数</strong>
           </div>
-          <div class="grid-three">
+          <div class="grid-three parameter-grid">
             <label>
               <span>模型</span>
               <select id="modelInput">
                 <option value="nai-diffusion-4-5-full">V4.5 完整版</option>
                 <option value="nai-diffusion-5-full">V5 完整版</option>
-              </select>
-            </label>
-            <label>
-              <span>采样器</span>
-              <select id="samplerInput">
-                <option value="k_dpmpp_2m_sde">DPM++ 2M SDE</option>
-                <option value="k_dpmpp_2m">DPM++ 2M</option>
-                <option value="k_dpmpp_sde">DPM++ SDE</option>
-                <option value="k_dpmpp_2s_ancestral">DPM++ 2S Ancestral</option>
-                <option value="k_euler_ancestral">Euler Ancestral</option>
-                <option value="k_euler">Euler</option>
               </select>
             </label>
             <label>
@@ -88,22 +77,56 @@
                 <option>方图</option>
               </select>
             </label>
+            <div class="parameter-field">
+              <div class="parameter-label">
+                <label for="stepsInput">迭代步数</label>
+                <button class="parameter-help-button" type="button" data-parameter-help="steps" aria-label="迭代步数说明" aria-haspopup="dialog">?</button>
+              </div>
+              <div class="parameter-range">
+                <input id="stepsInput" type="range" min="1" max="50" step="1" value="28" />
+                <output for="stepsInput" aria-hidden="true">28</output>
+              </div>
+            </div>
           </div>
-
-          <div class="grid-three param-grid">
-            <label>
-              <span>步数</span>
-              <input id="stepsInput" type="number" inputmode="numeric" min="1" max="50" step="1" value="28" />
-            </label>
-            <label>
-              <span>Scale</span>
-              <input id="scaleInput" type="number" min="1" max="20" step="0.5" value="6" />
-            </label>
-            <label>
-              <span>CFG</span>
-              <input id="cfgInput" type="number" min="0" max="1" step="0.05" value="0" />
-            </label>
-          </div>
+          <details class="advanced-prompts">
+            <summary>高级设置</summary>
+            <div class="grid-three parameter-grid">
+              <div class="parameter-field">
+                <div class="parameter-label">
+                  <label for="samplerInput">采样器</label>
+                  <button class="parameter-help-button" type="button" data-parameter-help="sampler" aria-label="采样器说明" aria-haspopup="dialog">?</button>
+                </div>
+                <select id="samplerInput">
+                  <option value="k_dpmpp_2m_sde">DPM++ 2M SDE</option>
+                  <option value="k_dpmpp_2m">DPM++ 2M</option>
+                  <option value="k_dpmpp_sde">DPM++ SDE</option>
+                  <option value="k_dpmpp_2s_ancestral">DPM++ 2S Ancestral</option>
+                  <option value="k_euler_ancestral">Euler Ancestral</option>
+                  <option value="k_euler">Euler</option>
+                </select>
+              </div>
+              <div class="parameter-field">
+                <div class="parameter-label">
+                  <label for="scaleInput">提示词引导强度</label>
+                  <button class="parameter-help-button" type="button" data-parameter-help="scale" aria-label="提示词引导强度说明" aria-haspopup="dialog">?</button>
+                </div>
+                <div class="parameter-range">
+                  <input id="scaleInput" type="range" min="1" max="20" step="0.5" value="6" />
+                  <output for="scaleInput" aria-hidden="true">6</output>
+                </div>
+              </div>
+              <div class="parameter-field">
+                <div class="parameter-label">
+                  <label for="cfgInput">引导重缩放</label>
+                  <button class="parameter-help-button" type="button" data-parameter-help="cfg" aria-label="引导重缩放说明" aria-haspopup="dialog">?</button>
+                </div>
+                <div class="parameter-range">
+                  <input id="cfgInput" type="range" min="0" max="1" step="0.1" value="0" />
+                  <output for="cfgInput" aria-hidden="true">0</output>
+                </div>
+              </div>
+            </div>
+          </details>
         </div>
 
         <div class="form-section">
@@ -169,17 +192,7 @@
       <button id="prevResultBtn" class="preview-nav preview-prev" type="button" aria-label="上一张">‹</button>
       <button id="nextResultBtn" class="preview-nav preview-next" type="button" aria-label="下一张">›</button>
       <div id="resultPreviewStage" class="preview-stage result-preview-stage">
-        <div id="optimizeFluid" class="optimize-fluid" aria-hidden="true">
-          <canvas id="optimizeWaveCanvas"></canvas>
-          <strong>正在进行 4K 重构优化</strong>
-        </div>
         <img id="resultPreviewImage" alt="生成图片预览" />
-        <img id="comparisonPreviewImage" class="comparison-preview-image" alt="" aria-hidden="true" />
-        <div id="comparisonSlider" class="comparison-slider" hidden>
-          <span class="comparison-divider"><b aria-hidden="true">↔</b></span>
-          <input id="comparisonRange" type="range" min="0" max="100" value="20" aria-label="拖动查看优化前后对比" />
-        </div>
-        <button id="optimizeImageBtn" class="preview-optimize-button" type="button">重构优化</button>
       </div>
     </div>
 
@@ -200,6 +213,15 @@
         <button id="promptConvertSubmitBtn" class="primary wide" type="button">转换并填入</button>
       </div>
     </div>
+
+    <dialog id="parameterHelpDialog" class="parameter-help-dialog" aria-labelledby="parameterHelpTitle" aria-describedby="parameterHelpText">
+      <div class="parameter-help-heading">
+        <h3 id="parameterHelpTitle"></h3>
+        <form method="dialog"><button class="prompt-convert-close" aria-label="关闭参数说明" autofocus>×</button></form>
+      </div>
+      <p id="parameterHelpText"></p>
+      <a id="parameterHelpSource" target="_blank" rel="noopener noreferrer">NovelAI 官方说明 ↗</a>
+    </dialog>
 
     <div id="toast" class="toast" role="status"></div>
     <script src="/app.js" type="module"></script>

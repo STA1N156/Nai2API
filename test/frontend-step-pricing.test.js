@@ -186,12 +186,32 @@ test('upstream insufficient-points error blocks paid routing without overwriting
   assert.equal(api.selectAccount(db.accounts, {}, { request }).id, 'account');
 });
 
-test('UI retains only the prompt disclosure, not the reverted mobile toolbar or layout overrides', () => {
+test('UI retains collapsed advanced settings and prompts without image-editing controls or layout overrides', () => {
   const html = readFileSync(new URL('../public/index.html', import.meta.url), 'utf8');
   const css = readFileSync(new URL('../public/styles.css', import.meta.url), 'utf8');
   assert.match(html, /<details class="advanced-prompts">\s*<summary>画师串与负面提示词<\/summary>/);
   assert.match(html, /id="stepsInput"[^>]*max="50"/);
+  assert.match(html, /<label for="stepsInput">迭代步数<\/label>/);
+  const advanced = html.match(/<details class="advanced-prompts">\s*<summary>高级设置<\/summary>([\s\S]*?)<\/details>/);
+  assert.ok(advanced);
+  for (const id of ['samplerInput', 'scaleInput', 'cfgInput']) assert.ok(advanced[1].includes(`id="${id}"`));
+  assert.doesNotMatch(`${html}\n${frontend}\n${css}\n${server}`, /imageEditor|ImageInputs|imageEditPanel|preview-edit-actions|editUpload|inpaintImageBtn|useBaseImageBtn|重构优化|optimizeStoredImage/);
   assert.doesNotMatch(`${html}\n${frontend}\n${css}`, /mobileGenerateBtn|mobile-generation-bar|model-param-grid/);
   assert.doesNotMatch(css, /\.user-shell input,/);
   assert.match(css, /\.composer-panel:has\(\.custom-select\.open\)\s*\{\s*z-index: 2;/);
+});
+
+test('stale image-editing submissions are rejected before reserving credits or creating jobs', async () => {
+  const route = section(server, "  if (method === 'POST' && ['/api/jobs', '/api/web/jobs']", "  if (method === 'GET' && url.pathname === '/api/jobs/events')");
+  let reserved = 0;
+  for (const mode of ['img2img', 'infill']) {
+    const submit = vm.runInNewContext(`(async () => { ${route} })`, {
+      method: 'POST', url: new URL('http://localhost/api/web/jobs'), req: {},
+      readJson: async () => ({ edit: { mode }, token: 'test' }),
+      createJob: () => { reserved++; },
+      httpError: (statusCode, message) => Object.assign(new Error(message), { statusCode })
+    });
+    await assert.rejects(submit(), { statusCode: 400, message: '图片编辑功能已移除，请刷新页面后重试。' });
+  }
+  assert.equal(reserved, 0);
 });
