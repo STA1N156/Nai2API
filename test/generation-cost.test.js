@@ -2,7 +2,8 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import vm from 'node:vm';
-import { DIRECT_URL_MAX_STEPS, normalizeNovelAiRequest, sizeCostMap } from '../server/providers.js';
+import { MAX_STEPS, DIRECT_URL_MAX_STEPS, normalizeNovelAiRequest, sizeCostMap } from '../server/providers.js';
+import { frontendGenerationCost } from '../public/generation-pricing.js';
 
 const server = readFileSync(new URL('../server/index.js', import.meta.url), 'utf8');
 const frontend = readFileSync(new URL('../public/app.js', import.meta.url), 'utf8');
@@ -16,21 +17,20 @@ function section(source, start, end) {
 }
 const pricing = section(server, 'function generationCost(', 'function requestCacheKey(');
 
-test('V5 standard costs 8 even with an old client cost; other tiers and upstream quota are unchanged', () => {
-  const api = vm.runInNewContext(`${pricing}; ({ generationCost, accountGenerationCost })`, { sizeCostMap });
+test('V5 standard costs 8 even with an old client cost; other user pricing tiers are unchanged', () => {
+  const api = vm.runInNewContext(`${pricing}; ({ generationCost })`, { sizeCostMap });
   for (const [size, sizeCost] of Object.entries(sizeCostMap)) {
     for (const model of [v45, v5]) {
       for (const cost of [undefined, 0, -8, 1, 5]) {
         const request = { size, model, cost };
         assert.equal(api.generationCost(request), Math.max(sizeCost, model === v5 ? 8 : 1, cost || 0));
-        assert.equal(api.accountGenerationCost(request), sizeCost > 1 ? sizeCost : 0);
       }
     }
   }
 });
 
 test('frontend and OpenAI model catalog match server prices, including batch totals', () => {
-  const el = { modelInput: { value: v5 }, sizeInput: { value: '竖图' }, directGenerateBtn: {} };
+  const el = { modelInput: { value: v5 }, sizeInput: { value: '竖图' }, stepsInput: { value: 28 }, directGenerateBtn: {} };
   const state = { generationCount: 1 };
   const ui = vm.runInNewContext(`
     ${section(frontend, 'const sizeOptions =', 'const paramOrder =')}
@@ -38,7 +38,7 @@ test('frontend and OpenAI model catalog match server prices, including batch tot
     ${section(frontend, 'function updateGenerateCostLabel(', 'function setGenerationCount(')}
     ${section(frontend, 'function totalGenerationCost(', 'function wait(')}
     ({ generationCost, totalGenerationCost, populateSizeOptions, updateGenerateCostLabel });
-  `, { el, state, refreshSelect: () => {} });
+  `, { el, state, refreshSelect: () => {}, frontendGenerationCost, normalizeSteps: Number });
   const catalog = vm.runInNewContext(`
     ${section(server, 'const openAiSamplers =', 'const insufficientBalanceMessage =')}
     ${section(server, 'function openAiModelsResponse(', 'function parseOpenAiImageRequest(')}
@@ -79,7 +79,7 @@ test('web, URL and OpenAI jobs reserve 8, reject insufficient balance and refund
       ${section(server, 'function refundJob(', 'function hourlyUsageStatsByDay(')}
       ({ createJob, createDirectJob, refundJob });
     `, {
-      sizeCostMap, normalizeNovelAiRequest, DIRECT_URL_MAX_STEPS,
+      sizeCostMap, normalizeNovelAiRequest, DIRECT_URL_MAX_STEPS, MAX_STEPS, frontendGenerationCost,
       store: { update: async (mutate) => mutate(db) },
       cleanupStaleActiveJobs: async () => {},
       getUserOrThrow: () => user,

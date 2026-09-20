@@ -750,6 +750,10 @@ textarea.locked {
   padding: 24px;
 }
 
+.composer-panel:has(.custom-select.open) {
+  z-index: 2;
+}
+
 .form-section {
   border-top: 1px solid var(--line);
   padding-top: 20px;
@@ -868,6 +872,22 @@ textarea.locked {
 
 .param-grid {
   margin-top: 2px;
+}
+
+.advanced-prompts {
+  margin-top: 12px;
+  border-top: 1px solid var(--line);
+}
+
+.advanced-prompts summary {
+  padding: 14px 0;
+  color: var(--ink-soft);
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.advanced-prompts label:last-child {
+  margin-bottom: 0;
 }
 
 .result-panel {
@@ -1057,10 +1077,6 @@ textarea.locked {
   display: none;
 }
 
-.batch-card-progress {
-  margin-top: 3px;
-}
-
 .batch-card-orbit {
   position: relative;
   width: 60px;
@@ -1101,9 +1117,9 @@ textarea.locked {
 
 .image-frame .batch-image-button img {
   width: 100%;
-  height: 100%;
+  height: auto;
   min-height: 310px;
-  object-fit: cover;
+  object-fit: contain;
 }
 
 .image-frame.batch-landscape .batch-image-button img {
@@ -1210,44 +1226,33 @@ textarea.locked {
 
 .generation-stream-panel {
   width: 100%;
-  display: grid;
-  margin-top: 4px;
+}
+
+.image-frame:not(.has-generation-preview) > .loading-state > .generation-stream-panel,
+.batch-result-card:not(.has-generation-preview) > .batch-card-state > .batch-card-progress,
+.generation-stream-panel[hidden] {
+  display: none;
 }
 
 .generation-stream-track,
 .batch-card-progress {
   width: 100%;
-  height: 9px;
+  height: 6px;
   overflow: hidden;
-  border: 1px solid var(--line);
   border-radius: 999px;
-  padding: 1px;
-  background: rgba(25, 27, 25, 0.055);
-  box-shadow: inset 0 1px 2px rgba(25, 27, 25, 0.06);
+  background: rgba(10, 17, 20, 0.58);
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.28), 0 2px 8px rgba(0, 0, 0, 0.3);
 }
 
 .generation-stream-track span,
 .batch-card-progress span {
-  position: relative;
   display: block;
   width: 0;
   height: 100%;
-  overflow: hidden;
-  border-radius: 999px;
-  background: var(--accent);
-  box-shadow: 0 1px 3px rgba(189, 59, 32, 0.18);
-  transition: width 360ms var(--ease);
-}
-
-.generation-stream-track span::after,
-.batch-card-progress span::after {
-  content: "";
-  position: absolute;
-  inset: 0;
-  width: 42%;
-  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.55), transparent);
-  transform: translateX(-160%);
-  animation: progressSweep 1.15s ease-in-out infinite;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #f16d45, #ffab63 75%, #ffe3ad);
+  box-shadow: 0 0 8px rgba(255, 171, 99, 0.5);
+  transition: width 180ms linear;
 }
 
 .loading-steps {
@@ -1307,7 +1312,7 @@ textarea.locked {
 }
 
 .result-image-button {
-  width: auto;
+  width: 100%;
   max-width: 100%;
   min-height: 0;
   display: block;
@@ -1331,6 +1336,78 @@ textarea.locked {
   max-width: 100%;
   max-height: none;
   object-fit: contain;
+}
+
+.image-frame > .result-image-button img {
+  width: 100%;
+  height: auto;
+}
+
+.live-generation-preview {
+  position: relative;
+  width: 100%;
+  overflow: hidden;
+}
+
+.live-generation-preview[hidden] {
+  display: none;
+}
+
+.image-frame .live-generation-preview img {
+  width: 100%;
+  height: auto;
+}
+
+.image-frame.has-generation-preview {
+  min-height: 0;
+}
+
+.image-frame.has-generation-preview::after {
+  display: none;
+}
+
+.has-generation-preview > .loading-state,
+.has-generation-preview > .batch-card-state {
+  position: absolute;
+  z-index: 2;
+  left: 14px;
+  right: 14px;
+  bottom: 14px;
+  width: auto;
+  display: block;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  pointer-events: none;
+  transition: opacity 180ms ease-out;
+}
+
+.has-generation-preview > .loading-state > :not(.generation-stream-panel),
+.has-generation-preview > .batch-card-state > :not(.batch-card-progress) {
+  display: none;
+}
+
+.finishing-generation > .result-image-button {
+  position: absolute;
+  inset: 0;
+  height: 100%;
+  z-index: 1;
+}
+
+.finishing-generation > .result-image-button img {
+  height: 100%;
+  min-height: 0;
+  object-fit: contain;
+}
+
+.finishing-generation > .loading-state,
+.finishing-generation > .batch-card-state {
+  opacity: 0;
+}
+
+.result-image-button.from-generation-preview {
+  animation: none;
 }
 
 /* Admin layout */
@@ -2611,16 +2688,6 @@ html:has(body.modal-open) {
   }
   50% {
     box-shadow: 0 0 0 6px rgba(228, 87, 55, 0.02);
-  }
-}
-
-@keyframes progressSweep {
-  0% {
-    transform: translateX(-160%);
-  }
-  72%,
-  100% {
-    transform: translateX(340%);
   }
 }
 

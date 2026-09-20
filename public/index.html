@@ -93,7 +93,7 @@
           <div class="grid-three param-grid">
             <label>
               <span>步数</span>
-              <input id="stepsInput" type="number" min="1" max="28" value="28" />
+              <input id="stepsInput" type="number" inputmode="numeric" min="1" max="50" step="1" value="28" />
             </label>
             <label>
               <span>Scale</span>
@@ -122,12 +122,18 @@
               <option value="galgame">GalGame 风</option>
               <option value="custom">自定义</option>
             </select>
-            <textarea id="artistInput" rows="7"></textarea>
           </label>
-          <label>
-            <span>负面提示词</span>
-            <textarea id="negativeInput" rows="7"></textarea>
-          </label>
+          <details class="advanced-prompts">
+            <summary>画师串与负面提示词</summary>
+            <label>
+              <span>画师串</span>
+              <textarea id="artistInput" rows="7"></textarea>
+            </label>
+            <label>
+              <span>负面提示词</span>
+              <textarea id="negativeInput" rows="7"></textarea>
+            </label>
+          </details>
         </div>
       </section>
 

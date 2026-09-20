@@ -112,7 +112,7 @@ export async function generateNovelAiImage(request, account, env, options = {}) 
 
   if (contentType.includes('application/json')) {
     const payload = JSON.parse(buffer.toString('utf8'));
-    const base64 = payload.image || payload.data || payload.images?.[0];
+    const base64 = payload.image || payload.data || payload.images?.[0]?.image || payload.images?.[0];
     if (!base64) throw new Error('NovelAI JSON response does not contain image data.');
     return decodeDataUrl(base64);
   }
@@ -163,7 +163,7 @@ async function generateNovelAiImageStream(request, account, env, options = {}) {
       throw new Error(`NovelAI returned ${response.status} (cid=${correlationId}): ${text}`);
     }
     const payload = JSON.parse(buffer.toString('utf8'));
-    const base64 = payload.image || payload.data || payload.images?.[0];
+    const base64 = payload.image || payload.data || payload.images?.[0]?.image || payload.images?.[0];
     if (!base64) throw new Error('NovelAI JSON stream response does not contain image data.');
     return decodeDataUrl(base64);
   }
@@ -956,7 +956,13 @@ function emitNovelAiStreamProgress(event, state, isFinal) {
   const progress = normalizeNovelAiStreamProgress(event, state, isFinal);
   if (!isFinal && progress.percent <= state.lastPercent) return;
   state.lastPercent = progress.percent;
-  state.onProgress(progress);
+  state.onProgress({
+    ...progress,
+    ...(!isFinal && state.lastImage ? {
+      previewBuffer: state.lastImage,
+      previewMimeType: imageMimeType(state.lastImage)
+    } : {})
+  });
 }
 
 function normalizeNovelAiStreamProgress(event, state, isFinal) {
@@ -973,6 +979,7 @@ function normalizeNovelAiStreamProgress(event, state, isFinal) {
     event?.percent
   );
   const step = positiveNumber(
+    Number.isInteger(event?.step_ix) && event.step_ix >= 0 ? event.step_ix + 1 : null,
     event?.step,
     event?.step_index,
     event?.current_step,

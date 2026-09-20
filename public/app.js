@@ -1,4 +1,5 @@
 import { enhanceSelects, refreshSelect } from './select-ui.js';
+import { frontendGenerationCost } from './generation-pricing.js';
 
 const state = {
   settings: null,
@@ -14,6 +15,8 @@ const state = {
   optimizeWaveFrame: null,
   optimizing: false,
   generating: false,
+  previewFeed: null,
+  previewJobs: new Map(),
   generationCount: 1,
   previewScale: 1,
   previewPanX: 0,
@@ -73,7 +76,7 @@ const ids = [
 ];
 const el = Object.fromEntries(ids.map((id) => [id, document.querySelector(`#${id}`)]));
 
-const maxSteps = 28;
+const maxSteps = 50;
 const maxUrlSteps = 28;
 const defaultSteps = 28;
 const jobPollIntervalMs = 450;
@@ -222,11 +225,19 @@ function bindEvents() {
     el.promptInput,
     el.samplerInput,
     el.sizeInput,
-    el.stepsInput,
     el.scaleInput,
     el.cfgInput,
     el.negativeInput
   ].forEach((input) => input.addEventListener('input', updateUrlOutputs));
+  el.stepsInput.addEventListener('input', () => {
+    populateSizeOptions();
+    updateUrlOutputs();
+  });
+  el.stepsInput.addEventListener('change', () => {
+    el.stepsInput.value = normalizeSteps(el.stepsInput.value);
+    populateSizeOptions();
+    updateUrlOutputs();
+  });
   el.artistPresetInput.addEventListener('change', applyArtistPreset);
   el.modelInput.addEventListener('change', () => {
     populateSizeOptions();
@@ -303,7 +314,7 @@ function populateArtistPresetOptions() {
 function populateSizeOptions() {
   const selectedValue = el.sizeInput.value;
   el.sizeInput.innerHTML = sizeOptions
-    .map((option) => `<option value="${option.value}">${option.value}（${Math.max(option.cost, selectedModelCost())}点）</option>`)
+    .map((option) => `<option value="${option.value}">${option.value}（${generationCost(option.value)}点）</option>`)
     .join('');
   if (sizeOptions.some((option) => option.value === selectedValue)) el.sizeInput.value = selectedValue;
   refreshSelect(el.sizeInput);
@@ -318,13 +329,13 @@ function applyDefaults() {
   el.modelInput.value = ['nai-diffusion-4-5-full', 'nai-diffusion-5-full'].includes(defaultModel)
     ? defaultModel
     : 'nai-diffusion-4-5-full';
-  populateSizeOptions();
   el.artistInput.value = artistPresets['2.5d'].value;
   syncArtistPresetSelection();
   el.negativeInput.value = state.settings.defaultNegative || '';
   el.samplerInput.value = state.settings.defaults?.sampler || 'k_dpmpp_2m_sde';
-  el.sizeInput.value = state.settings.defaults?.size || '竖图';
   el.stepsInput.value = normalizeSteps(state.settings.defaults?.steps || defaultSteps);
+  populateSizeOptions();
+  el.sizeInput.value = state.settings.defaults?.size || '竖图';
   el.scaleInput.value = state.settings.defaults?.scale || 6;
   el.cfgInput.value = state.settings.defaults?.cfg || 0;
 }
@@ -484,7 +495,7 @@ async function directGenerate() {
   const img = new Image();
   img.alt = '生成图片';
   img.onload = async () => {
-    renderResultImage(img.src);
+    await renderResultImage(img.src);
     await loadMe().catch(() => {});
     showToast('图片已生成');
     setGenerateBusy(false);
@@ -512,10 +523,12 @@ async function startJob() {
   renderLoadingFrame();
   try {
     const params = collectParams();
-    const job = await api('/api/jobs', {
+    startPreviewFeed(params.token);
+    const job = await api('/api/web/jobs', {
       method: 'POST',
       body: jobRequestBody(params)
     });
+    state.previewJobs.set(job.id, null);
     el.jobText.textContent = jobStatusText(job);
     updateLoadingStatus(job);
     loadMe().catch(() => {});
@@ -531,6 +544,7 @@ async function startBatchJobs(count) {
   setGenerateBusy(true);
   renderBatchLoading(count);
   const params = collectParams();
+  startPreviewFeed(params.token);
   const results = await Promise.allSettled(
     Array.from({ length: count }, (_, index) => runBatchJob(index, params))
   );
@@ -545,17 +559,22 @@ async function startBatchJobs(count) {
 }
 
 async function runBatchJob(index, params) {
+  let jobId;
   try {
     updateBatchCard(index, '正在提交', 0);
-    const job = await api('/api/jobs', {
+    const job = await api('/api/web/jobs', {
       method: 'POST',
       body: jobRequestBody(params)
     });
+    jobId = job.id;
+    state.previewJobs.set(job.id, index);
     updateBatchJobStatus(index, job);
     return await pollBatchJob(job.id, index, params.token);
   } catch (error) {
     renderBatchError(index, error.message || '生成失败');
     throw error;
+  } finally {
+    state.previewJobs.delete(jobId);
   }
 }
 
@@ -575,7 +594,7 @@ async function pollBatchJob(id, index, token) {
 
     updateBatchJobStatus(index, job);
     if (job.status === 'done') {
-      renderBatchImage(index, job.imageUrl);
+      await renderBatchImage(index, job.imageUrl);
       return job.imageUrl;
     }
     if (job.status === 'failed') throw new Error(job.error || '任务失败');
@@ -619,7 +638,7 @@ async function pollJob(id, token) {
     el.jobText.textContent = jobStatusText(job);
     updateLoadingStatus(job);
     if (job.status === 'done') {
-      renderResultImage(job.imageUrl);
+      await renderResultImage(job.imageUrl);
       await loadMe().catch(() => {});
       showToast('图片已生成');
       setGenerateBusy(false);
@@ -633,9 +652,9 @@ async function pollJob(id, token) {
 function renderLoadingFrame() {
   closeResultPreview();
   el.jobText.textContent = '生成中';
-  el.imageFrame.classList.remove('result-ready', 'batch-ready', 'batch-mode', 'batch-landscape');
+  el.imageFrame.classList.remove('result-ready', 'batch-ready', 'batch-mode', 'batch-landscape', 'has-generation-preview');
   el.imageFrame.classList.add('loading');
-  el.imageFrame.innerHTML = `<div class="loading-state" role="status" aria-live="polite">
+  el.imageFrame.innerHTML = `${previewMarkup()}<div class="loading-state" role="status" aria-live="polite">
     <div class="loading-orbit" aria-hidden="true"></div>
     <strong>正在生成图片</strong>
     <p id="loadingStatusText">任务已提交，正在分配账号</p>
@@ -655,11 +674,12 @@ function renderLoadingFrame() {
 function renderBatchLoading(count) {
   closeResultPreview();
   el.jobText.textContent = `0 / ${count} 完成`;
-  el.imageFrame.classList.remove('result-ready', 'batch-ready');
+  el.imageFrame.classList.remove('result-ready', 'batch-ready', 'has-generation-preview');
   el.imageFrame.classList.add('loading', 'batch-mode');
   el.imageFrame.classList.toggle('batch-landscape', el.sizeInput.value.includes('横图'));
   el.imageFrame.innerHTML = `<div class="batch-result-grid" aria-live="polite">
     ${Array.from({ length: count }, (_, index) => `<article class="batch-result-card is-loading" data-batch-index="${index}">
+      ${previewMarkup()}
       <div class="batch-card-state">
         <div class="batch-card-orbit" aria-hidden="true"></div>
         <strong class="batch-card-number">${String(index + 1).padStart(2, '0')}</strong>
@@ -672,6 +692,7 @@ function renderBatchLoading(count) {
 
 function updateBatchJobStatus(index, job) {
   if (job.status === 'queued') {
+    clearLivePreview(el.imageFrame.querySelector(`[data-batch-index="${index}"]`));
     const position = Number(job.queuePosition || 0);
     const total = Number(job.queuedCount || 0);
     updateBatchCard(index, position && total ? `排队中 · ${position} / ${total}` : '等待可用账号', 0);
@@ -679,6 +700,8 @@ function updateBatchJobStatus(index, job) {
   }
   if (job.status === 'running') {
     updateBatchCard(index, '', clampGenerationPercent(job.generationProgress?.percent));
+  } else if (job.status === 'done') {
+    updateBatchCard(index, '', 100);
   }
 }
 
@@ -690,21 +713,19 @@ function updateBatchCard(index, status, progress) {
   const bar = progressBar?.querySelector('span');
   if (statusText) statusText.textContent = status;
   if (progress !== undefined) {
-    const percent = Math.round(clampGenerationPercent(progress));
+    const previous = card.classList.contains('has-generation-preview') ? Number(progressBar?.getAttribute('aria-valuenow') || 0) : 0;
+    const percent = Math.round(Math.max(previous, clampGenerationPercent(progress)));
     if (bar) bar.style.width = `${percent}%`;
     if (progressBar) progressBar.setAttribute('aria-valuenow', String(percent));
   }
 }
 
-function renderBatchImage(index, src) {
+async function renderBatchImage(index, src) {
   const card = el.imageFrame.querySelector(`[data-batch-index="${index}"]`);
   if (!card) return;
+  await replaceGenerationImage(card, src, index);
   pushResultHistory(src);
   card.className = 'batch-result-card is-done';
-  card.innerHTML = `<button class="result-image-button batch-image-button" type="button" aria-label="放大预览图片 ${index + 1}">
-    <img src="${src}" alt="生成图片 ${index + 1}">
-    <span class="batch-image-index">${String(index + 1).padStart(2, '0')}</span>
-  </button>`;
   updateBatchCompletedText();
 }
 
@@ -726,20 +747,21 @@ function updateLoadingStatus(job) {
   const target = document.querySelector('#loadingStatusText');
   if (!target) return;
   if (job.status === 'queued') {
+    clearLivePreview(el.imageFrame);
     target.textContent = queueLoadingText(job.queuePosition, job.queuedCount);
     setGenerationStreamProgress(null, false);
     setLoadingStep(1);
     return;
   }
   if (job.status === 'running') {
-    target.textContent = '账号已分配，NovelAI 正在生成';
+    target.textContent = job.generationProgress?.percent > 0 ? 'NovelAI 正在生成' : '账号已分配，正在等待 NovelAI 响应';
     setGenerationStreamProgress(job.generationProgress, true);
     setLoadingStep(2);
     return;
   }
   if (job.status === 'done') {
     target.textContent = '生成完成，正在载入图片';
-    setGenerationStreamProgress({ percent: 100 }, false);
+    setGenerationStreamProgress({ percent: 100 }, true);
   }
 }
 
@@ -751,6 +773,7 @@ function applyArtistPreset() {
   } else {
     el.artistInput.value = '';
     setArtistInputLocked(false);
+    el.artistInput.closest('details').open = true;
   }
   updateUrlOutputs();
 }
@@ -778,7 +801,8 @@ function setGenerationStreamProgress(progress = null, isVisible = true) {
   const stream = document.querySelector('#generationStream');
   if (!stream) return;
   stream.hidden = !isVisible;
-  const percent = clampGenerationPercent(progress?.percent);
+  const previous = isVisible && el.imageFrame.classList.contains('has-generation-preview') ? Number(stream.getAttribute('aria-valuenow') || 0) : 0;
+  const percent = Math.max(previous, clampGenerationPercent(progress?.percent));
   const bar = document.querySelector('#generationStreamBar');
   const roundedPercent = Math.round(isVisible ? percent : 0);
   if (bar) bar.style.width = `${isVisible ? percent : 0}%`;
@@ -792,15 +816,44 @@ function clampGenerationPercent(value) {
 }
 
 function renderFrameNotice(message, isError = false) {
-  el.imageFrame.classList.remove('result-ready', 'loading', 'batch-ready', 'batch-mode', 'batch-landscape');
+  el.imageFrame.classList.remove('result-ready', 'loading', 'batch-ready', 'batch-mode', 'batch-landscape', 'has-generation-preview');
   el.imageFrame.innerHTML = `<span class="${isError ? 'frame-error' : ''}">${message}</span>`;
 }
 
-function renderResultImage(src) {
+async function renderResultImage(src) {
+  await replaceGenerationImage(el.imageFrame, src);
   pushResultHistory(src);
-  el.imageFrame.classList.remove('loading', 'batch-ready', 'batch-mode', 'batch-landscape');
+  el.imageFrame.classList.remove('loading', 'batch-ready', 'batch-mode', 'batch-landscape', 'has-generation-preview');
   el.imageFrame.classList.add('result-ready');
-  el.imageFrame.innerHTML = `<button class="result-image-button" type="button" aria-label="放大预览生成图片"><img src="${src}" alt="生成图片"></button>`;
+}
+
+async function replaceGenerationImage(target, src, index = null) {
+  // Keep the current preview and its progress bar until the final pixels are ready.
+  const image = await preloadImage(src);
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = `result-image-button${index === null ? '' : ' batch-image-button'}`;
+  button.setAttribute('aria-label', index === null ? '放大预览生成图片' : `放大预览图片 ${index + 1}`);
+  image.alt = index === null ? '生成图片' : `生成图片 ${index + 1}`;
+  button.append(image);
+  if (index !== null) {
+    const badge = document.createElement('span');
+    badge.className = 'batch-image-index';
+    badge.textContent = String(index + 1).padStart(2, '0');
+    button.append(badge);
+  }
+  if (target.classList.contains('has-generation-preview')) {
+    target.classList.add('finishing-generation');
+    button.classList.add('from-generation-preview');
+    target.append(button);
+    const animation = button.animate([{ opacity: 0 }, { opacity: 1 }], {
+      duration: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 0 : 180,
+      easing: 'ease-out'
+    });
+    await animation.finished.catch(() => {});
+  }
+  target.replaceChildren(button);
+  target.classList.remove('finishing-generation');
 }
 
 function handleResultPreview(event) {
@@ -973,8 +1026,8 @@ function updateOptimizeButton() {
 function preloadImage(src) {
   return new Promise((resolve, reject) => {
     const image = new Image();
-    image.onload = resolve;
-    image.onerror = () => reject(new Error('优化图片加载失败'));
+    image.onload = () => image.decode().then(() => resolve(image), reject);
+    image.onerror = () => reject(new Error('图片加载失败'));
     image.src = src;
   });
 }
@@ -1166,12 +1219,60 @@ function queueLoadingText(position, count) {
 
 function setGenerateBusy(isBusy) {
   state.generating = isBusy;
+  if (!isBusy) stopPreviewFeed();
   el.directGenerateBtn.disabled = isBusy;
   el.generationCountControl.querySelectorAll('button').forEach((button) => {
     button.disabled = isBusy;
   });
   el.directGenerateBtn.textContent = isBusy ? '生成中...' : `生成图片（${totalGenerationCost()}点）`;
 }
+
+function previewMarkup() {
+  return '<div class="live-generation-preview" hidden><img alt="生成中的预览图"></div>';
+}
+
+function startPreviewFeed(token) {
+  stopPreviewFeed();
+  if (!globalThis.EventSource) return;
+  const feed = new EventSource(`/api/jobs/events?token=${encodeURIComponent(token)}`);
+  state.previewFeed = feed;
+  feed.onmessage = (event) => {
+    if (!state.generating || state.previewFeed !== feed) return;
+    let frame;
+    try { frame = JSON.parse(event.data); } catch { return; }
+    if (!state.previewJobs.has(frame.jobId)) return;
+    const index = state.previewJobs.get(frame.jobId);
+    const target = index === null ? el.imageFrame : el.imageFrame.querySelector(`[data-batch-index="${index}"]`);
+    const preview = target?.querySelector('.live-generation-preview');
+    if (!preview || target.classList.contains('finishing-generation') || !/^data:image\/(?:jpeg|png|webp);base64,/.test(frame.preview || '')) return;
+    const percent = clampGenerationPercent(frame.progress?.percent);
+    if (percent < Number(preview.dataset.percent || 0)) return;
+    preview.dataset.percent = String(percent);
+    preview.querySelector('img').src = frame.preview;
+    preview.hidden = false;
+    target.classList.add('has-generation-preview');
+    if (index === null) setGenerationStreamProgress(frame.progress, true);
+    else updateBatchCard(index, '', percent);
+  };
+  // EventSource reconnects automatically; normal job polling remains the fallback.
+}
+
+function stopPreviewFeed() {
+  state.previewFeed?.close();
+  state.previewFeed = null;
+  state.previewJobs.clear();
+}
+
+function clearLivePreview(target) {
+  target?.classList.remove('has-generation-preview');
+  const preview = target?.querySelector('.live-generation-preview');
+  if (!preview) return;
+  preview.hidden = true;
+  preview.dataset.percent = '0';
+  preview.querySelector('img').removeAttribute('src');
+}
+
+window.addEventListener('pagehide', stopPreviewFeed);
 
 function updateGenerateCostLabel() {
   el.directGenerateBtn.textContent = `生成图片（${totalGenerationCost()}点）`;
@@ -1192,13 +1293,9 @@ function totalGenerationCost() {
   return generationCost() * state.generationCount;
 }
 
-function generationCost() {
-  const selected = sizeOptions.find((option) => option.value === el.sizeInput.value);
-  return Math.max(selected?.cost || 1, selectedModelCost());
-}
-
-function selectedModelCost() {
-  return el.modelInput.value === 'nai-diffusion-5-full' ? 8 : 1;
+function generationCost(size = el.sizeInput.value) {
+  const selected = sizeOptions.find((option) => option.value === size);
+  return frontendGenerationCost(selected?.cost || 1, el.modelInput.value, normalizeSteps(el.stepsInput.value));
 }
 
 function wait(ms) {

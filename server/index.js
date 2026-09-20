@@ -1,10 +1,12 @@
 import http from 'node:http';
+import { JobPreviews } from './job-previews.js';
 import { createReadStream } from 'node:fs';
 import { mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { JsonStore, MAX_CACHE_IMAGES_LIMIT, createId, createPublicToken, defaultArtist2_5D, hashObject, legacyDefaultArtist, maskToken, normalizeDb } from './store.js';
-import { DIRECT_URL_MAX_STEPS, buildErrorImage, fetchNovelAiAccountQuota, generateNovelAiImage, normalizeNovelAiRequest, sizeCostMap } from './providers.js';
+import { MAX_STEPS, DIRECT_URL_MAX_STEPS, buildErrorImage, fetchNovelAiAccountQuota, generateNovelAiImage, normalizeNovelAiRequest, sizeCostMap } from './providers.js';
+import { frontendGenerationCost } from '../public/generation-pricing.js';
 import { adminPromptApiConfig, convertChinesePrompt, fetchPromptApiModels, isPromptApiConfigured, normalizePromptApiConfig, promptApiModel, publicPromptApiConfig, repairImage } from './prompt-api.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -31,6 +33,7 @@ const openAiChatTimeoutMs = Number(process.env.OPENAI_CHAT_TIMEOUT_MS || 10 * 60
 const openAiQueuePollMs = 650;
 const openAiFixedSteps = 28;
 const jobStreamProgress = new Map();
+const jobPreviews = new JobPreviews();
 const jobStreamProgressPersistState = new Map();
 const beijingOffsetMs = 8 * 60 * 60 * 1000;
 const usageChartDays = 7;
@@ -576,13 +579,21 @@ async function route(req, res) {
     return;
   }
 
-  if (method === 'POST' && url.pathname === '/api/jobs') {
+  if (method === 'POST' && ['/api/jobs', '/api/web/jobs'].includes(url.pathname)) {
     const body = await readJson(req);
     const token = String(body.token || tokenFrom(req, url) || '');
-    const job = await createJob(token, body);
+    const job = await createJob(token, body, { frontend: url.pathname === '/api/web/jobs' });
     scheduleQueueDrain();
     const snapshot = await store.findJobContext(job.id);
     sendJson(res, 202, publicJob(snapshot?.job || job, snapshot));
+    return;
+  }
+
+  if (method === 'GET' && url.pathname === '/api/jobs/events') {
+    const token = tokenFrom(req, url);
+    const user = await store.readUserByToken(token);
+    if (!user || user.enabled === false) throw httpError(401, 'invalid token.');
+    jobPreviews.subscribe(token, res);
     return;
   }
 
@@ -1573,7 +1584,7 @@ function accountAvailability(account, settings = {}) {
   const enabled = account.enabled !== false;
   const hasSlot = inFlight < maxConcurrency;
   const standardAvailable = enabled && !coolingDown && hasSlot;
-  const highResolutionAvailable = standardAvailable && (quotaPoints === null || quotaPoints >= 15);
+  const highResolutionAvailable = standardAvailable && hasPaidQuota(account);
 
   return {
     enabled,
@@ -2024,9 +2035,18 @@ function mergeDirtyRows(target, source = {}) {
 
 async function createJob(token, body, options = {}) {
   await cleanupStaleActiveJobs('create job');
+  const normalizeRequest = (settings) => {
+    const input = options.frontend ? { ...body, width: undefined, height: undefined, cost: undefined } : body;
+    const request = normalizeNovelAiRequest(input, settings, { maxSteps: options.frontend ? MAX_STEPS : DIRECT_URL_MAX_STEPS });
+    if (options.frontend) {
+      request.steps = Math.floor(request.steps);
+      request.cost = frontendGenerationCost(sizeCostMap[request.size] || 1, request.model, request.steps);
+    }
+    return request;
+  };
   if (!isNoCache(body.nocache)) {
     const settings = await store.readSettings();
-    const request = normalizeNovelAiRequest(body, settings, { maxSteps: DIRECT_URL_MAX_STEPS });
+    const request = normalizeRequest(settings);
     const cacheKey = requestCacheKey(token, request, body.seed);
     const cached = await store.findImageByCacheKey(cacheKey);
     if (cached) {
@@ -2040,7 +2060,7 @@ async function createJob(token, body, options = {}) {
   }
   return store.update((db) => {
     const user = getUserOrThrow(db, token);
-    const request = normalizeNovelAiRequest(body, db.settings, { maxSteps: DIRECT_URL_MAX_STEPS });
+    const request = normalizeRequest(db.settings);
     const cacheKey = requestCacheKey(token, request, body.seed);
     if (!isNoCache(body.nocache)) {
       const activeMatch = db.jobs.find((job) => (
@@ -2051,7 +2071,6 @@ async function createJob(token, body, options = {}) {
       if (activeMatch) return activeMatch;
     }
     const cost = generationCost(request);
-    const accountCost = accountGenerationCost(request);
     if (user.balance < cost) throw httpError(402, insufficientBalanceMessage);
     const queueTotal = activeJobCount(db.jobs) + 1;
     user.balance -= cost;
@@ -2065,7 +2084,7 @@ async function createJob(token, body, options = {}) {
       cacheKey,
       queueTotal,
       cost,
-      accountCost,
+      accountCost: 0,
       deadlineAt: options.deadlineAt || '',
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
@@ -2099,7 +2118,6 @@ async function createDirectJob(token, request, cacheKey, options = {}) {
   return store.update((db) => {
     const user = getUserOrThrow(db, token);
     const cost = Number(options.cost ?? generationCost(request));
-    const accountCost = Number(options.accountCost ?? (options.status ? 0 : accountGenerationCost(request)));
     const shouldCharge = !options.status && cost > 0;
     if (shouldCharge && user.balance < cost) throw httpError(402, insufficientBalanceMessage);
     const now = new Date().toISOString();
@@ -2116,7 +2134,7 @@ async function createDirectJob(token, request, cacheKey, options = {}) {
       cacheKey,
       queueTotal: options.status === 'done' ? 1 : activeJobCount(db.jobs) + 1,
       cost: shouldCharge ? cost : Number(options.cost || 0),
-      accountCost,
+      accountCost: 0,
       accountId: options.accountId || '',
       deadlineAt: options.deadlineAt || '',
       createdAt: now,
@@ -2242,6 +2260,7 @@ function notifyJobWaiters(jobId, payload) {
 
 function resetJobStreamProgress(jobId, request = {}) {
   if (!jobId) return;
+  jobPreviews.clear(jobId);
   const progress = {
     percent: 0,
     step: 0,
@@ -2267,7 +2286,9 @@ function updateJobStreamProgress(jobId, progress = {}) {
     updatedAt: progress.updatedAt || new Date().toISOString()
   };
   jobStreamProgress.set(jobId, next);
-  patchCachedJobStreamProgress(jobId, next);
+  const job = patchCachedJobStreamProgress(jobId, next);
+  if (percent === 0) jobPreviews.clear(jobId);
+  jobPreviews.update(job, progress);
   if (shouldPersistJobStreamProgress(jobId, next)) {
     persistJobStreamProgress(jobId, next).catch((error) => {
       console.error('[runtime] failed to persist job stream progress:', error);
@@ -2277,6 +2298,7 @@ function updateJobStreamProgress(jobId, progress = {}) {
 
 function clearJobStreamProgress(jobId) {
   if (!jobId) return;
+  jobPreviews.clear(jobId);
   jobStreamProgress.delete(jobId);
   jobStreamProgressPersistState.delete(jobId);
 }
@@ -2285,6 +2307,7 @@ function patchCachedJobStreamProgress(jobId, progress = {}) {
   const job = store.db?.jobs?.find((item) => item.id === jobId);
   if (!job) return;
   job.generationProgress = publicProgressSnapshot(progress, job);
+  return job;
 }
 
 function shouldPersistJobStreamProgress(jobId, progress = {}) {
@@ -2357,13 +2380,13 @@ async function reserveQueuedJob(jobId) {
       job.completedAt = job.updatedAt;
       return { skip: true, jobId: job.id };
     }
-    const account = selectAccount(db.accounts, db.settings, { cost: accountCost, request: job.request });
+    const account = selectAccount(db.accounts, db.settings, { request: job.request });
     if (!account && hasEnabledAccounts(db.accounts)) {
-      if (!hasAccountWithEnoughQuota(db.accounts, accountCost, job.request)) {
+      if (!hasAccountWithEnoughQuota(db.accounts, job.request)) {
         refundJob(db, job, 'NovelAI账号点数不足');
         job.status = 'failed';
         job.error = 'NovelAI账号点数不足';
-        job.errorDetail = `No NovelAI account has enough quota for accountCost=${accountCost}`;
+        job.errorDetail = 'No NovelAI account has available free allowance or paid balance for this request';
         job.updatedAt = new Date().toISOString();
         job.completedAt = job.updatedAt;
         return { skip: true, jobId: job.id };
@@ -2540,7 +2563,6 @@ async function retryReservationWithNextAccount(reservation, error, tried, option
       if (isNovelAiAccountQuotaError(error)) {
         const outOfTrial = isNovelAiOutOfTrialImageGenerationError(error);
         if (outOfTrial) disableNovelAiAccount(failedAccount);
-        failedAccount.quotaPoints = 0;
         failedAccount.quotaError = outOfTrial ? '试用次数已用完，已自动禁用' : '点数不足';
         failedAccount.quotaCheckedAt = now;
       }
@@ -2548,8 +2570,8 @@ async function retryReservationWithNextAccount(reservation, error, tried, option
     }
 
     if (options.deadline && Date.now() >= options.deadline) return null;
-    const accountCost = reservationAccountCost(reservation, reservation.job?.request);
-    const account = selectAccount(db.accounts, db.settings, { excludeIds: tried, cost: accountCost, request: options.request });
+    const accountCost = reservationAccountCost(reservation);
+    const account = selectAccount(db.accounts, db.settings, { excludeIds: tried, request: options.request });
     if (!account) return null;
     account.inFlight = Number(account.inFlight || 0) + 1;
     account.lastUsedAt = new Date().toISOString();
@@ -2607,11 +2629,10 @@ async function reserveCreditAndAccount(token, request, cacheKey) {
   return store.update((db) => {
     const user = getUserOrThrow(db, token);
     const cost = generationCost(request);
-    const accountCost = accountGenerationCost(request);
     if (user.balance < cost) throw httpError(402, insufficientBalanceMessage);
-    const account = selectAccount(db.accounts, db.settings, { cost: accountCost, request });
+    const account = selectAccount(db.accounts, db.settings, { request });
     if (!account && hasEnabledAccounts(db.accounts)) {
-      if (!hasAccountWithEnoughQuota(db.accounts, accountCost, request)) throw httpError(503, 'NovelAI账号点数不足');
+      if (!hasAccountWithEnoughQuota(db.accounts, request)) throw httpError(503, 'NovelAI账号点数不足');
       throw httpError(429, 'all NovelAI accounts are busy, retry shortly.');
     }
     if (account) {
@@ -2629,7 +2650,7 @@ async function reserveCreditAndAccount(token, request, cacheKey) {
       at: new Date().toISOString()
     };
     db.ledger.unshift(ledger);
-    return { token, userId: user.id, account: account ? { ...account } : null, ledgerId: ledger.id, cost, accountCost, cacheKey };
+    return { token, userId: user.id, account: account ? { ...account } : null, ledgerId: ledger.id, cost, accountCost: 0, cacheKey };
   }, {
     dirtyRows: dirtyCreditReservationRows
   });
@@ -2648,11 +2669,10 @@ async function tryReserveCreditAndAccount(token, request, cacheKey) {
   return store.update((db) => {
     const user = getUserOrThrow(db, token);
     const cost = generationCost(request);
-    const accountCost = accountGenerationCost(request);
     if (user.balance < cost) throw httpError(402, insufficientBalanceMessage);
-    const account = selectAccount(db.accounts, db.settings, { cost: accountCost, request });
+    const account = selectAccount(db.accounts, db.settings, { request });
     if (!account && hasEnabledAccounts(db.accounts)) {
-      if (!hasAccountWithEnoughQuota(db.accounts, accountCost, request)) throw httpError(503, 'NovelAI账号点数不足');
+      if (!hasAccountWithEnoughQuota(db.accounts, request)) throw httpError(503, 'NovelAI账号点数不足');
       return { busy: true };
     }
     if (account) {
@@ -2670,7 +2690,7 @@ async function tryReserveCreditAndAccount(token, request, cacheKey) {
       at: new Date().toISOString()
     };
     db.ledger.unshift(ledger);
-    return { busy: false, reservation: { token, userId: user.id, account: account ? { ...account } : null, ledgerId: ledger.id, cost, accountCost, cacheKey } };
+    return { busy: false, reservation: { token, userId: user.id, account: account ? { ...account } : null, ledgerId: ledger.id, cost, accountCost: 0, cacheKey } };
   }, {
     dirtyRows: dirtyCreditReservationRows,
     shouldPersist: (result) => !result?.busy
@@ -2680,7 +2700,7 @@ async function tryReserveCreditAndAccount(token, request, cacheKey) {
 async function completeGeneration(reservation, request, image, meta = {}) {
   const imageId = createId('img');
   const imageFile = await writeStoredImage(imageId, image);
-  const accountCost = reservationAccountCost(reservation, request);
+  const accountCost = reservationAccountCost(reservation);
   let trimmedImages = [];
   let savedImage;
   try {
@@ -2690,9 +2710,6 @@ async function completeGeneration(reservation, request, image, meta = {}) {
       if (account) {
         account.inFlight = Math.max(0, Number(account.inFlight || 0) - 1);
         account.total = Number(account.total || 0) + 1;
-        if (accountCost > 0 && Number.isFinite(Number(account.quotaPoints))) {
-          account.quotaPoints = Math.max(0, Number(account.quotaPoints) - accountCost);
-        }
         account.updatedAt = new Date().toISOString();
       }
 
@@ -2742,11 +2759,11 @@ async function completeGeneration(reservation, request, image, meta = {}) {
     await removeStoredImages([{ id: imageId, file: imageFile }]);
     throw error;
   }
+  if (meta.jobId) clearJobStreamProgress(meta.jobId);
   trimmedImages = await store.trimImageCache(null, { batchSize: imageCacheTrimBuffer() });
   await removeStoredImages(trimmedImages);
   scheduleQueueDrain();
   if (meta.jobId) {
-    clearJobStreamProgress(meta.jobId);
     notifyJobWaiters(meta.jobId, { saved: savedImage, image, balance: savedImage.balance });
   }
   return savedImage;
@@ -2831,7 +2848,7 @@ async function failGeneration(reservation, error) {
 function selectAccount(accounts, settings = {}, options = {}) {
   resetStaleAccountLoads(accounts);
   const excludeIds = options.excludeIds || new Set();
-  const cost = normalizeAccountCost(options.cost);
+  const paid = requiresPaidAccount(options.request);
   const now = Date.now();
   const enabled = accounts.filter((account) => account.enabled !== false && !isAccountCoolingDown(account, now));
   if (!enabled.length) return null;
@@ -2839,13 +2856,12 @@ function selectAccount(accounts, settings = {}, options = {}) {
   const available = enabled.filter((account) => {
     if (excludeIds.has(account.id)) return false;
     if (Number(account.inFlight || 0) >= maxConcurrency) return false;
-    const quota = accountQuotaPoints(account);
-    return quota === null || quota >= cost;
+    return !paid || hasPaidQuota(account);
   });
   if (!available.length) return null;
   let candidates = available;
-  let preferQuota = cost > 0;
-  if (isV5StandardAccountRequest(options.request, cost)) {
+  let preferQuota = paid;
+  if (isV5StandardAccountRequest(options.request)) {
     const freeAccounts = available.filter(hasV5FreeQuota);
     if (freeAccounts.length) {
       candidates = freeAccounts;
@@ -2876,8 +2892,8 @@ function accountQuotaPoints(account) {
   return Number.isFinite(value) ? value : null;
 }
 
-function isV5StandardAccountRequest(request = {}, cost = 0) {
-  return normalizeAccountCost(cost) === 0 && String(request?.model || '').startsWith('nai-diffusion-5');
+function isV5StandardAccountRequest(request = {}) {
+  return !requiresPaidAccount(request) && String(request?.model || '').startsWith('nai-diffusion-5');
 }
 
 function hasV5FreeQuota(account) {
@@ -2887,7 +2903,7 @@ function hasV5FreeQuota(account) {
 
 function hasPaidQuota(account) {
   const quota = accountQuotaPoints(account);
-  return quota === null || quota > 0;
+  return account.quotaError !== '点数不足' && (quota === null || quota > 0);
 }
 
 function maxAccountConcurrency(settings = {}) {
@@ -2989,13 +3005,11 @@ function hasEnabledAccounts(accounts) {
   return accounts.some((account) => account.enabled !== false);
 }
 
-function hasAccountWithEnoughQuota(accounts, cost = 1, request = {}) {
-  const required = normalizeAccountCost(cost);
+function hasAccountWithEnoughQuota(accounts, request = {}) {
   return accounts.some((account) => {
     if (account.enabled === false) return false;
-    if (isV5StandardAccountRequest(request, required)) return hasV5FreeQuota(account) || hasPaidQuota(account);
-    const quota = accountQuotaPoints(account);
-    return quota === null || quota >= required;
+    if (isV5StandardAccountRequest(request)) return hasV5FreeQuota(account) || hasPaidQuota(account);
+    return !requiresPaidAccount(request) || hasPaidQuota(account);
   });
 }
 
@@ -3726,31 +3740,19 @@ function modelGenerationCost(model) {
   return String(model || '') === 'nai-diffusion-5-full' ? 8 : 1;
 }
 
-function accountGenerationCost(request = null) {
-  const sizeCost = sizeCostMap[normalizeSizeName(request?.size)] || 1;
-  const resolutionCost = resolutionGenerationCost(request);
-  const cost = Math.max(sizeCost, resolutionCost);
-  return cost > 1 ? cost : 0;
+function requiresPaidAccount(request = {}) {
+  return Number(request?.steps) > 28
+    || (sizeCostMap[normalizeSizeName(request?.size)] || 1) > 1
+    || Number(request?.width) * Number(request?.height) > 1024 * 1024;
 }
 
-function resolutionGenerationCost(request = null) {
-  const width = Number(request?.width || 0);
-  const height = Number(request?.height || 0);
-  if (width >= 1700 || height >= 1900) return 25;
-  if (width >= 1300 || height >= 1500) return 15;
-  return 1;
-}
-
+// Retain historical metadata only. New jobs do not estimate or debit upstream points.
 function jobAccountCost(job = {}) {
-  const stored = Number(job.accountCost);
-  if (Number.isFinite(stored) && stored >= 0) return normalizeAccountCost(stored);
-  return accountGenerationCost(job.request);
+  return normalizeAccountCost(job.accountCost);
 }
 
-function reservationAccountCost(reservation = {}, request = null) {
-  const stored = Number(reservation.accountCost);
-  if (Number.isFinite(stored) && stored >= 0) return normalizeAccountCost(stored);
-  return accountGenerationCost(request);
+function reservationAccountCost(reservation = {}) {
+  return normalizeAccountCost(reservation.accountCost);
 }
 
 function normalizeAccountCost(value) {
@@ -4181,6 +4183,8 @@ async function memoryDiagnostics() {
       runningJobControls: runningJobControls.size,
       jobStreamProgress: jobStreamProgress.size,
       jobStreamProgressPersistState: jobStreamProgressPersistState.size,
+      jobPreviewFrames: jobPreviews.frames.size,
+      jobPreviewConnections: [...jobPreviews.listeners.values()].reduce((sum, clients) => sum + clients.size, 0),
       queueDrainTimer: Boolean(queueDrainTimer),
       queueDraining,
       queueDrainRequested
