@@ -581,35 +581,15 @@ textarea.locked {
 }
 
 .token-panel {
-  position: relative;
   grid-column: 1 / -1;
   display: grid;
-  grid-template-columns: minmax(240px, 0.72fr) minmax(300px, 1.5fr) 150px;
+  grid-template-columns: minmax(0, 1fr) 124px;
   align-items: end;
-  gap: 20px;
-  overflow: hidden;
+  gap: 16px 12px;
   border-color: var(--line);
   background: rgba(251, 250, 246, 0.96);
   color: var(--ink);
   box-shadow: 0 8px 24px rgba(25, 27, 25, 0.05);
-}
-
-.token-panel::after {
-  content: "";
-  position: absolute;
-  top: 0;
-  right: 0;
-  width: 22%;
-  height: 3px;
-  background: var(--accent);
-}
-
-.token-panel .panel-title,
-.token-panel label,
-.token-panel button,
-.token-panel .merge-panel {
-  position: relative;
-  z-index: 1;
 }
 
 .token-panel .panel-title,
@@ -617,24 +597,66 @@ textarea.locked {
   margin-bottom: 0;
 }
 
-.token-summary {
-  display: grid;
-  grid-template-columns: 14px minmax(0, 1fr);
+.token-panel .token-summary {
+  grid-column: 1 / -1;
+  min-height: 32px;
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
   align-items: center;
-  justify-content: start;
-  gap: 13px;
+  justify-content: space-between;
+  gap: 10px 16px;
 }
 
 .token-summary h1 {
-  margin-bottom: 2px;
+  margin: 0;
   color: var(--ink);
-  font-size: 20px;
+  font-size: 18px;
   line-height: 1.2;
+  white-space: nowrap;
 }
 
 .token-summary #balanceText {
-  color: var(--muted);
-  font-size: 11px;
+  color: var(--ink-soft);
+  font-size: 12px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.token-heading,
+.token-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.token-actions {
+  margin-left: auto;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.token-purchase {
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgba(228, 87, 55, 0.07);
+  color: var(--accent-dark);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.2;
+  white-space: nowrap;
+  text-decoration: none;
+  transition: background-color 160ms ease;
+}
+
+.token-purchase:hover {
+  background: rgba(228, 87, 55, 0.13);
+}
+
+.token-purchase:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
 }
 
 .status-dot {
@@ -674,38 +696,45 @@ textarea.locked {
   box-shadow: 0 0 0 3px rgba(228, 87, 55, 0.22);
 }
 
-.token-panel .secondary,
-.token-panel .ghost {
+.token-panel .secondary {
   border-color: var(--line);
   background: rgba(255, 255, 255, 0.64);
   color: var(--ink-soft);
 }
 
-.token-panel .secondary:hover,
-.token-panel .ghost:hover {
+.token-panel .secondary:hover {
   border-color: var(--ink-soft);
   background: #fff;
   color: var(--ink);
 }
 
-.token-submit {
+.token-submit,
+.merge-fields > button {
   min-height: 44px;
 }
 
 .merge-panel {
   grid-column: 1 / -1;
   display: grid;
-  gap: 14px;
+  gap: 10px;
   border-top: 1px solid var(--line);
-  padding-top: 14px;
+  padding-top: 8px;
 }
 
 .merge-toggle {
+  min-height: 32px;
   justify-content: space-between;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
 }
 
 .merge-toggle:hover {
   transform: none;
+  color: var(--ink);
 }
 
 .merge-toggle-hint {
@@ -731,9 +760,9 @@ textarea.locked {
 
 .merge-fields {
   display: grid;
-  grid-template-columns: minmax(280px, 1fr) 150px;
+  grid-template-columns: minmax(0, 1fr) 124px;
   align-items: end;
-  gap: 14px;
+  gap: 12px;
   animation: reveal 240ms var(--ease) both;
 }
 
@@ -1038,6 +1067,7 @@ html:has(#parameterHelpDialog[open]) { overflow: hidden; }
   width: 100%;
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: start;
   gap: 12px;
 }
 
@@ -1059,6 +1089,10 @@ html:has(#parameterHelpDialog[open]) { overflow: hidden; }
     linear-gradient(rgba(25, 27, 25, 0.035) 1px, transparent 1px),
     linear-gradient(90deg, rgba(25, 27, 25, 0.035) 1px, transparent 1px);
   background-size: 24px 24px;
+}
+
+.batch-result-card:is(.has-generation-preview, .is-done) {
+  min-height: 0;
 }
 
 .batch-card-state {
@@ -1134,12 +1168,6 @@ html:has(#parameterHelpDialog[open]) { overflow: hidden; }
 
 .image-frame .batch-image-button img {
   width: 100%;
-  height: auto;
-  min-height: 310px;
-  object-fit: contain;
-}
-
-.image-frame.batch-landscape .batch-image-button img {
   height: auto;
   min-height: 0;
   object-fit: contain;
@@ -2619,13 +2647,9 @@ html:has(body.modal-open) {
     padding-bottom: 28px;
   }
 
-  .token-panel {
-    grid-template-columns: 1fr;
-    gap: 15px;
-  }
-
+  .token-panel,
   .merge-fields {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr) 96px;
   }
 
   .login-panel {
@@ -2768,8 +2792,7 @@ html:has(body.modal-open) {
     gap: 8px;
   }
 
-  .batch-result-card,
-  .batch-image-button img {
+  .batch-result-card {
     min-height: 230px;
   }
 

@@ -12,11 +12,13 @@
     <main class="user-shell">
       <section class="panel token-panel" aria-labelledby="tokenTitle">
         <div class="panel-title token-summary">
-          <span id="tokenStatusDot" class="status-dot" aria-hidden="true"></span>
-          <div>
-            <span class="eyebrow">Access</span>
+          <div class="token-heading">
+            <span id="tokenStatusDot" class="status-dot" aria-hidden="true"></span>
             <h1 id="tokenTitle">连接密钥</h1>
-            <span id="balanceText">尚未连接</span>
+          </div>
+          <div class="token-actions">
+            <span id="balanceText" aria-live="polite">尚未连接</span>
+            <a class="token-purchase" href="https://68n.cn/cYPn6" target="_blank" rel="noopener noreferrer">购买密钥 ↗</a>
           </div>
         </div>
         <label>
@@ -26,7 +28,7 @@
         <button id="saveTokenBtn" class="secondary token-submit">加载密钥</button>
 
         <div id="mergePanel" class="merge-panel">
-          <button id="toggleMergeBtn" class="ghost wide merge-toggle" type="button" aria-expanded="false" aria-controls="mergeFields">
+          <button id="toggleMergeBtn" class="wide merge-toggle" type="button" aria-expanded="false" aria-controls="mergeFields">
             <span>融合另一个密钥的额度</span>
             <span id="mergeToggleHint" class="merge-toggle-hint" aria-hidden="true"></span>
           </button>
