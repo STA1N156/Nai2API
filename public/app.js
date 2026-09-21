@@ -3,7 +3,7 @@ import { frontendGenerationCost } from './generation-pricing.js';
 
 const state = {
   settings: null,
-  token: localStorage.getItem('nai.userToken') || '',
+  token: sessionStorage.getItem('nai.officialToken') || localStorage.getItem('nai.userToken') || '',
   userBalance: null,
   toastTimer: null,
   resultHistory: [],
@@ -186,6 +186,7 @@ async function boot() {
   populateArtistPresetOptions();
   bindEvents();
   el.userToken.value = state.token;
+  updateKeyMode();
   await loadSettings();
   applyDefaults();
   updateGenerateCostLabel();
@@ -199,7 +200,9 @@ function bindEvents() {
     button.addEventListener('click', () => {
       const help = parameterHelp[button.dataset.parameterHelp];
       el.parameterHelpTitle.textContent = help.title;
-      el.parameterHelpText.textContent = help.text;
+      el.parameterHelpText.textContent = button.dataset.parameterHelp === 'steps' && usesOfficialKey()
+        ? help.text.split('\n\n')[0] + '\n\n支持 1–50 步，消耗由 NovelAI 按官方规则计算。'
+        : help.text;
       el.parameterHelpSource.href = help.source;
       el.parameterHelpDialog.showModal();
     });
@@ -249,12 +252,20 @@ function bindEvents() {
   });
 
   [
-    el.userToken,
     el.promptInput,
     el.samplerInput,
     el.sizeInput,
     el.negativeInput
   ].forEach((input) => input.addEventListener('input', updateUrlOutputs));
+  el.userToken.addEventListener('input', () => {
+    if (el.userToken.value.trim() !== state.token) {
+      state.userBalance = null;
+      el.balanceText.textContent = '尚未连接';
+      el.tokenStatusDot.classList.remove('connected');
+    }
+    updateKeyMode();
+    updateUrlOutputs();
+  });
   [el.stepsInput, el.scaleInput, el.cfgInput].forEach(input => {
     input.addEventListener('input', () => {
       updateParameterValue(input);
@@ -344,7 +355,7 @@ function populateArtistPresetOptions() {
 function populateSizeOptions() {
   const selectedValue = el.sizeInput.value;
   el.sizeInput.innerHTML = sizeOptions
-    .map((option) => `<option value="${option.value}">${option.value}（${generationCost(option.value)}点）</option>`)
+    .map((option) => `<option value="${option.value}">${option.value}${usesOfficialKey() ? '' : `（${generationCost(option.value)}点）`}</option>`)
     .join('');
   if (sizeOptions.some((option) => option.value === selectedValue)) el.sizeInput.value = selectedValue;
   refreshSelect(el.sizeInput);
@@ -374,7 +385,13 @@ function applyDefaults() {
 async function saveToken() {
   try {
     state.token = el.userToken.value.trim();
-    localStorage.setItem('nai.userToken', state.token);
+    if (usesOfficialKey()) {
+      sessionStorage.setItem('nai.officialToken', state.token);
+    } else {
+      sessionStorage.removeItem('nai.officialToken');
+      localStorage.setItem('nai.userToken', state.token);
+    }
+    updateKeyMode();
     updateUrlOutputs();
     if (!state.token) {
       state.userBalance = null;
@@ -393,15 +410,23 @@ async function saveToken() {
 
 async function loadMe() {
   if (!state.token) return;
-  const user = await api(`/api/me?token=${encodeURIComponent(state.token)}`);
-  state.userBalance = Number(user.balance);
-  el.balanceText.textContent = `${user.balance} 点可用`;
+  const token = state.token;
+  const user = await api('/api/me', { token });
+  if (state.token !== token || el.userToken.value.trim() !== token) return;
+  state.userBalance = user.authMode === 'official' ? null : Number(user.balance);
+  el.balanceText.textContent = user.authMode === 'official'
+    ? `Anlas: ${user.anlas ?? '未知'}点 · V5 剩余 ${user.v5RemainingPercent == null ? '未知' : `${user.v5RemainingPercent}%`} · ${user.membership}`
+    : `${user.balance} 点可用`;
   el.tokenStatusDot.classList.add('connected');
 }
 
 async function mergeTokenBalance() {
   const targetToken = el.userToken.value.trim();
   const sourceToken = el.mergeSourceToken.value.trim();
+  if (targetToken.startsWith('pst-') || sourceToken.startsWith('pst-')) {
+    showToast('官方密钥不支持站内额度融合', true);
+    return;
+  }
   if (!targetToken) {
     showToast('请先输入需要保留额度的密钥', true);
     return;
@@ -542,7 +567,7 @@ async function directGenerate() {
 async function startJob() {
   if (state.generating) return;
   const currentToken = el.userToken.value.trim();
-  if (state.token === currentToken && Number.isFinite(state.userBalance) && state.userBalance < totalGenerationCost()) {
+  if (!usesOfficialKey() && state.token === currentToken && Number.isFinite(state.userBalance) && state.userBalance < totalGenerationCost()) {
     showToast(`当前额度不足，需要 ${totalGenerationCost()} 点`, true);
     return;
   }
@@ -613,7 +638,7 @@ async function pollBatchJob(id, index, token) {
   while (state.generating) {
     let job;
     try {
-      job = await api(`/api/jobs/${id}?token=${encodeURIComponent(token)}`);
+      job = await api(`/api/jobs/${id}`, { token });
     } catch (error) {
       if (!error.status || error.status >= 500) {
         updateBatchCard(index, '连接重试中');
@@ -657,7 +682,7 @@ async function pollJob(id, token) {
   while (state.generating) {
     let job;
     try {
-      job = await api(`/api/jobs/${id}?token=${encodeURIComponent(token)}`);
+      job = await api(`/api/jobs/${id}`, { token });
     } catch (error) {
       if (!error.status || error.status >= 500) {
         el.jobText.textContent = '连接重试中';
@@ -1068,10 +1093,13 @@ function setGenerateBusy(isBusy) {
   state.generating = isBusy;
   if (!isBusy) stopPreviewFeed();
   el.directGenerateBtn.disabled = isBusy;
+  el.userToken.disabled = isBusy;
+  el.saveTokenBtn.disabled = isBusy;
   el.generationCountControl.querySelectorAll('button').forEach((button) => {
     button.disabled = isBusy;
   });
-  el.directGenerateBtn.textContent = isBusy ? '生成中...' : `生成图片（${totalGenerationCost()}点）`;
+  if (isBusy) el.directGenerateBtn.textContent = '生成中...';
+  else updateGenerateCostLabel();
 }
 
 function previewMarkup() {
@@ -1122,7 +1150,7 @@ function clearLivePreview(target) {
 window.addEventListener('pagehide', stopPreviewFeed);
 
 function updateGenerateCostLabel() {
-  el.directGenerateBtn.textContent = `生成图片（${totalGenerationCost()}点）`;
+  el.directGenerateBtn.textContent = usesOfficialKey() ? '生成图片' : `生成图片（${totalGenerationCost()}点）`;
 }
 
 function setGenerationCount(value) {
@@ -1143,6 +1171,16 @@ function totalGenerationCost() {
 function generationCost(size = el.sizeInput.value) {
   const selected = sizeOptions.find((option) => option.value === size);
   return frontendGenerationCost(selected?.cost || 1, el.modelInput.value, normalizeSteps(el.stepsInput.value));
+}
+
+function usesOfficialKey() {
+  return String(el.userToken?.value ?? state.token ?? '').trim().startsWith('pst-');
+}
+
+function updateKeyMode() {
+  el.mergePanel.hidden = usesOfficialKey();
+  if (usesOfficialKey()) setMergePanelOpen(false);
+  populateSizeOptions();
 }
 
 function wait(ms) {

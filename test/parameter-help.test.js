@@ -34,7 +34,7 @@ test('help buttons show the matching explanation and outside clicks close only t
   const el = { parameterHelpDialog: dialog, parameterHelpTitle: {}, parameterHelpText: {}, parameterHelpSource: {} };
   vm.runInNewContext(`${section('const parameterHelp =', 'await boot().catch')}
     ${section('function bindEvents() {', "  el.saveTokenBtn.addEventListener")} }
-    bindEvents();`, { el, document: { querySelectorAll: () => buttons } });
+    bindEvents();`, { el, usesOfficialKey: () => false, document: { querySelectorAll: () => buttons } });
   for (const button of buttons) {
     button.click();
     assert.equal(dialog.open, true);

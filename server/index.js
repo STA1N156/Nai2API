@@ -1,5 +1,6 @@
 import http from 'node:http';
 import { JobPreviews } from './job-previews.js';
+import { isOfficialKey, officialKeyOwner, officialKeyError, OfficialKeyJobs } from './official-key-jobs.js';
 import { createReadStream } from 'node:fs';
 import { mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
@@ -33,6 +34,12 @@ const openAiQueuePollMs = 650;
 const openAiFixedSteps = 28;
 const jobStreamProgress = new Map();
 const jobPreviews = new JobPreviews();
+const officialJobs = new OfficialKeyJobs({
+  generate: (request, account, options) => generateNovelAiImage(request, account, process.env, options),
+  saveImage: saveOfficialImage,
+  findImage: cacheKey => store.findImageByCacheKey(cacheKey),
+  previews: jobPreviews
+});
 const jobStreamProgressPersistState = new Map();
 const beijingOffsetMs = 8 * 60 * 60 * 1000;
 const usageChartDays = 7;
@@ -242,6 +249,10 @@ async function route(req, res) {
 
   if (method === 'GET' && url.pathname === '/api/me') {
     const token = tokenFrom(req, url);
+    if (isOfficialKey(token)) {
+      sendJson(res, 200, await officialKeyInfo(token));
+      return;
+    }
     const user = await store.readUserByToken(token);
     if (!user || user.enabled === false) throw httpError(401, 'invalid token.');
     sendJson(res, 200, publicUser(user));
@@ -582,6 +593,10 @@ async function route(req, res) {
     const body = await readJson(req);
     if (body.edit) throw httpError(400, '图片编辑功能已移除，请刷新页面后重试。');
     const token = String(body.token || tokenFrom(req, url) || '');
+    if (isOfficialKey(token)) {
+      sendJson(res, 202, await createOfficialJob(token, body, url.pathname === '/api/web/jobs'));
+      return;
+    }
     const job = await createJob(token, body, { frontend: url.pathname === '/api/web/jobs' });
     scheduleQueueDrain();
     const snapshot = await store.findJobContext(job.id);
@@ -591,6 +606,11 @@ async function route(req, res) {
 
   if (method === 'GET' && url.pathname === '/api/jobs/events') {
     const token = tokenFrom(req, url);
+    if (isOfficialKey(token)) {
+      await officialKeyInfo(token);
+      jobPreviews.subscribe(officialKeyOwner(token), res);
+      return;
+    }
     const user = await store.readUserByToken(token);
     if (!user || user.enabled === false) throw httpError(401, 'invalid token.');
     jobPreviews.subscribe(token, res);
@@ -600,6 +620,12 @@ async function route(req, res) {
   if (method === 'GET' && /^\/api\/jobs\/[^/]+\/content$/.test(url.pathname)) {
     const id = decodeURIComponent(url.pathname.split('/').at(-2) || '');
     const token = tokenFrom(req, url);
+    if (id.startsWith('job_pst_')) {
+      const job = officialJobs.get(id, token);
+      if (job.status !== 'done') throw httpError(409, job.error || 'job is not finished.');
+      await sendStoredImage(res, 200, job.image);
+      return;
+    }
     const snapshot = await store.findJobContext(id);
     const job = snapshot?.job;
     if (!job) throw httpError(404, 'job not found.');
@@ -620,6 +646,10 @@ async function route(req, res) {
   if (method === 'GET' && url.pathname.startsWith('/api/jobs/')) {
     const id = decodeURIComponent(url.pathname.split('/').pop() || '');
     const token = tokenFrom(req, url);
+    if (id.startsWith('job_pst_')) {
+      sendJson(res, 200, officialJobs.snapshot(officialJobs.get(id, token)));
+      return;
+    }
     const snapshot = await store.findJobContext(id);
     const job = snapshot?.job;
     if (!job) throw httpError(404, 'job not found.');
@@ -652,6 +682,15 @@ async function route(req, res) {
 async function handleDirectGenerate(url, res) {
   const token = String(url.searchParams.get('token') || '').trim();
   const rawParams = Object.fromEntries(url.searchParams.entries());
+  if (isOfficialKey(token)) {
+    const snapshot = await createOfficialJob(token, rawParams, false, directGenerateTimeoutMs);
+    const job = await officialJobs.get(snapshot.id, token).done;
+    if (job.status !== 'done') throw httpError(502, job.error);
+    await sendStoredImage(res, 200, job.image, {
+      'cache-control': 'private, max-age=0', 'x-cache': job.cacheHit ? 'hit' : 'miss', 'x-auth-mode': 'official'
+    });
+    return;
+  }
   const db = await store.readCollections(['settings', 'users']);
   const request = normalizeNovelAiRequest(rawParams, db.settings, { maxSteps: DIRECT_URL_MAX_STEPS });
   const cacheKey = requestCacheKey(token, request, rawParams.seed);
@@ -712,6 +751,53 @@ async function handleDirectGenerate(url, res) {
     }
     throw error;
   }
+}
+
+async function officialKeyInfo(token) {
+  officialKeyOwner(token);
+  try {
+    const quota = await fetchNovelAiAccountQuota(token, process.env, { signal: AbortSignal.timeout(accountQuotaRequestTimeoutMs) });
+    return {
+      authMode: 'official', balance: null, anlas: quota.points,
+      v5RemainingPercent: quota.v5UsageIsNegative ? 0 : quota.v5UsagePercent,
+      membership: accountTierText(quota.tier, '会员未知')
+    };
+  } catch (error) {
+    throw officialKeyError(error);
+  }
+}
+
+async function createOfficialJob(token, body, frontend = false, timeoutMs = novelAiGenerateTimeoutMs()) {
+  const owner = officialKeyOwner(token);
+  const settings = await store.readSettings();
+  const request = normalizeNovelAiRequest({ ...body, cost: undefined }, settings, { maxSteps: frontend ? MAX_STEPS : DIRECT_URL_MAX_STEPS });
+  request.steps = Math.floor(request.steps);
+  request.cost = 0;
+  // Existing site caching is shared; official-key caching must include its owner.
+  const cacheKey = hashObject({ owner, request: requestCacheKey('', request, body.seed) });
+  return officialJobs.create(token, request, { cacheKey, noCache: isNoCache(body.nocache), timeoutMs });
+}
+
+async function saveOfficialImage(job, image) {
+  const request = job.request;
+  const id = createId('img');
+  const file = await writeStoredImage(id, image);
+  const saved = {
+    id, token: job.owner, accountId: '', authMode: 'official', cacheKey: job.cacheKey,
+    prompt: request.tag, fullPrompt: request.prompt, model: request.model,
+    width: request.width, height: request.height, requestedSteps: request.requestedSteps ?? request.steps,
+    routedSteps: request.steps, cost: 0, accountCost: 0,
+    mimeType: image.mimeType, file, createdAt: new Date().toISOString()
+  };
+  try {
+    await store.update(db => { db.images.unshift(saved); }, { collections: ['images'], dirtyRows: () => ({ images: [id] }) });
+  } catch (error) {
+    await removeStoredImages([saved]);
+    throw error;
+  }
+  const trimmed = await store.trimImageCache(null, { batchSize: imageCacheTrimBuffer() });
+  await removeStoredImages(trimmed);
+  return saved;
 }
 
 async function handleOpenAiChatCompletion(req, res) {

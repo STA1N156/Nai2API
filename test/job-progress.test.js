@@ -36,8 +36,9 @@ test('single-job polling is sequential and a temporary network failure does not 
   const context = vm.createContext({
     state, el: { jobText: { textContent: '' } },
     queuedPollIntervalMs: 1000, jobPollIntervalMs: 450,
-    api: async (url) => {
-      assert.equal(url, '/api/jobs/test?token=fixed-token');
+    api: async (url, options) => {
+      assert.equal(url, '/api/jobs/test');
+      assert.equal(options.token, 'fixed-token');
       maximumActive = Math.max(maximumActive, ++active);
       await new Promise((resolve) => setImmediate(resolve));
       active--;
