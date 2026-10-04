@@ -57,7 +57,7 @@ test('Chinese parameter names and the requested steps explanation are consistent
     assert.match(html, new RegExp(`aria-label="${name}说明"`));
     assert.equal(help[key].title, name);
   }
-  assert.equal(help.steps.text, '模型逐步完成图片的迭代次数，更多步数通常需要更久，花费更多，高步数可能会提升画面精细程度，也可能适得其反。\n\n支持 1–50 步，超过 28 步会进入更高的扣费档位，具体点数以“生成图片”按钮显示为准。');
+  assert.equal(help.steps.text, '模型逐步完成图片的迭代次数，更多步数通常需要更久，花费更多，高步数可能会提升画面精细程度，也可能适得其反。\n\n支持 1–50 步，超过 28 步或选择 2K／4K 时，按实际分辨率、步数和模型同步官方 Anlas 价格，具体点数以“生成图片”按钮显示为准。');
   assert.match(css, /\.parameter-help-button \{[^}]*width: 20px; min-height: 20px;/);
   const mobile = css.slice(css.indexOf('@media (max-width: 820px)'), css.indexOf('@media (max-width: 560px)'));
   assert.match(mobile, /scrollbar-width: none !important/);

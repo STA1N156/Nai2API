@@ -6,8 +6,8 @@ import { mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { JsonStore, MAX_CACHE_IMAGES_LIMIT, createId, createPublicToken, defaultArtist2_5D, hashObject, legacyDefaultArtist, maskToken, normalizeDb } from './store.js';
-import { MAX_STEPS, DIRECT_URL_MAX_STEPS, buildErrorImage, fetchNovelAiAccountQuota, generateNovelAiImage, normalizeNovelAiRequest, sizeCostMap } from './providers.js';
-import { frontendGenerationCost } from '../public/generation-pricing.js';
+import { MAX_STEPS, DIRECT_URL_MAX_STEPS, buildErrorImage, fetchNovelAiAccountQuota, generateNovelAiImage, normalizeNovelAiRequest } from './providers.js';
+import { generationPrice, sizeMap } from '../public/generation-pricing.js';
 import { adminPromptApiConfig, convertChinesePrompt, fetchPromptApiModels, isPromptApiConfigured, normalizePromptApiConfig, publicPromptApiConfig } from './prompt-api.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -61,20 +61,18 @@ const openAiImageModels = [
 const openAiSizeTiers = {
   '2K': {
     label: '[2K]',
-    cost: 15,
     sizes: {
-      '竖图': { width: 1088, height: 1600 },
-      '横图': { width: 1600, height: 1088 },
-      '方图': { width: 1344, height: 1344 }
+      '竖图': sizeMap['2K竖图'],
+      '横图': sizeMap['2K横图'],
+      '方图': sizeMap['2K方图']
     }
   },
   '4K': {
     label: '[4K]',
-    cost: 25,
     sizes: {
-      '竖图': { width: 1344, height: 1984 },
-      '横图': { width: 1984, height: 1344 },
-      '方图': { width: 1728, height: 1728 }
+      '竖图': sizeMap['4K竖图'],
+      '横图': sizeMap['4K横图'],
+      '方图': sizeMap['4K方图']
     }
   }
 };
@@ -850,7 +848,10 @@ function openAiModelsResponse() {
         object: 'model',
         created,
         owned_by: 'nai2api',
-        cost: Math.max(tier.cost, model.cost),
+        cost: generationCost({ model: model.id, ...tier.sizes['竖图'], steps: openAiFixedSteps }),
+        cost_by_size: Object.fromEntries(Object.entries(tier.sizes).map(([size, dimensions]) => [
+          size, generationCost({ model: model.id, ...dimensions, steps: openAiFixedSteps })
+        ])),
         resolution_tier: tierName
       }))))
     ]
@@ -881,8 +882,7 @@ function parseOpenAiImageRequest(body = {}, settings = {}) {
     sampler: nai.sampler ?? fields.sampler ?? modelParts.sampler ?? settings.defaults?.sampler,
     negative,
     nocache: nai.nocache ?? body.nocache ?? '1',
-    noise_schedule: nai.noise_schedule ?? nai.noiseSchedule ?? settings.defaults?.noiseSchedule ?? 'karras',
-    cost: modelParts.tier?.cost ?? modelGenerationCost(modelParts.model)
+    noise_schedule: nai.noise_schedule ?? nai.noiseSchedule ?? settings.defaults?.noiseSchedule ?? 'karras'
   };
 
   return {
@@ -2108,7 +2108,7 @@ async function createJob(token, body, options = {}) {
     const request = normalizeNovelAiRequest(input, settings, { maxSteps: options.frontend ? MAX_STEPS : DIRECT_URL_MAX_STEPS });
     if (options.frontend) {
       request.steps = Math.floor(request.steps);
-      request.cost = frontendGenerationCost(sizeCostMap[request.size] || 1, request.model, request.steps);
+      request.cost = generationCost(request);
     }
     return request;
   };
@@ -3719,20 +3719,13 @@ function publicImage(image) {
 }
 
 function generationCost(request = null) {
-  const requestedCost = Number(request?.cost);
-  const sizeCost = sizeCostMap[normalizeSizeName(request?.size)] || 1;
-  const costs = [sizeCost, modelGenerationCost(request?.model)];
-  if (Number.isFinite(requestedCost) && requestedCost > 0) costs.push(Math.ceil(requestedCost));
-  return Math.max(...costs);
-}
-
-function modelGenerationCost(model) {
-  return String(model || '') === 'nai-diffusion-5-full' ? 8 : 1;
+  return generationPrice(request || {});
 }
 
 function requiresPaidAccount(request = {}) {
+  const dimensions = sizeMap[normalizeSizeName(request.size)];
   return Number(request?.steps) > 28
-    || (sizeCostMap[normalizeSizeName(request?.size)] || 1) > 1
+    || dimensions?.width * dimensions?.height > 1024 * 1024
     || Number(request?.width) * Number(request?.height) > 1024 * 1024;
 }
 

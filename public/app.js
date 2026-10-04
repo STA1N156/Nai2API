@@ -1,5 +1,5 @@
 import { enhanceSelects, refreshSelect } from './select-ui.js';
-import { frontendGenerationCost } from './generation-pricing.js';
+import { generationPrice, sizeMap } from './generation-pricing.js';
 
 const state = {
   settings: null,
@@ -111,17 +111,7 @@ year 2025, textless version, {{petite,loli}}, Petite figure, no text, The image 
   }
 };
 
-const sizeOptions = [
-  { value: '竖图', cost: 1 },
-  { value: '横图', cost: 1 },
-  { value: '方图', cost: 1 },
-  { value: '2K竖图', cost: 15 },
-  { value: '2K横图', cost: 15 },
-  { value: '2K方图', cost: 15 },
-  { value: '4K竖图', cost: 25 },
-  { value: '4K横图', cost: 25 },
-  { value: '4K方图', cost: 25 }
-];
+const sizeOptions = Object.keys(sizeMap).map(value => ({ value }));
 
 const paramOrder = [
   'tag',
@@ -156,7 +146,7 @@ const snippetParamOrder = [
 const parameterHelp = {
   steps: {
     title: '迭代步数',
-    text: '模型逐步完成图片的迭代次数，更多步数通常需要更久，花费更多，高步数可能会提升画面精细程度，也可能适得其反。\n\n支持 1–50 步，超过 28 步会进入更高的扣费档位，具体点数以“生成图片”按钮显示为准。',
+    text: '模型逐步完成图片的迭代次数，更多步数通常需要更久，花费更多，高步数可能会提升画面精细程度，也可能适得其反。\n\n支持 1–50 步，超过 28 步或选择 2K／4K 时，按实际分辨率、步数和模型同步官方 Anlas 价格，具体点数以“生成图片”按钮显示为准。',
     source: 'https://docs.novelai.net/en/image/stepsguidance/'
   },
   sampler: {
@@ -1169,8 +1159,7 @@ function totalGenerationCost() {
 }
 
 function generationCost(size = el.sizeInput.value) {
-  const selected = sizeOptions.find((option) => option.value === size);
-  return frontendGenerationCost(selected?.cost || 1, el.modelInput.value, normalizeSteps(el.stepsInput.value));
+  return generationPrice({ size, model: el.modelInput.value, steps: normalizeSteps(el.stepsInput.value) });
 }
 
 function usesOfficialKey() {

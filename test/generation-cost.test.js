@@ -2,8 +2,8 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import vm from 'node:vm';
-import { MAX_STEPS, DIRECT_URL_MAX_STEPS, normalizeNovelAiRequest, sizeCostMap } from '../server/providers.js';
-import { frontendGenerationCost } from '../public/generation-pricing.js';
+import { MAX_STEPS, DIRECT_URL_MAX_STEPS, normalizeNovelAiRequest } from '../server/providers.js';
+import { generationPrice, sizeMap } from '../public/generation-pricing.js';
 
 const server = readFileSync(new URL('../server/index.js', import.meta.url), 'utf8');
 const frontend = readFileSync(new URL('../public/app.js', import.meta.url), 'utf8');
@@ -16,17 +16,34 @@ function section(source, start, end) {
   return source.slice(from, to);
 }
 const pricing = section(server, 'function generationCost(', 'function requestCacheKey(');
+const prices28 = {
+  '竖图': [1, 8], '横图': [1, 8], '方图': [1, 8],
+  '2K竖图': [34, 51], '2K横图': [34, 51], '2K方图': [35, 53],
+  '4K竖图': [51, 77], '4K横图': [51, 77], '4K方图': [57, 86]
+};
 
-test('V5 standard costs 8 even with an old client cost; other user pricing tiers are unchanged', () => {
-  const api = vm.runInNewContext(`${pricing}; ({ generationCost })`, { sizeCostMap });
-  for (const [size, sizeCost] of Object.entries(sizeCostMap)) {
+test('paid resolutions follow official prices; standard prices stay unchanged and client cost is ignored', () => {
+  const api = vm.runInNewContext(`${pricing}; ({ generationCost })`, { sizeMap, generationPrice });
+  for (const size of Object.keys(sizeMap)) {
     for (const model of [v45, v5]) {
-      for (const cost of [undefined, 0, -8, 1, 5]) {
-        const request = { size, model, cost };
-        assert.equal(api.generationCost(request), Math.max(sizeCost, model === v5 ? 8 : 1, cost || 0));
+      for (const cost of [undefined, 0, -8, 1, 5, 999]) {
+        const request = { size, model, steps: 28, cost };
+        assert.equal(api.generationCost(request), prices28[size][model === v5 ? 1 : 0]);
       }
     }
   }
+});
+
+test('high steps use exact pixels and both official rounding stages, not old price bands', () => {
+  for (const [size, steps, normal, v5Cost] of [
+    ['竖图', 29, 20, 30], ['方图', 29, 21, 32], ['竖图', 35, 24, 36],
+    ['竖图', 45, 30, 45], ['竖图', 50, 33, 50], ['2K竖图', 50, 56, 84],
+    ['2K方图', 50, 58, 87], ['4K竖图', 50, 85, 128], ['4K方图', 50, 95, 143]
+  ]) {
+    assert.equal(generationPrice({ size, steps, model: v45 }), normal);
+    assert.equal(generationPrice({ size, steps, model: v5 }), v5Cost);
+  }
+  assert.equal(generationPrice({ size: '竖图', width: 1728, height: 1728, model: v5, steps: 28, cost: 1 }), 86);
 });
 
 test('frontend and OpenAI model catalog match server prices, including batch totals', () => {
@@ -38,23 +55,26 @@ test('frontend and OpenAI model catalog match server prices, including batch tot
     ${section(frontend, 'function updateGenerateCostLabel(', 'function setGenerationCount(')}
     ${section(frontend, 'function totalGenerationCost(', 'function wait(')}
     ({ generationCost, totalGenerationCost, populateSizeOptions, updateGenerateCostLabel });
-  `, { el, state, refreshSelect: () => {}, frontendGenerationCost, normalizeSteps: Number });
+  `, { el, state, refreshSelect: () => {}, generationPrice, sizeMap, normalizeSteps: Number });
   const catalog = vm.runInNewContext(`
     ${section(server, 'const openAiSamplers =', 'const insufficientBalanceMessage =')}
     ${section(server, 'function openAiModelsResponse(', 'function parseOpenAiImageRequest(')}
     openAiModelsResponse().data;
-  `);
+  `, { sizeMap, generationCost: generationPrice, openAiFixedSteps: 28 });
   assert.equal(catalog.length, 36);
   for (const item of catalog) {
-    const expected = item.resolution_tier === '4K' ? 25 : item.resolution_tier === '2K' ? 15 : item.id.startsWith(v5) ? 8 : 1;
+    const tier = item.resolution_tier === 'standard' ? '' : item.resolution_tier;
+    const modelIndex = item.id.includes(v5) ? 1 : 0;
+    const expected = prices28[`${tier}竖图`][modelIndex];
     assert.equal(item.cost, expected, item.id);
+    if (tier) for (const size of ['竖图', '横图', '方图']) assert.equal(item.cost_by_size[size], prices28[`${tier}${size}`][modelIndex]);
   }
   for (const model of [v45, v5]) {
     el.modelInput.value = model;
     ui.populateSizeOptions();
-    for (const [size, cost] of Object.entries(sizeCostMap)) {
+    for (const size of Object.keys(sizeMap)) {
       el.sizeInput.value = size;
-      const expected = Math.max(cost, model === v5 ? 8 : 1);
+      const expected = prices28[size][model === v5 ? 1 : 0];
       assert.equal(ui.generationCost(), expected);
       assert.ok(el.sizeInput.innerHTML.includes(`>${size}（${expected}点）</option>`));
       for (const count of [1, 2, 4]) {
@@ -79,7 +99,7 @@ test('web, URL and OpenAI jobs reserve 8, reject insufficient balance and refund
       ${section(server, 'function refundJob(', 'function hourlyUsageStatsByDay(')}
       ({ createJob, createDirectJob, refundJob });
     `, {
-      sizeCostMap, normalizeNovelAiRequest, DIRECT_URL_MAX_STEPS, MAX_STEPS, frontendGenerationCost,
+      sizeMap, normalizeNovelAiRequest, DIRECT_URL_MAX_STEPS, MAX_STEPS, generationPrice,
       store: { update: async (mutate) => mutate(db) },
       cleanupStaleActiveJobs: async () => {},
       getUserOrThrow: () => user,

@@ -2,16 +2,15 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import vm from 'node:vm';
-import { MAX_STEPS, DIRECT_URL_MAX_STEPS, normalizeNovelAiRequest, sizeCostMap } from '../server/providers.js';
-import { frontendGenerationCost } from '../public/generation-pricing.js';
+import { MAX_STEPS, DIRECT_URL_MAX_STEPS, normalizeNovelAiRequest } from '../server/providers.js';
+import { generationPrice, sizeMap } from '../public/generation-pricing.js';
 
 const server = readFileSync(new URL('../server/index.js', import.meta.url), 'utf8');
 const frontend = readFileSync(new URL('../public/app.js', import.meta.url), 'utf8');
 const section = (text, start, end) => text.slice(text.indexOf(start), text.indexOf(end));
 const pricing = section(server, 'function generationCost(', 'function requestCacheKey(');
 const v45 = 'nai-diffusion-4-5-full', v5 = 'nai-diffusion-5-full';
-const tiers = [[1, 1, 8, 15, 25], [28, 1, 8, 15, 25], [29, 6, 12, 19, 29], [35, 6, 12, 19, 29],
-  [36, 8, 14, 21, 31], [45, 8, 14, 21, 31], [46, 10, 16, 23, 33], [50, 10, 16, 23, 33]];
+const tiers = [1, 28, 29, 35, 36, 45, 46, 50];
 
 function runtime() {
   const user = { id: 'user', token: 'test', balance: 1000 };
@@ -30,7 +29,7 @@ function runtime() {
     ({ createJob, refundJob, requiresPaidAccount, selectAccount, hasAccountWithEnoughQuota,
       completeGeneration, retryReservationWithNextAccount, applyAccountQuotaResult });
   `, {
-    MAX_STEPS, DIRECT_URL_MAX_STEPS, normalizeNovelAiRequest, sizeCostMap, frontendGenerationCost,
+    MAX_STEPS, DIRECT_URL_MAX_STEPS, normalizeNovelAiRequest, sizeMap, generationPrice,
     store: { update: async mutate => mutate(db), trimImageCache: async () => [] }, cleanupStaleActiveJobs: async () => {},
     getUserOrThrow: () => user, requestCacheKey: () => 'cache', isNoCache: value => value === '1',
     activeJobCount: jobs => jobs.length, dirtyResultJobRows: () => {}, createId: () => `id-${++id}`,
@@ -55,16 +54,15 @@ test('every frontend price boundary matches all sizes and both models; batch tot
     ${section(frontend, 'function updateGenerateCostLabel(', 'function setGenerationCount(')}
     ${section(frontend, 'function totalGenerationCost(', 'function wait(')}
     ({ populateSizeOptions, generationCost, totalGenerationCost, updateGenerateCostLabel });
-  `, { el, state, frontendGenerationCost, maxSteps: 50, defaultSteps: 28, refreshSelect: () => {} });
-  for (const [steps, normal45, normal5, twoK, fourK] of tiers) {
+  `, { el, state, generationPrice, sizeMap, maxSteps: 50, defaultSteps: 28, refreshSelect: () => {} });
+  for (const steps of tiers) {
     el.stepsInput.value = steps;
     for (const model of [v45, v5]) {
       el.modelInput.value = model;
       ui.populateSizeOptions();
-      for (const [size, sizeCost] of Object.entries(sizeCostMap)) {
+      for (const size of Object.keys(sizeMap)) {
         el.sizeInput.value = size;
-        const expected = sizeCost === 25 ? fourK : sizeCost === 15 ? twoK : model === v5 ? normal5 : normal45;
-        assert.equal(frontendGenerationCost(sizeCost, model, steps), expected);
+        const expected = generationPrice({ size, model, steps });
         assert.equal(ui.generationCost(), expected);
         assert.ok(el.sizeInput.innerHTML.includes(`${size}（${expected}点）`));
         for (const count of [1, 2, 4]) {
@@ -79,11 +77,11 @@ test('every frontend price boundary matches all sizes and both models; batch tot
 });
 
 test('frontend charges server-calculated price, rejects insufficient balance and refunds the stored price once', async () => {
-  for (const [steps, normal45, normal5, twoK, fourK] of tiers) {
+  for (const steps of tiers) {
     for (const model of [v45, v5]) {
-      for (const [size, sizeCost] of Object.entries(sizeCostMap)) {
+      for (const size of Object.keys(sizeMap)) {
         const { api, user, db } = runtime();
-        const expected = sizeCost === 25 ? fourK : sizeCost === 15 ? twoK : model === v5 ? normal5 : normal45;
+        const expected = generationPrice({ size, model, steps });
         const body = { model, size, steps, cost: 0.1, nocache: '1' };
         user.balance = expected - 1;
         await assert.rejects(api.createJob('test', body, { frontend: true }), { statusCode: 402 });
@@ -116,11 +114,11 @@ test('50-step limit is frontend-only; forged cost/dimensions do not change front
     assert.equal(web.request.steps, Math.min(50, steps));
     assert.equal(web.request.width, 832);
     assert.equal(web.request.height, 1216);
-    assert.equal(web.cost, frontendGenerationCost(1, v5, Math.min(50, steps)));
+    assert.equal(web.cost, generationPrice({ size: '竖图', model: v5, steps: Math.min(50, steps) }));
   }
   const fractional = await api.createJob('test', { model: v45, size: '竖图', steps: 35.9, nocache: '1' }, { frontend: true });
   assert.equal(fractional.request.steps, 35);
-  assert.equal(fractional.cost, 6);
+  assert.equal(fractional.cost, 24);
   assert.match(frontend, /const maxUrlSteps = 28/);
   assert.match(server, /const openAiFixedSteps = 28/);
   assert.equal((frontend.match(/api\('\/api\/web\/jobs'/g) || []).length, 2);

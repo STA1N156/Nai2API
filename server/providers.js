@@ -1,33 +1,10 @@
 import net from 'node:net';
 import tls from 'node:tls';
 import zlib from 'node:zlib';
+import { sizeMap } from '../public/generation-pricing.js';
 
 export const MAX_STEPS = 50;
 export const DIRECT_URL_MAX_STEPS = 28;
-
-export const sizeMap = {
-  '竖图': { width: 832, height: 1216 },
-  '横图': { width: 1216, height: 832 },
-  '方图': { width: 1024, height: 1024 },
-  '2K竖图': { width: 1088, height: 1600 },
-  '2K横图': { width: 1600, height: 1088 },
-  '2K方图': { width: 1344, height: 1344 },
-  '4K竖图': { width: 1344, height: 1984 },
-  '4K横图': { width: 1984, height: 1344 },
-  '4K方图': { width: 1728, height: 1728 }
-};
-
-export const sizeCostMap = {
-  '竖图': 1,
-  '横图': 1,
-  '方图': 1,
-  '2K竖图': 15,
-  '2K横图': 15,
-  '2K方图': 15,
-  '4K竖图': 25,
-  '4K横图': 25,
-  '4K方图': 25
-};
 
 export function normalizeNovelAiRequest(input, settings, options = {}) {
   const defaults = settings.defaults || {};
