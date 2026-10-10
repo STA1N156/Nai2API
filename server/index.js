@@ -56,7 +56,7 @@ const openAiSamplers = [
 ];
 const openAiImageModels = [
   { id: 'nai-diffusion-4-5-full', cost: 1 },
-  { id: 'nai-diffusion-5-full', cost: 8 }
+  { id: 'nai-diffusion-5-full', cost: 6 }
 ];
 const openAiSizeTiers = {
   '2K': {
@@ -755,8 +755,11 @@ async function officialKeyInfo(token) {
   officialKeyOwner(token);
   try {
     const quota = await fetchNovelAiAccountQuota(token, process.env, { signal: AbortSignal.timeout(accountQuotaRequestTimeoutMs) });
+    const subscription = quota.raw.subscription || quota.raw.account?.subscription || {};
+    const opus = Number(quota.tier) >= 3 && Number(subscription.expiresAt) > Date.now() / 1000;
     return {
       authMode: 'official', balance: null, anlas: quota.points,
+      freeStandard: { v45: opus, v5: opus && quota.v5UsagePercent !== null && !quota.v5UsageIsNegative },
       v5RemainingPercent: quota.v5UsageIsNegative ? 0 : quota.v5UsagePercent,
       membership: accountTierText(quota.tier, '会员未知')
     };

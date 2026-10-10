@@ -109,7 +109,7 @@ test('50-step limit is frontend-only; forged cost/dimensions do not change front
     const body = { model: v5, size: '竖图', steps, cost: 1, nocache: '1' };
     const legacy = await api.createJob('test', body);
     assert.equal(legacy.request.steps, 28);
-    assert.equal(legacy.cost, 8);
+    assert.equal(legacy.cost, 6);
     const web = await api.createJob('test', { ...body, cost: 999, width: 2048, height: 2048 }, { frontend: true });
     assert.equal(web.request.steps, Math.min(50, steps));
     assert.equal(web.request.width, 832);

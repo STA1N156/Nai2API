@@ -10,14 +10,17 @@ export const sizeMap = {
   '4K方图': { width: 1728, height: 1728 }
 };
 
-// Shared site pricing: standard <=28-step images keep 1/8 credits.
+// Shared site pricing: standard <=28-step images cost 1/6 credits.
 // Paid sizes/steps follow NovelAI's single-image formula (SMEA/DYN are disabled).
 // Verified 2026-10-05: https://novelai.net/_next/static/chunks/1601-6ba10aad6d763f0c.js
-export function generationPrice({ size = '竖图', width, height, model, steps = 28 } = {}) {
+export function generationPrice({ size = '竖图', width, height, model, steps = 28 } = {}, { official = false, freeStandard = false } = {}) {
   const dimensions = sizeMap[size] || sizeMap['竖图'];
   const pixels = Number(width ?? dimensions.width) * Number(height ?? dimensions.height);
   const v5 = model === 'nai-diffusion-5-full';
-  if (steps <= 28 && pixels <= 1024 * 1024) return v5 ? 8 : 1;
+  if (steps <= 28 && pixels <= 1024 * 1024) {
+    if (!official) return v5 ? 6 : 1;
+    if (freeStandard) return 0;
+  }
   const base = Math.ceil(2.951823174884865e-6 * pixels + 5.753298233447344e-7 * pixels * steps);
   // Round BEFORE the V5 multiplier, then round again, exactly as on the official site.
   return Math.max(2, Math.ceil(base * (v5 ? 1.5 : 1)));

@@ -16,12 +16,14 @@ const listen = async server => { server.listen(0, '127.0.0.1'); await once(serve
 test('PST frontend and URL routes use only the supplied key; billing, pool and persisted credentials stay untouched', { timeout: 30_000 }, async t => {
   const dataDir = await mkdtemp(path.join(tmpdir(), 'nai2api-official-routes-'));
   const calls = [];
+  const subscription = { tier: 3, expiresAt: Math.floor(Date.now() / 1000) + 86400,
+    trainingStepsLeft: { fixedTrainingStepsLeft: 17963, purchasedTrainingSteps: 0 }, usage: { percent: 76.5 } };
   const upstream = http.createServer(async (req, res) => {
     const token = String(req.headers.authorization || '').replace('Bearer ', '');
     if (token !== key) { res.writeHead(401); res.end(`invalid token ${token}`); return; }
     res.setHeader('content-type', 'application/json');
     if (req.url === '/user/data') {
-      res.end(JSON.stringify({ subscription: { tier: 3, trainingStepsLeft: { fixedTrainingStepsLeft: 17963, purchasedTrainingSteps: 0 }, usage: { percent: 76.5 } } }));
+      res.end(JSON.stringify({ subscription }));
       return;
     }
     let raw = '';
@@ -66,7 +68,11 @@ test('PST frontend and URL routes use only the supplied key; billing, pool and p
   const siteKey = issued.users[0].token;
   const before = await fetchJson('/api/me', { headers: { 'x-user-token': siteKey } });
   const official = await fetchJson('/api/me', { headers: { 'x-user-token': key } });
-  assert.deepEqual(official, { authMode: 'official', balance: null, anlas: 17963, v5RemainingPercent: 76.5, membership: 'Opus 会员' });
+  assert.deepEqual(official, { authMode: 'official', balance: null, anlas: 17963, freeStandard: { v45: true, v5: true }, v5RemainingPercent: 76.5, membership: 'Opus 会员' });
+  subscription.usage.isNegative = true;
+  assert.deepEqual((await fetchJson('/api/me', { headers: { 'x-user-token': key } })).freeStandard, { v45: true, v5: false });
+  subscription.expiresAt = 1;
+  assert.deepEqual((await fetchJson('/api/me', { headers: { 'x-user-token': key } })).freeStandard, { v45: false, v5: false });
   const denied = await fetch(origin + '/api/me', { headers: { 'x-user-token': 'pst-invalid' } });
   assert.equal(denied.status, 401);
   assert.doesNotMatch(await denied.text(), /pst-invalid/);

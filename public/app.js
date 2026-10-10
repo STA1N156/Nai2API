@@ -5,6 +5,7 @@ const state = {
   settings: null,
   token: sessionStorage.getItem('nai.officialToken') || localStorage.getItem('nai.userToken') || '',
   userBalance: null,
+  officialAccount: null,
   toastTimer: null,
   resultHistory: [],
   resultHistoryIndex: -1,
@@ -191,7 +192,7 @@ function bindEvents() {
       const help = parameterHelp[button.dataset.parameterHelp];
       el.parameterHelpTitle.textContent = help.title;
       el.parameterHelpText.textContent = button.dataset.parameterHelp === 'steps' && usesOfficialKey()
-        ? help.text.split('\n\n')[0] + '\n\n支持 1–50 步，消耗由 NovelAI 按官方规则计算。'
+        ? help.text.split('\n\n')[0] + '\n\n支持 1–50 步，按钮显示预计 Anlas 消耗，连接密钥后会结合会员免费额度更新。最终以 NovelAI 实际扣除为准。'
         : help.text;
       el.parameterHelpSource.href = help.source;
       el.parameterHelpDialog.showModal();
@@ -250,6 +251,7 @@ function bindEvents() {
   el.userToken.addEventListener('input', () => {
     if (el.userToken.value.trim() !== state.token) {
       state.userBalance = null;
+      state.officialAccount = null;
       el.balanceText.textContent = '尚未连接';
       el.tokenStatusDot.classList.remove('connected');
     }
@@ -345,7 +347,7 @@ function populateArtistPresetOptions() {
 function populateSizeOptions() {
   const selectedValue = el.sizeInput.value;
   el.sizeInput.innerHTML = sizeOptions
-    .map((option) => `<option value="${option.value}">${option.value}${usesOfficialKey() ? '' : `（${generationCost(option.value)}点）`}</option>`)
+    .map((option) => `<option value="${option.value}">${option.value}（${formatGenerationCost(generationCost(option.value))}）</option>`)
     .join('');
   if (sizeOptions.some((option) => option.value === selectedValue)) el.sizeInput.value = selectedValue;
   refreshSelect(el.sizeInput);
@@ -374,6 +376,7 @@ function applyDefaults() {
 
 async function saveToken() {
   try {
+    state.officialAccount = null;
     state.token = el.userToken.value.trim();
     if (usesOfficialKey()) {
       sessionStorage.setItem('nai.officialToken', state.token);
@@ -403,11 +406,14 @@ async function loadMe() {
   const token = state.token;
   const user = await api('/api/me', { token });
   if (state.token !== token || el.userToken.value.trim() !== token) return;
+  state.officialAccount = user.authMode === 'official' ? user : null;
   state.userBalance = user.authMode === 'official' ? null : Number(user.balance);
   el.balanceText.textContent = user.authMode === 'official'
     ? `Anlas: ${user.anlas ?? '未知'}点 · V5 剩余 ${user.v5RemainingPercent == null ? '未知' : `${user.v5RemainingPercent}%`} · ${user.membership}`
     : `${user.balance} 点可用`;
   el.tokenStatusDot.classList.add('connected');
+  populateSizeOptions();
+  updateUrlOutputs();
 }
 
 async function mergeTokenBalance() {
@@ -1140,7 +1146,11 @@ function clearLivePreview(target) {
 window.addEventListener('pagehide', stopPreviewFeed);
 
 function updateGenerateCostLabel() {
-  el.directGenerateBtn.textContent = usesOfficialKey() ? '生成图片' : `生成图片（${totalGenerationCost()}点）`;
+  el.directGenerateBtn.textContent = `生成图片（${formatGenerationCost(totalGenerationCost())}）`;
+}
+
+function formatGenerationCost(cost) {
+  return usesOfficialKey() ? `预计 ${cost} Anlas` : `${cost}点`;
 }
 
 function setGenerationCount(value) {
@@ -1159,7 +1169,11 @@ function totalGenerationCost() {
 }
 
 function generationCost(size = el.sizeInput.value) {
-  return generationPrice({ size, model: el.modelInput.value, steps: normalizeSteps(el.stepsInput.value) });
+  const model = el.modelInput.value;
+  return generationPrice({ size, model, steps: normalizeSteps(el.stepsInput.value) }, {
+    official: usesOfficialKey(),
+    freeStandard: state.officialAccount?.freeStandard?.[model === 'nai-diffusion-5-full' ? 'v5' : 'v45'] === true
+  });
 }
 
 function usesOfficialKey() {

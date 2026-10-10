@@ -17,7 +17,7 @@ function section(source, start, end) {
 }
 const pricing = section(server, 'function generationCost(', 'function requestCacheKey(');
 const prices28 = {
-  '竖图': [1, 8], '横图': [1, 8], '方图': [1, 8],
+  '竖图': [1, 6], '横图': [1, 6], '方图': [1, 6],
   '2K竖图': [34, 51], '2K横图': [34, 51], '2K方图': [35, 53],
   '4K竖图': [51, 77], '4K横图': [51, 77], '4K方图': [57, 86]
 };
@@ -87,9 +87,9 @@ test('frontend and OpenAI model catalog match server prices, including batch tot
   }
 });
 
-test('web, URL and OpenAI jobs reserve 8, reject insufficient balance and refund only the stored amount once', async () => {
+test('web, URL and OpenAI jobs reserve 6, reject insufficient balance and refund only the stored amount once', async () => {
   for (const source of ['web', 'direct', 'openai']) {
-    const user = { token: 'test-token', balance: 8 };
+    const user = { token: 'test-token', balance: 6 };
     const db = { settings: {}, users: [user], jobs: [], ledger: [] };
     let nextId = 0;
     const api = vm.runInNewContext(`
@@ -111,27 +111,27 @@ test('web, URL and OpenAI jobs reserve 8, reject insufficient balance and refund
       httpError: (statusCode, message) => Object.assign(new Error(message), { statusCode }),
       insufficientBalanceMessage: 'insufficient balance'
     });
-    const request = { model: v5, size: '竖图', cost: 5, nocache: '1' };
+    const request = { model: v5, size: '竖图', cost: 8, nocache: '1' };
     const create = () => source === 'direct'
       ? api.createDirectJob(user.token, request, 'test-cache')
       : api.createJob(user.token, request, { source });
-    user.balance = 7;
+    user.balance = 5;
     await assert.rejects(create(), { statusCode: 402 });
-    assert.equal(user.balance, 7);
+    assert.equal(user.balance, 5);
     assert.equal(db.ledger.length, 0);
-    user.balance = 8;
+    user.balance = 6;
     const job = await create();
-    assert.equal(job.cost, 8);
+    assert.equal(job.cost, 6);
     assert.equal(job.accountCost, 0);
     assert.equal(user.balance, 0);
-    assert.equal(db.ledger[0].amount, -8);
+    assert.equal(db.ledger[0].amount, -6);
     api.refundJob(db, job, 'test failure');
     api.refundJob(db, job, 'duplicate failure');
-    assert.equal(user.balance, 8);
+    assert.equal(user.balance, 6);
     assert.equal(db.ledger.length, 2);
+    assert.equal(db.ledger[0].amount, 6);
+    api.refundJob(db, { id: 'old-job', userToken: user.token, cost: 8 }, 'old task');
+    assert.equal(user.balance, 14);
     assert.equal(db.ledger[0].amount, 8);
-    api.refundJob(db, { id: 'old-job', userToken: user.token, cost: 5 }, 'old task');
-    assert.equal(user.balance, 13);
-    assert.equal(db.ledger[0].amount, 5);
   }
 });
